@@ -1,0 +1,30 @@
+{
+  "model": "gpt-codex-fixture",
+  "instructions": "You are Codex running inside a local fixture contract.",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Summarize the current repository status."
+        }
+      ]
+    }
+  ],
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "prompt_cache_key": "coditor-fixture:/Users/pradeepsingh/code/coditor",
+  "metadata": {
+    "cwd": "/Users/pradeepsingh/code/coditor",
+    "coditor_fixture": "minimal_text"
+  },
+  "client_metadata": {
+    "session_id": "codex-session-fixture-001",
+    "x_client_request_id": "codex-request-fixture-001"
+  },
+  "stream": true
+}

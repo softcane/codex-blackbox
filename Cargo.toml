@@ -1,0 +1,3 @@
+[workspace]
+members = ["coditor-core", "coditor-cli"]
+resolver = "2"

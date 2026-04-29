@@ -1,0 +1,54 @@
+{
+  "model": "gpt-codex-fixture",
+  "instructions": [
+    {
+      "type": "message",
+      "role": "developer",
+      "content": "Use tools only when repository inspection is required."
+    }
+  ],
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Find the package names and report them."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "name": "read_file",
+      "description": "Read a UTF-8 text file from the local workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "reasoning": {
+    "effort": "low"
+  },
+  "prompt_cache_key": "coditor-fixture:/Users/pradeepsingh/code/coditor:tools",
+  "metadata": {
+    "cwd": "/Users/pradeepsingh/code/coditor",
+    "coditor_fixture": "tool_use"
+  },
+  "client_metadata": {
+    "session_id": "codex-session-fixture-tools-001",
+    "x_client_request_id": "codex-request-fixture-tools-001"
+  },
+  "stream": true
+}

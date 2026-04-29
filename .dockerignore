@@ -1,0 +1,7 @@
+**
+!Cargo.toml
+!Cargo.lock
+!coditor-cli/
+!coditor-cli/**
+!coditor-core/
+!coditor-core/**
