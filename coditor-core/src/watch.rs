@@ -98,8 +98,9 @@ pub enum WatchEvent {
         requested: String,
         actual: String,
     },
-    /// Per-turn context-window status. `fill_percent` is the share of the
-    /// resolved context window consumed by input + cache tokens. The optional
+    /// Per-turn context-window status. `fill_percent` follows the active
+    /// provider finalization rule: copied Anthropic fallback includes cache
+    /// token fields, while Codex Responses uses input tokens only. The optional
     /// `context_window_tokens` field makes the denominator explicit for clients
     /// and debugging.
     ContextStatus {

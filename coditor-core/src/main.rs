@@ -50,6 +50,7 @@ pub mod envoy {
     }
 }
 
+pub mod codex_accounting;
 pub mod codex_request;
 pub mod codex_response;
 pub mod diagnosis;
@@ -2128,6 +2129,22 @@ impl SelectedResponseAccumulator {
     }
 }
 
+#[derive(Clone, Debug)]
+enum SelectedFinalizationOutcome {
+    Codex(CodexFinalizationOutcome),
+    TemporaryUnportedAnthropicFallback,
+}
+
+#[derive(Clone, Debug)]
+struct CodexFinalizationOutcome {
+    request_id: String,
+    accounting: codex_accounting::CodexTurnAccounting,
+    duration_ms: u64,
+    context_window_tokens: u64,
+    context_fill_percent: f64,
+    watch_events: Vec<watch::WatchEvent>,
+}
+
 // ---------------------------------------------------------------------------
 // Finalize: metrics + DB persistence
 // ---------------------------------------------------------------------------
@@ -2686,9 +2703,202 @@ fn finalize_response(
     }
 }
 
+fn build_codex_finalization_outcome(
+    request_id: &str,
+    request: &codex_request::ParsedCodexRequest,
+    response: &codex_response::CodexResponseSummary,
+    duration: Duration,
+    context_window_tokens: u64,
+) -> CodexFinalizationOutcome {
+    let accounting = codex_accounting::summarize_codex_turn(request, response);
+    let context_fill_percent =
+        context_fill_percent(accounting.input_tokens, 0, 0, context_window_tokens);
+    let mut watch_events = Vec::new();
+
+    if !accounting.identity.session_id.is_empty() {
+        if let Some(initial_prompt) = accounting.first_user_prompt_excerpt.clone() {
+            watch_events.push(watch::WatchEvent::SessionStart {
+                session_id: accounting.identity.session_id.clone(),
+                display_name: codex_display_name(&accounting),
+                model: accounting.requested_model.clone(),
+                initial_prompt: Some(initial_prompt),
+            });
+        }
+
+        if let Some(served_model) = accounting.served_model.as_ref() {
+            if served_model != &accounting.requested_model {
+                watch_events.push(watch::WatchEvent::ModelFallback {
+                    session_id: accounting.identity.session_id.clone(),
+                    requested: accounting.requested_model.clone(),
+                    actual: served_model.clone(),
+                });
+            }
+        }
+
+        watch_events.push(watch::WatchEvent::ContextStatus {
+            session_id: accounting.identity.session_id.clone(),
+            fill_percent: context_fill_percent,
+            context_window_tokens: Some(context_window_tokens),
+            turns_to_compact: None,
+        });
+    }
+
+    CodexFinalizationOutcome {
+        request_id: request_id.to_string(),
+        accounting,
+        duration_ms: duration.as_millis() as u64,
+        context_window_tokens,
+        context_fill_percent,
+        watch_events,
+    }
+}
+
+fn finalize_codex_response(
+    request_id: &str,
+    request: &codex_request::ParsedCodexRequest,
+    response: &codex_response::CodexResponseSummary,
+    started_at: &Instant,
+    context_window_tokens: u64,
+) -> CodexFinalizationOutcome {
+    let duration = started_at.elapsed();
+    let outcome = build_codex_finalization_outcome(
+        request_id,
+        request,
+        response,
+        duration,
+        context_window_tokens,
+    );
+    apply_codex_finalization_outcome(&outcome, duration);
+    log_codex_finalization_outcome(&outcome);
+    outcome
+}
+
+fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration: Duration) {
+    let newly_started = upsert_codex_session(&outcome.accounting);
+    record_codex_runtime_counters(&outcome.accounting);
+
+    let metric_model = outcome
+        .accounting
+        .served_model
+        .as_deref()
+        .unwrap_or(outcome.accounting.requested_model.as_str());
+    metrics::record_codex_turn(
+        metric_model,
+        outcome.accounting.input_tokens,
+        outcome.accounting.output_tokens,
+        duration.as_secs_f64(),
+    );
+
+    for event in &outcome.watch_events {
+        match event {
+            watch::WatchEvent::SessionStart { .. } if !newly_started => {}
+            watch::WatchEvent::ModelFallback {
+                requested, actual, ..
+            } => {
+                metrics::record_model_fallback(requested, actual);
+                watch::BROADCASTER.broadcast(event.clone());
+            }
+            watch::WatchEvent::ContextStatus {
+                turns_to_compact, ..
+            } => {
+                metrics::record_context_status(*turns_to_compact);
+                watch::BROADCASTER.broadcast(event.clone());
+            }
+            _ => watch::BROADCASTER.broadcast(event.clone()),
+        }
+    }
+}
+
+fn record_codex_runtime_counters(accounting: &codex_accounting::CodexTurnAccounting) {
+    let trusted_cost = accounting
+        .pricing
+        .trusted_for_budget_enforcement
+        .then_some(accounting.pricing.cost_dollars)
+        .flatten()
+        .unwrap_or(0.0);
+
+    match RUNTIME_STATE.lock() {
+        Ok(mut runtime) => {
+            runtime.total_spend += trusted_cost;
+            runtime.total_tokens = runtime.total_tokens.saturating_add(accounting.total_tokens);
+            runtime.request_count = runtime.request_count.saturating_add(1);
+        }
+        Err(err) => {
+            warn!(
+                session_id = %accounting.identity.session_id,
+                error = %err,
+                "failed to update Codex runtime counters"
+            );
+        }
+    }
+}
+
+fn upsert_codex_session(accounting: &codex_accounting::CodexTurnAccounting) -> bool {
+    let session_key = accounting.identity.fallback_hash.unwrap_or_else(|| {
+        codex_request::fallback_session_hash("", &accounting.identity.session_id)
+    });
+    if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&session_key) {
+        existing.last_activity = Instant::now();
+        existing.cache_warning_sent = true;
+        return false;
+    }
+
+    diagnosis::SESSIONS.insert(
+        session_key,
+        diagnosis::SessionState {
+            session_id: accounting.identity.session_id.clone(),
+            display_name: codex_display_name(accounting),
+            model: accounting.requested_model.clone(),
+            initial_prompt: accounting.first_user_prompt_excerpt.clone(),
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+            session_inserted: false,
+            cache_warning_sent: true,
+        },
+    );
+    true
+}
+
+fn log_codex_finalization_outcome(outcome: &CodexFinalizationOutcome) {
+    info!(
+        phase = "codex_finalization",
+        request_id = %outcome.request_id,
+        session_id = %outcome.accounting.identity.session_id,
+        response_id = outcome.accounting.identity.response_id.as_deref().unwrap_or(""),
+        requested_model = %outcome.accounting.requested_model,
+        served_model = outcome.accounting.served_model.as_deref().unwrap_or(""),
+        status = ?outcome.accounting.status,
+        input_tokens = outcome.accounting.input_tokens,
+        cached_input_tokens = outcome.accounting.cached_input_tokens,
+        uncached_input_tokens = outcome.accounting.uncached_input_tokens,
+        output_tokens = outcome.accounting.output_tokens,
+        reasoning_output_tokens = outcome.accounting.reasoning_output_tokens,
+        total_tokens = outcome.accounting.total_tokens,
+        context_window_tokens = outcome.context_window_tokens,
+        fill_percent = format!("{:.1}", outcome.context_fill_percent),
+        pricing = ?outcome.accounting.pricing.status,
+        trusted_for_budget_enforcement = outcome.accounting.pricing.trusted_for_budget_enforcement,
+        duration_ms = outcome.duration_ms,
+        anomalies = ?outcome.accounting.anomalies,
+        "Codex response finalized without SQLite persistence"
+    );
+}
+
+fn codex_display_name(accounting: &codex_accounting::CodexTurnAccounting) -> String {
+    accounting
+        .identity
+        .cwd
+        .as_deref()
+        .and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty()))
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| accounting.requested_model.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_selected_response(
     acc: &mut SelectedResponseAccumulator,
+    codex_request: Option<&codex_request::ParsedCodexRequest>,
     request_id: &str,
     model: &str,
     started_at: &Instant,
@@ -2697,28 +2907,29 @@ fn finalize_selected_response(
     working_dir_str: &str,
     user_prompt_excerpt: &str,
     context_window_tokens: u64,
-) {
+) -> Option<SelectedFinalizationOutcome> {
     match acc {
         SelectedResponseAccumulator::CodexResponses { accumulator, .. } => {
             if let Err(err) = accumulator.finish() {
                 warn!(request_id, error = %err, "failed to finish Codex Responses accumulator");
-                return;
+                return None;
             }
             let summary = accumulator.summary();
-            debug!(
+            let Some(codex_request) = codex_request else {
+                warn!(
+                    request_id,
+                    requested_model = model,
+                    "Codex response completed without parsed Codex request metadata"
+                );
+                return None;
+            };
+            Some(SelectedFinalizationOutcome::Codex(finalize_codex_response(
                 request_id,
-                requested_model = model,
-                response_id = summary.response_id.as_deref().unwrap_or(""),
-                served_model = summary.served_model.as_deref().unwrap_or(""),
-                http_status = summary.http_status.unwrap_or_default(),
-                response_status = ?summary.status,
-                input_tokens = summary.usage.input_tokens,
-                cached_input_tokens = summary.usage.cached_input_tokens,
-                output_tokens = summary.usage.output_tokens,
-                reasoning_output_tokens = summary.usage.reasoning_output_tokens,
-                elapsed_ms = started_at.elapsed().as_millis(),
-                "Codex Responses summary accumulated; finalization deferred"
-            );
+                codex_request,
+                &summary,
+                started_at,
+                context_window_tokens,
+            )))
         }
         SelectedResponseAccumulator::TemporaryUnportedAnthropicFallback(accumulator) => {
             finalize_response(
@@ -2732,7 +2943,18 @@ fn finalize_selected_response(
                 user_prompt_excerpt,
                 context_window_tokens,
             );
+            Some(SelectedFinalizationOutcome::TemporaryUnportedAnthropicFallback)
         }
+    }
+}
+
+fn observe_selected_finalization_outcome(outcome: &Option<SelectedFinalizationOutcome>) {
+    if let Some(SelectedFinalizationOutcome::Codex(outcome)) = outcome {
+        debug!(
+            request_id = %outcome.request_id,
+            status = ?outcome.accounting.status,
+            "selected Codex finalization outcome recorded"
+        );
     }
 }
 
@@ -3415,6 +3637,7 @@ enum RequestMetadataSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RequestBodyMetadata {
     source: RequestMetadataSource,
+    codex_request: Option<codex_request::ParsedCodexRequest>,
     model: String,
     message_count: usize,
     has_tools: bool,
@@ -3460,6 +3683,7 @@ fn request_metadata_from_codex(
     let has_tools = parsed.has_tools();
     RequestBodyMetadata {
         source: RequestMetadataSource::CodexResponses,
+        codex_request: Some(parsed.clone()),
         model: parsed.model,
         message_count: parsed.input_count,
         has_tools,
@@ -3488,6 +3712,7 @@ fn request_metadata_from_temporary_unported_anthropic(
     ) = parsed;
     RequestBodyMetadata {
         source: RequestMetadataSource::TemporaryUnportedAnthropicFallback,
+        codex_request: None,
         model,
         message_count,
         has_tools,
@@ -4498,6 +4723,7 @@ impl ExternalProcessor for CoditorProcessor {
             let mut request_anthropic_beta_values: Vec<String> = Vec::new();
             let mut codex_request_headers = codex_request::CodexRequestHeaders::default();
             let mut codex_observed_model_header: Option<String> = None;
+            let mut current_codex_request: Option<codex_request::ParsedCodexRequest> = None;
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -4507,8 +4733,9 @@ impl ExternalProcessor for CoditorProcessor {
                     Ok(None) => {
                         // Stream closed — finalize if not already done via end_of_stream.
                         if !finalized && !model.is_empty() {
-                            finalize_selected_response(
+                            let outcome = finalize_selected_response(
                                 &mut response_accumulator,
+                                current_codex_request.as_ref(),
                                 &request_id,
                                 &model,
                                 &started_at,
@@ -4518,6 +4745,7 @@ impl ExternalProcessor for CoditorProcessor {
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                             );
+                            observe_selected_finalization_outcome(&outcome);
                             REQUEST_STATE.remove(&request_id);
                         }
                         break;
@@ -4525,8 +4753,9 @@ impl ExternalProcessor for CoditorProcessor {
                     Err(e) => {
                         warn!(error = %e, "ext_proc stream error");
                         if !finalized && !model.is_empty() {
-                            finalize_selected_response(
+                            let outcome = finalize_selected_response(
                                 &mut response_accumulator,
+                                current_codex_request.as_ref(),
                                 &request_id,
                                 &model,
                                 &started_at,
@@ -4536,6 +4765,7 @@ impl ExternalProcessor for CoditorProcessor {
                                 &user_prompt_excerpt_buf,
                                 context_window_tokens,
                             );
+                            observe_selected_finalization_outcome(&outcome);
                             REQUEST_STATE.remove(&request_id);
                         }
                         break;
@@ -4599,6 +4829,7 @@ impl ExternalProcessor for CoditorProcessor {
                                     SelectedResponseAccumulator::for_request_source(
                                         request_metadata.source,
                                     );
+                                current_codex_request = request_metadata.codex_request.clone();
                                 let request_source = match request_metadata.source {
                                     RequestMetadataSource::CodexResponses => "codex_responses",
                                     RequestMetadataSource::TemporaryUnportedAnthropicFallback => {
@@ -4789,8 +5020,9 @@ impl ExternalProcessor for CoditorProcessor {
                         }
                         if b.end_of_stream {
                             if !model.is_empty() {
-                                finalize_selected_response(
+                                let outcome = finalize_selected_response(
                                     &mut response_accumulator,
+                                    current_codex_request.as_ref(),
                                     &request_id,
                                     &model,
                                     &started_at,
@@ -4800,6 +5032,7 @@ impl ExternalProcessor for CoditorProcessor {
                                     &user_prompt_excerpt_buf,
                                     context_window_tokens,
                                 );
+                                observe_selected_finalization_outcome(&outcome);
                             }
                             REQUEST_STATE.remove(&request_id);
                             finalized = true;
@@ -6135,15 +6368,15 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, canonical_telemetry_name, clean_user_prompt,
-        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
-        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
-        derive_display_name, diagnosis, ensure_session_columns, epoch_to_iso8601,
-        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
-        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
-        parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
+        build_codex_finalization_outcome, build_diagnosis_response_json,
+        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
+        canonical_telemetry_name, clean_user_prompt, codex_request_headers_from_ext_proc,
+        codex_response_headers_from_ext_proc, compact_response_summary, context_fill_percent,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, ensure_session_columns,
+        epoch_to_iso8601, extract_explicit_skill_refs, extract_header, extract_headers,
+        extract_working_dir, infer_context_window_tokens, load_degradation_view_from_db,
+        looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
+        now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
         persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
         repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
         request_uses_1m_context, resolve_context_window_tokens, score_recall_doc,
@@ -6152,9 +6385,10 @@ mod tests {
         summarize_hook_tool_input, tokenize_search_text, tool_recall_context,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
         BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult,
-        ProtoHeaderValue, RequestMetadataSource, SelectedResponseAccumulator, SummaryWindowData,
-        CONTEXT_1M_BETA, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS,
-        QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
+        SelectedResponseAccumulator, SummaryWindowData, CONTEXT_1M_BETA, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
+        STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -6571,6 +6805,184 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
+    fn codex_finalization_builds_accounting_and_watch_without_cache_event() {
+        let request = parse_codex_fixture_request("phase-4b-session-001");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4b-001",
+            &request,
+            &response,
+            Duration::from_millis(42),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        assert_eq!(
+            outcome.accounting.identity.session_id,
+            "phase-4b-session-001"
+        );
+        assert_eq!(outcome.accounting.requested_model, "gpt-codex-fixture");
+        assert_eq!(outcome.accounting.total_tokens, 1376);
+        assert!(outcome
+            .watch_events
+            .iter()
+            .any(|event| matches!(event, super::watch::WatchEvent::SessionStart { session_id, initial_prompt: Some(prompt), .. }
+                if session_id == "phase-4b-session-001"
+                    && prompt == "Summarize the current repository status.")));
+        assert!(outcome.watch_events.iter().any(
+            |event| matches!(event, super::watch::WatchEvent::ContextStatus { session_id, .. }
+                if session_id == "phase-4b-session-001")
+        ));
+        assert!(!outcome
+            .watch_events
+            .iter()
+            .any(|event| matches!(event, super::watch::WatchEvent::CacheEvent { .. })));
+    }
+
+    #[test]
+    fn codex_finalization_uses_input_only_for_context_and_totals() {
+        let request = parse_codex_fixture_request("phase-4b-session-002");
+        let response = super::codex_response::CodexResponseSummary {
+            status: super::codex_response::CodexResponseStatus::Completed,
+            served_model: Some("gpt-codex-fixture".to_string()),
+            usage: super::codex_response::CodexUsage {
+                input_tokens: 100,
+                cached_input_tokens: 80,
+                uncached_input_tokens: 20,
+                output_tokens: 10,
+                reasoning_output_tokens: 4,
+                total_tokens: 110,
+            },
+            ..Default::default()
+        };
+
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4b-002",
+            &request,
+            &response,
+            Duration::from_millis(10),
+            200,
+        );
+
+        assert_eq!(outcome.accounting.total_tokens, 110);
+        assert_eq!(outcome.context_fill_percent, 50.0);
+        assert_ne!(outcome.context_fill_percent, 90.0);
+    }
+
+    #[test]
+    fn codex_finalization_derives_model_fallback_event() {
+        let request = parse_codex_fixture_request("phase-4b-session-003");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture-served"),
+        );
+
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4b-003",
+            &request,
+            &response,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        assert!(outcome.watch_events.iter().any(|event| {
+            matches!(event, super::watch::WatchEvent::ModelFallback { session_id, requested, actual }
+                if session_id == "phase-4b-session-003"
+                    && requested == "gpt-codex-fixture"
+                    && actual == "gpt-codex-fixture-served")
+        }));
+    }
+
+    #[test]
+    fn codex_finalization_represents_failed_and_incomplete_statuses() {
+        let request = parse_codex_fixture_request("phase-4b-session-004");
+        let failed = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_failed_stream.sse"),
+            None,
+        );
+        let incomplete = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_incomplete_stream.sse"),
+            None,
+        );
+
+        let failed_outcome = build_codex_finalization_outcome(
+            "req-phase-4b-004a",
+            &request,
+            &failed,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+        let incomplete_outcome = build_codex_finalization_outcome(
+            "req-phase-4b-004b",
+            &request,
+            &incomplete,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        assert_eq!(
+            failed_outcome.accounting.status,
+            super::codex_accounting::CodexTurnStatus::Failed
+        );
+        assert_eq!(
+            incomplete_outcome.accounting.status,
+            super::codex_accounting::CodexTurnStatus::Incomplete
+        );
+    }
+
+    #[test]
+    fn selected_codex_finalization_returns_codex_outcome() {
+        let request = parse_codex_fixture_request("phase-4b-session-005");
+        let mut accumulator =
+            SelectedResponseAccumulator::for_request_source(RequestMetadataSource::CodexResponses);
+        accumulator.apply_response_headers(&super::codex_response::CodexResponseHeaders {
+            http_status: Some(200),
+            served_model: Some("gpt-codex-fixture".to_string()),
+        });
+        accumulator
+            .process_chunk(include_bytes!(
+                "../../test/fixtures/openai_responses_text_stream.sse"
+            ))
+            .expect("process codex fixture");
+
+        let outcome = super::finalize_selected_response(
+            &mut accumulator,
+            Some(&request),
+            "req-phase-4b-005",
+            "gpt-codex-fixture",
+            &Instant::now(),
+            &[],
+            0,
+            "",
+            "",
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        let SelectedFinalizationOutcome::Codex(outcome) =
+            outcome.expect("codex finalization outcome")
+        else {
+            panic!("expected Codex finalization outcome");
+        };
+        assert_eq!(
+            outcome.accounting.identity.session_id,
+            "phase-4b-session-005"
+        );
+        assert_eq!(
+            outcome.accounting.status,
+            super::codex_accounting::CodexTurnStatus::Completed
+        );
+        assert!(super::SESSION_BUDGETS.get("phase-4b-session-005").is_none());
+
+        let _ = diagnosis::SESSIONS.remove(&super::codex_request::fallback_session_hash(
+            "",
+            "phase-4b-session-005",
+        ));
+    }
+
+    #[test]
     fn upstream_adjustment_strips_1m_model_alias_and_adds_beta_header() {
         let body = br#"{
           "model": "claude-opus-4-7[1m]",
@@ -6966,6 +7378,35 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             ],
         )
         .expect("insert turn snapshot");
+    }
+
+    fn parse_codex_fixture_request(session_id: &str) -> super::codex_request::ParsedCodexRequest {
+        super::codex_request::parse_codex_responses_request(
+            include_bytes!("../../test/fixtures/openai_responses_minimal_text_request.json"),
+            super::codex_request::CodexRequestHeaders {
+                session_id: Some(session_id.to_string()),
+                client_request_id: None,
+            },
+        )
+        .expect("parse codex fixture request")
+    }
+
+    fn accumulate_codex_fixture_response(
+        stream: &str,
+        served_model_header: Option<&str>,
+    ) -> super::codex_response::CodexResponseSummary {
+        let mut accumulator = super::codex_response::CodexResponsesAccumulator::new();
+        if let Some(served_model) = served_model_header {
+            accumulator.apply_headers(&super::codex_response::CodexResponseHeaders {
+                http_status: Some(200),
+                served_model: Some(served_model.to_string()),
+            });
+        }
+        accumulator
+            .process_chunk(stream.as_bytes())
+            .expect("process codex fixture stream");
+        accumulator.finish().expect("finish codex fixture stream");
+        accumulator.summary()
     }
 
     fn make_http_headers(entries: &[(&str, &str)]) -> HttpHeaders {

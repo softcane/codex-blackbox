@@ -129,6 +129,25 @@ Pricing remains explicit and untrusted in Phase 4A. Unknown OpenAI/Codex model
 ids produce an `UnknownModel`/unpriced result with no nonzero fallback cost and
 are not trusted for budget enforcement.
 
+## Phase 4B Finalization Boundary
+
+Phase 4B wires the fixture-only Codex accounting summary into a minimal
+in-memory finalization path. It still does not persist Codex turns to SQLite,
+does not emit Anthropic cache TTL/rebuild events, and does not make real Codex
+traffic supported.
+
+Codex watch events are limited to:
+
+- `SessionStart` when a session identity and first prompt excerpt are available.
+- `ContextStatus` using `input_tokens / context_window_tokens`; cached input is
+  not added again.
+- `ModelFallback` when requested and served models differ.
+
+Codex metrics record request count, input tokens, output tokens, duration,
+context status, and model fallback labels where applicable. Unknown/untrusted
+Codex pricing contributes no estimated cost and is not used for session budget
+enforcement.
+
 ## Headers To Verify Later
 
 The fake contract records these headers as candidates to verify in real Codex

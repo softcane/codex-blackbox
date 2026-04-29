@@ -450,6 +450,28 @@ pub fn record_request(
         .observe(duration_seconds.max(0.0));
 }
 
+pub fn record_codex_turn(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    duration_seconds: f64,
+) {
+    let model = normalize_model(model);
+    METRICS.requests_total.with_label_values(&[model]).inc();
+    METRICS
+        .tokens_total
+        .with_label_values(&[model, "input"])
+        .inc_by(input_tokens);
+    METRICS
+        .tokens_total
+        .with_label_values(&[model, "output"])
+        .inc_by(output_tokens);
+    METRICS
+        .turn_duration_seconds
+        .with_label_values(&[model])
+        .observe(duration_seconds.max(0.0));
+}
+
 pub fn record_cache_event(model: &str, event_type: &str, estimated_waste_dollars: Option<f64>) {
     let model = normalize_model(model);
     let event_type = normalize_cache_event(event_type);
