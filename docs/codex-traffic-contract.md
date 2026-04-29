@@ -148,6 +148,23 @@ context status, and model fallback labels where applicable. Unknown/untrusted
 Codex pricing contributes no estimated cost and is not used for session budget
 enforcement.
 
+## Phase 5A Fake Envoy E2E
+
+Phase 5A adds a local-only fake OpenAI Responses upstream for Envoy tests:
+
+- `test/fake-openai.py` accepts `POST /v1/responses` and streams checked-in
+  Responses SSE fixtures.
+- `test/envoy.openai-responses.e2e.yaml` routes the local Envoy listener to the
+  fake upstream while keeping ext_proc enabled, `failure_mode_allow: true`, and
+  `response_body_mode: STREAMED`.
+- `test/e2e-openai-responses.sh` sends a fixture request through Envoy, verifies
+  streamed Responses events, checks Codex `SessionStart` and `ContextStatus`
+  watch events, and asserts no Anthropic `CacheEvent` TTL/rebuild fields are
+  emitted for the Codex turn.
+
+This e2e path uses no OpenAI credentials and does not contact real OpenAI or
+real Codex services.
+
 ## Headers To Verify Later
 
 The fake contract records these headers as candidates to verify in real Codex

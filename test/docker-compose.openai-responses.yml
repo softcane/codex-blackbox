@@ -1,0 +1,37 @@
+# Phase 5A fake OpenAI Responses E2E override.
+# Routes only local test traffic to test/fake-openai.py; production Envoy
+# remains unchanged and real OpenAI/Codex is not contacted.
+
+services:
+  fake-openai:
+    image: python:3.12-alpine
+    command: ["python", "/fake-openai.py"]
+    volumes:
+      - ./test/fake-openai.py:/fake-openai.py:ro
+      - ./test/fixtures:/fixtures:ro
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  envoy:
+    volumes:
+      - ./test/envoy.openai-responses.e2e.yaml:/etc/envoy/envoy.yaml:ro
+    depends_on:
+      coditor-core:
+        condition: service_healthy
+      fake-openai:
+        condition: service_healthy
+
+  coditor-core:
+    environment:
+      - CODITOR_SESSION_TIMEOUT_MINUTES=1
