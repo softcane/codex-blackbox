@@ -1,0 +1,200 @@
+# Remaining Phases
+
+Current checkpoint: Phase 6A is complete at commit `11dad54` (`add coditor cli doctor groundwork`).
+
+Coditor already has unit, contract, and fake Envoy e2e tests. The remaining question is when to start each kind of testing.
+
+## Where We Are
+
+Completed:
+
+- Phase 0A: skeleton copy and repo bootstrap.
+- Phase 0B: mechanical Coditor rename.
+- Phase 1: Codex/OpenAI traffic contract and fixtures.
+- Phase 2A: Codex request parser behind tests.
+- Phase 2B: Codex request parser wired into request metadata path.
+- Phase 3A: Codex Responses SSE accumulator behind tests.
+- Phase 3B: Codex response accumulator wired into response path.
+- Phase 4A: Codex accounting helpers behind tests.
+- Phase 4B: minimal Codex finalization/watch/metrics path.
+- Phase 5A: fake OpenAI Responses upstream through Envoy.
+- Phase 5B: manual OpenAI API-key Envoy config.
+- Phase 6A: CLI doctor and config groundwork.
+
+## Remaining Work
+
+The remaining work spans Phase 4C, Phase 6B/6C, and Phase 7 through Phase 10.
+There is also one missing execution gate from the Phase 4 work: Codex
+SQLite persistence/schema mapping. That gate is required before automated DB
+checks can be meaningful.
+
+For execution, split them into these smaller gates:
+
+### Phase 4C: Codex Persistence And DB Checks
+
+Persist Codex turns without reusing Anthropic cache fields incorrectly:
+
+- store input, cached input, uncached input, output, reasoning output, and served model
+- keep request rows immutable
+- avoid double-counting cached input
+- make failed/incomplete outcomes queryable
+- add DB assertions for fake Codex turns
+
+Done when SQLite can be checked for Codex sessions and token accounting without
+using Anthropic cache TTL/rebuild semantics.
+
+### Phase 6B: Safe `coditor run -- codex ...` Wiring
+
+Add a conservative wrapper path for Codex:
+
+- point Codex at the local Coditor proxy
+- disable Codex request compression for MVP
+- preserve the user environment
+- print proxy/watch URLs
+- avoid editing `~/.codex/config.toml` unless explicitly requested
+
+Done when `coditor run -- codex ...` can be tested against the fake/manual path without pretending ChatGPT-auth routing works.
+
+### Phase 6C: Watch And Tmux Codex Polish
+
+Finish user-facing watch behavior:
+
+- remove stale Claude/Anthropic labels from active Coditor UI
+- render cached input and reasoning token language correctly
+- keep no-TTL cached input behavior clear
+- ensure `watch --tmux` still self-bootstraps and renders Codex sessions
+
+Done when inline watch and tmux views make sense for Codex fake sessions.
+
+### Phase 7: Codex Hooks Integration
+
+Add `/api/hooks/codex` and hook-helper/config output if Codex hooks are available:
+
+- parse fake Codex hook payloads
+- decide whether hooks create sessions or enrich proxy sessions
+- correlate hook ids with proxy session ids
+- emit tool events without duplicating proxy events
+
+Done when fake hook payloads produce expected watch events and hook failures cannot affect model traffic.
+
+### Phase 8: Diagnostics, Rate Limits, And Context Intelligence
+
+Make diagnosis useful for Codex:
+
+- failed/incomplete responses
+- repeated tool failures
+- model mismatch
+- context pressure
+- high reasoning token use
+- low cached-input reuse
+- OpenAI rate-limit headers if verified
+
+Done when diagnosis endpoints and watch events use Codex-native signals and metrics still avoid session-id labels.
+
+### Phase 9A: Broader Fake E2E Coverage
+
+Expand fake tests beyond the current text-only Envoy path:
+
+- parallel session isolation
+- watch replay race
+- failure-open behavior after core shutdown
+- failed and incomplete Responses streams
+- CLI smoke through fake proxy
+- no double-counting of cached input in e2e assertions
+
+Done when fake e2e validates the proxy, parser, finalization, watch, CLI, and failure posture without OpenAI credentials.
+
+### Phase 9B: First Real Codex Smoke Test
+
+Run a controlled real Codex session only after Phase 6B and enough fake e2e coverage are passing.
+
+Minimum preconditions:
+
+- CLI can point Codex at Coditor intentionally.
+- Request compression is disabled or decoded.
+- Manual OpenAI API-key mode is documented.
+- Fake e2e still passes.
+- The smoke test has clear rollback instructions.
+
+Done when the real smoke test is documented with date, Codex version, config, command, observed events, and limitations.
+
+### Phase 9C: Automated Multi-Session Dogfood Feedback
+
+Build the real automated feedback harness described in
+`docs/automated-feedback-testing.md`:
+
+- launch 3-4 Codex sessions
+- cover same-repo and different-repo sessions
+- run read-only prompts, tool-call prompts, and MCP prompts when MCP is configured
+- capture `/watch`
+- query SQLite
+- query Prometheus
+- verify Grafana provisioning/dashboard availability
+- write a report that names passed, failed, skipped, and missing capabilities
+
+Done when the harness can say exactly what is left rather than only pass/fail.
+
+### Phase 10: Documentation And Release Readiness
+
+Make the repo usable by someone who did not watch the migration happen:
+
+- README
+- architecture docs
+- troubleshooting docs
+- ADRs
+- known limitations
+- supported runtime/auth modes
+- repeatable fake and real smoke-test commands
+
+Done when docs match the code and do not overclaim support.
+
+## Testing Gates
+
+Testing has already started.
+
+Current test level:
+
+- Unit and contract tests pass.
+- Fake OpenAI Responses Envoy e2e passes.
+- Manual OpenAI Envoy config validates statically.
+
+Next testing milestones:
+
+1. Completed after Phase 6A: CLI doctor/config output testing.
+2. After Phase 6B: first wrapper-level Codex command testing against the local proxy path.
+3. After Phase 4C: SQLite assertions for Codex sessions and turns.
+4. After Phase 6C: watch and tmux UX testing with fake Codex sessions.
+5. After Phase 7: fake Codex hook/tool/MCP testing.
+6. After Phase 8: diagnosis, Prometheus, and Grafana checks become meaningful.
+7. After Phase 9A: full fake e2e regression testing.
+8. After Phase 9B: first real Codex smoke test.
+9. After Phase 9C: automated 3-4 session dogfood feedback.
+
+Do not treat Coditor as ready for daily dogfood until Phase 9C can produce an
+automated feedback report for multiple real Codex sessions.
+
+## Short Answer
+
+Left before the first small real Codex smoke test: about four execution gates.
+
+- Phase 4C
+- Phase 6B
+- Phase 6C
+- Phase 9A minimum fake e2e expansion
+
+Left before the automated 3-4 session dogfood test the user described:
+
+- Phase 4C
+- Phase 6B
+- Phase 6C
+- Phase 7
+- Phase 8
+- Phase 9A
+- Phase 9B
+- Phase 9C
+
+Phase 9C is the target for automated feedback across same/different repos, read
+queries, tool calls, MCP when configured, SQLite, Prometheus, and Grafana.
+
+Left before release-quality Coditor: Phase 4C plus the remaining Phase 6 through
+Phase 10 work.
