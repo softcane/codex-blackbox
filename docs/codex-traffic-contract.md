@@ -409,6 +409,39 @@ Limitations:
 - Codex cached-input reuse is treated as a diagnosis signal only after at least
   three turns; OpenAI cache-affinity behavior still needs real validation.
 
+## Phase 8B Observability Boundary
+
+Phase 8B adds a local observability validation around the fake OpenAI Responses
+stack. It starts Prometheus and Grafana with the fake upstream, sends a fixture
+Responses turn, and verifies that Coditor exposes bounded Codex-relevant
+metrics without requiring OpenAI credentials.
+
+Prometheus checks currently cover:
+
+- `coditor_requests_total`
+- `coditor_tokens_total`
+- `coditor_turn_duration_seconds`
+- `coditor_context_fill_percent`
+- `coditor_sessions_degraded_total` with bounded `codex_*` cause labels
+- `coditor_mcp_events_total`
+- absence of session-id metric labels and fixture session-id label values
+
+Grafana checks currently cover:
+
+- Grafana HTTP health.
+- provisioned `coditor-main` dashboard availability.
+- Phase 8B dashboard panels for Codex/OpenAI request count, token kinds,
+  context fill, and Codex diagnosis causes.
+- dashboard panel expressions reference metrics that Prometheus has scraped.
+
+Rate-limit boundary:
+
+- Coditor still does not parse OpenAI rate-limit headers as production truth.
+- `test/fixtures/openai_rate_limit_candidate_headers.txt` records candidate
+  header names only as an unverified fixture boundary for future tests.
+- Real header names, units, reset semantics, and availability must be captured
+  from real Codex/OpenAI traffic before any production parser is added.
+
 ## Headers To Verify Later
 
 The fake contract records these headers as candidates to verify in real Codex

@@ -102,6 +102,19 @@ The harness should verify:
 
 This can start as static provisioning validation plus HTTP availability. Full visual validation can come later.
 
+Phase 8B adds a narrow local prerequisite for these checks:
+
+```sh
+./test/observability-openai-responses.sh
+```
+
+That script uses only the fake OpenAI Responses upstream. It starts
+Prometheus and Grafana, verifies Codex request/token/context/diagnosis metrics,
+checks that metric labels do not contain session ids, and confirms the
+provisioned dashboard's Phase 8B panels reference metrics Prometheus has
+scraped. It is not the Phase 9C dogfood harness and does not launch real Codex
+sessions.
+
 ### Tool And MCP Assertions
 
 Tool telemetry should verify:
@@ -158,7 +171,8 @@ For the full version that checks tools, MCP, diagnosis, Prometheus, and Grafana,
 
 - Phase 6C: watch/tmux Codex rendering polish.
 - Phase 7: Codex hook/tool/MCP telemetry.
-- Phase 8: diagnostics, rate-limit, and context intelligence.
+- Phase 8: diagnostics, observability validation, rate-limit boundary, and
+  context intelligence.
 
 ## Minimal First Dogfood
 

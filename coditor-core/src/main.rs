@@ -3173,6 +3173,11 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
         outcome.accounting.output_tokens,
         duration.as_secs_f64(),
     );
+    metrics::record_context_fill_percent(
+        "codex_responses",
+        metric_model,
+        outcome.context_fill_percent,
+    );
 
     for event in &outcome.watch_events {
         match event {

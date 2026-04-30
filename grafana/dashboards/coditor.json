@@ -31,7 +31,7 @@
       },
       "id": 21,
       "options": {
-        "content": "### How to read this dashboard\n\nUNPORTED: copied baseline, Codex support not implemented yet. This dashboard still reflects Anthropic/Claude semantics.\n\n**Degraded session** means the session hit a real problem, not just an early warning.\n\n**Degraded sessions %** is the main health number. Lower is better.\n\n**Degraded causes** tells you what kind of problem happened, so you can see patterns.\n\n**Cache reuse %** shows how much old context was reused instead of rebuilt. Higher is better because it usually means faster and cheaper sessions.\n\n**TTL misses** mean the copied Anthropic baseline cache expired before the next turn, so context had to be rebuilt.\n\n**Thrash misses** mean the cache had to be rebuilt again very quickly, which usually points to something in the setup or context changing too often.\n\n**Model fallbacks** mean the requested model was not the one that actually got used.\n\n**Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.",
+        "content": "### How to read this dashboard\n\nPhase 8B validates fixture-first Codex/OpenAI proxy observability only. This dashboard is not production readiness proof and still includes some copied cache-history panels until real Codex captures verify the right long-term views.\n\n**Codex/OpenAI requests and tokens** come from local fake or proxied Responses traffic observed by coditor-core.\n\n**Context fill** is a bounded histogram of context-window fill percentage; it has provider and normalized model labels only.\n\n**Codex diagnosis causes** show bounded `codex_*` degradation causes. Session ids must not appear in metric labels.\n\n**Cache reuse %** is historical token reuse. For Codex this remains fixture-driven until real cache behavior is captured.\n\n**Model fallbacks** mean the requested model was not the one that actually got used.\n\n**Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.",
         "mode": "markdown"
       },
       "pluginVersion": "11.1.0",
@@ -1461,6 +1461,245 @@
       "title": "MCP lifecycle by tool since start",
       "description": "Current cumulative MCP lifecycle counts by server, tool, event type, and source since the current coditor-core start. Only non-zero rows are shown.",
       "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "id": 28,
+      "panels": [],
+      "title": "Codex fixture observability",
+      "description": "Fixture-first Codex/OpenAI proxy metrics. These panels intentionally use bounded labels and do not require OpenAI credentials.",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 63
+      },
+      "id": 29,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum(coditor_requests_total) or vector(0)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Codex/OpenAI requests since start",
+      "description": "Completed proxy turns observed by coditor-core since the current process start.",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 63
+      },
+      "id": 30,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (kind) (coditor_tokens_total) or vector(0)",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Codex/OpenAI tokens by kind",
+      "description": "Input, output, and copied baseline cache token counters by normalized model and token kind.",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 63
+      },
+      "id": 31,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(coditor_context_fill_percent_bucket{provider=\"codex_responses\"}[5m])))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "Codex context fill p95",
+      "description": "Five-minute p95 of observed Codex Responses context-window fill percentage.",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 63
+      },
+      "id": 32,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "coditor_sessions_degraded_total{cause_type=~\"codex_.*\"} >= 0",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{cause_type}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Codex diagnosis causes",
+      "description": "Bounded Codex-native diagnosis cause counters. Session ids must never appear as labels.",
+      "type": "table"
     }
   ],
   "refresh": "30s",
@@ -1480,6 +1719,6 @@
   "timezone": "",
   "title": "Coditor — estimated cost & quality over time",
   "uid": "coditor-main",
-  "version": 3,
+  "version": 4,
   "weekStart": "monday"
 }

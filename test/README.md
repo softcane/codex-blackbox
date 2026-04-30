@@ -22,6 +22,24 @@ Run it from the repository root:
 The script uses checked-in fixtures only. It does not require OpenAI
 credentials and must not be treated as real Codex support validation.
 
+## Phase 8B Fake Observability Validation
+
+`test/observability-openai-responses.sh` starts the fake OpenAI Responses stack
+plus Prometheus and Grafana. It sends one fixture Responses request, verifies
+Codex request/token/context/diagnosis metrics, checks that Prometheus labels do
+not leak session ids, and confirms the provisioned Coditor dashboard loads with
+Phase 8B panels backed by scraped metrics.
+
+Run it from the repository root:
+
+```sh
+./test/observability-openai-responses.sh
+```
+
+This validation does not require OpenAI credentials and does not launch real
+Codex sessions. Rate-limit header names remain unverified; the candidate file
+under `test/fixtures/` is fixture-only documentation, not parser input.
+
 ## Phase 5B Manual OpenAI API-Key Config
 
 `docker-compose.openai.yml` is an opt-in Compose override that mounts

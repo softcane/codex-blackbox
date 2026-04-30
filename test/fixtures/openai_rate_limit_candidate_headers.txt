@@ -1,0 +1,12 @@
+# Fixture-only candidate headers for future rate-limit boundary tests.
+#
+# These names and units are unverified for Codex/OpenAI Responses traffic
+# observed through Coditor. Do not parse them as production truth until a real
+# capture confirms exact names, presence, units, and reset semantics.
+
+x-ratelimit-limit-requests: 1000
+x-ratelimit-remaining-requests: 999
+x-ratelimit-reset-requests: 1s
+x-ratelimit-limit-tokens: 200000
+x-ratelimit-remaining-tokens: 199000
+x-ratelimit-reset-tokens: 1s

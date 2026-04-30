@@ -16,6 +16,7 @@ const LIVE_SKILL_EVENT_TYPES: [&str; 5] = ["expected", "fired", "missed", "misfi
 const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
 const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
 const LIVE_MCP_EVENT_SOURCES: [&str; 2] = ["hook", "proxy"];
+const LIVE_CONTEXT_PROVIDERS: [&str; 2] = ["codex_responses", "unknown"];
 pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
 pub const HISTORY_CAUSE_TYPES: [&str; 17] = [
     "cache_miss_ttl",
@@ -92,6 +93,7 @@ pub struct CoditorMetrics {
     history_tool_failures: IntGaugeVec,
     history_refresh_timestamp_seconds: IntGauge,
     turn_duration_seconds: HistogramVec,
+    context_fill_percent: HistogramVec,
     estimated_session_cost_dollars: HistogramVec,
     session_turns: Histogram,
 }
@@ -351,6 +353,15 @@ impl CoditorMetrics {
                 &["model"]
             )
             .expect("register coditor_turn_duration_seconds"),
+            context_fill_percent: register_histogram_vec!(
+                histogram_opts!(
+                    "coditor_context_fill_percent",
+                    "Observed context-window fill percentage by provider and normalized model.",
+                    vec![10.0, 25.0, 50.0, 70.0, 80.0, 90.0, 95.0, 100.0]
+                ),
+                &["provider", "model"]
+            )
+            .expect("register coditor_context_fill_percent"),
             estimated_session_cost_dollars: register_histogram_vec!(
                 histogram_opts!(
                     "coditor_estimated_session_cost_dollars",
@@ -396,6 +407,11 @@ pub fn init() {
         metrics
             .estimated_session_cost_dollars
             .with_label_values(&[model]);
+        for provider in LIVE_CONTEXT_PROVIDERS {
+            metrics
+                .context_fill_percent
+                .with_label_values(&[provider, model]);
+        }
         for actual in LIVE_MODELS {
             metrics
                 .model_fallback_total
@@ -420,6 +436,14 @@ pub fn init() {
             ensure_skill_metric_labels("unknown", event_type, source);
         }
     }
+    for cause_type in HISTORY_CAUSE_TYPES {
+        metrics
+            .sessions_degraded_total
+            .with_label_values(&[cause_type]);
+    }
+    metrics
+        .sessions_degraded_total
+        .with_label_values(&["unknown"]);
 }
 
 pub fn record_request(
@@ -541,6 +565,13 @@ pub fn record_context_status(turns_to_compact: Option<u32>) {
     if turns_to_compact == Some(0) {
         METRICS.compaction_suspected_total.inc();
     }
+}
+
+pub fn record_context_fill_percent(provider: &str, model: &str, fill_percent: f64) {
+    METRICS
+        .context_fill_percent
+        .with_label_values(&[normalize_context_provider(provider), normalize_model(model)])
+        .observe(fill_percent.clamp(0.0, 100.0));
 }
 
 pub fn record_tool_call(tool_name: &str) {
@@ -857,6 +888,13 @@ fn normalize_model(model: &str) -> &'static str {
     }
 }
 
+fn normalize_context_provider(provider: &str) -> &'static str {
+    match provider {
+        "codex_responses" => "codex_responses",
+        _ => "unknown",
+    }
+}
+
 fn normalize_cache_event(event_type: &str) -> &'static str {
     match event_type {
         "hit" => "hit",
@@ -890,8 +928,10 @@ fn normalize_outcome(outcome: &str) -> &'static str {
 fn normalize_cause(cause_type: &str) -> &str {
     if cause_type.is_empty() {
         "unknown"
-    } else {
+    } else if HISTORY_CAUSE_TYPES.contains(&cause_type) {
         cause_type
+    } else {
+        "unknown"
     }
 }
 
@@ -991,7 +1031,9 @@ pub fn mcp_tool_labels(tool_name: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::mcp_tool_labels;
+    use super::{
+        init, mcp_tool_labels, record_context_fill_percent, record_degraded_cause, render,
+    };
 
     #[test]
     fn parses_mcp_tool_labels() {
@@ -1015,5 +1057,24 @@ mod tests {
         assert_eq!(mcp_tool_labels("mcp__github"), None);
         assert_eq!(mcp_tool_labels("mcp____get_issue"), None);
         assert_eq!(mcp_tool_labels("mcp__github__"), None);
+    }
+
+    #[test]
+    fn codex_observability_metrics_are_bounded_and_initialized() {
+        init();
+        record_context_fill_percent("codex_responses", "gpt-codex-fixture", 42.0);
+        record_degraded_cause("session-id-like-cause-phase-8b");
+
+        let (_, body) = render().expect("render metrics");
+        assert!(body.contains(
+            "coditor_context_fill_percent_count{model=\"other\",provider=\"codex_responses\"}"
+        ));
+        assert!(
+            body.contains("coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}")
+        );
+        assert!(body.contains("coditor_sessions_degraded_total{cause_type=\"unknown\"}"));
+        assert!(!body.contains("session-id-like-cause-phase-8b"));
+        assert!(!body.contains("session_id="));
+        assert!(!body.contains("coditor_session_id="));
     }
 }
