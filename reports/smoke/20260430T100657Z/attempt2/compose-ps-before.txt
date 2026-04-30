@@ -1,0 +1,6 @@
+NAME                     IMAGE                           COMMAND                  SERVICE        CREATED         STATUS                   PORTS
+coditor-coditor-core-1   coditor-coditor-core            "coditor-core"           coditor-core   3 minutes ago   Up 3 minutes (healthy)   127.0.0.1:9091->9090/tcp
+coditor-envoy-1          envoyproxy/envoy:v1.32-latest   "/docker-entrypoint.…"   envoy          3 minutes ago   Up 3 minutes (healthy)   127.0.0.1:10000->10000/tcp
+coditor-fake-openai-1    python:3.12-alpine              "python /fake-openai…"   fake-openai    3 minutes ago   Up 3 minutes (healthy)   8000/tcp
+coditor-grafana-1        grafana/grafana:11.1.0          "/run.sh"                grafana        3 minutes ago   Up 3 minutes             127.0.0.1:3000->3000/tcp
+coditor-prometheus-1     prom/prometheus:v2.52.0         "/bin/prometheus --c…"   prometheus     3 minutes ago   Up 3 minutes             127.0.0.1:9092->9090/tcp

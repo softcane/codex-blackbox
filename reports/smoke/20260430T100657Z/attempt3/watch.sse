@@ -1,0 +1,12 @@
+data: {"type":"session_start","session_id":"019ddde0-3124-7c03-ab92-cd7febebe196","display_name":"gpt-5.3-codex","model":"gpt-5.3-codex","initial_prompt":"# AGENTS.md instructions for /Users/pradeepsingh/code/coditor <INSTRUCTIONS> # Coditor Agent Instructions Coditor is not implemented yet. Files copied from Clauditor are an unported baseline until a later phase explicitly replaces Clauditor behavior. - Treat copied Clauditor behavior, naming, tests, configuration, and ..."}
+
+data: {"type":"codex_turn_summary","session_id":"019ddde0-3124-7c03-ab92-cd7febebe196","status":"completed","requested_model":"gpt-5.3-codex","served_model":"gpt-5.3-codex","input_tokens":1280,"cached_input_tokens":512,"uncached_input_tokens":768,"output_tokens":96,"reasoning_output_tokens":32,"total_tokens":1376}
+
+data: {"type":"context_status","session_id":"019ddde0-3124-7c03-ab92-cd7febebe196","fill_percent":0.64,"context_window_tokens":200000,"turns_to_compact":null}
+
+:
+
+:
+
+:
+

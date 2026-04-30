@@ -1,0 +1,26 @@
+{
+  "status": "pass_fake_only",
+  "timestamp": "20260430T100657Z",
+  "coditor_commit": "f0c4b71",
+  "codex_version": "codex-cli 0.122.0",
+  "final_attempt": "attempt3",
+  "session_id": "019ddde0-3124-7c03-ab92-cd7febebe196",
+  "codex_exit_code": 0,
+  "fake_upstream_post_observed": true,
+  "watch_events": ["session_start", "codex_turn_summary", "context_status"],
+  "sqlite_provider": "codex_responses",
+  "tokens": {
+    "input": 1280,
+    "cached_input": 512,
+    "uncached_input": 768,
+    "output": 96,
+    "reasoning_output": 32,
+    "total": 1376
+  },
+  "real_openai_validated": false,
+  "notes": [
+    "attempt1 failed before model traffic due default Codex home ChatGPT auth versus forced API-key mode",
+    "attempt2 succeeded but attempted unrelated chatgpt.com plugin metadata warmup",
+    "attempt3 succeeded with plugins and general_analytics disabled and no api.openai.com/chatgpt.com references in attempt3 artifacts"
+  ]
+}

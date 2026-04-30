@@ -1,0 +1,1 @@
+OPENAI_API_KEY=[dummy-redacted] cargo run -q -p coditor-cli -- run -- codex exec --cd /Users/pradeepsingh/code/coditor --sandbox read-only --json "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."

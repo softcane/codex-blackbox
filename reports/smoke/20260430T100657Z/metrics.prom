@@ -1,0 +1,554 @@
+# HELP coditor_active_sessions Tracked active sessions currently in memory.
+# TYPE coditor_active_sessions gauge
+coditor_active_sessions 0
+# HELP coditor_cache_events_total Session-scoped cache events emitted for tracked sessions.
+# TYPE coditor_cache_events_total counter
+coditor_cache_events_total{event_type="cold_start",model="haiku"} 0
+coditor_cache_events_total{event_type="cold_start",model="opus"} 0
+coditor_cache_events_total{event_type="cold_start",model="other"} 0
+coditor_cache_events_total{event_type="cold_start",model="sonnet"} 0
+coditor_cache_events_total{event_type="miss_thrash",model="haiku"} 0
+coditor_cache_events_total{event_type="miss_thrash",model="opus"} 0
+coditor_cache_events_total{event_type="miss_thrash",model="other"} 0
+coditor_cache_events_total{event_type="miss_thrash",model="sonnet"} 0
+coditor_cache_events_total{event_type="miss_ttl",model="haiku"} 0
+coditor_cache_events_total{event_type="miss_ttl",model="opus"} 0
+coditor_cache_events_total{event_type="miss_ttl",model="other"} 0
+coditor_cache_events_total{event_type="miss_ttl",model="sonnet"} 0
+coditor_cache_events_total{event_type="partial",model="haiku"} 0
+coditor_cache_events_total{event_type="partial",model="opus"} 0
+coditor_cache_events_total{event_type="partial",model="other"} 0
+coditor_cache_events_total{event_type="partial",model="sonnet"} 0
+# HELP coditor_compaction_suspected_total Compaction suspicion signals emitted by heuristics or explicit events.
+# TYPE coditor_compaction_suspected_total counter
+coditor_compaction_suspected_total 0
+# HELP coditor_context_fill_percent Observed context-window fill percentage by provider and normalized model.
+# TYPE coditor_context_fill_percent histogram
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="10"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="25"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="50"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="70"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="80"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="90"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="95"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="100"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="codex_responses",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="haiku",provider="codex_responses"} 0
+coditor_context_fill_percent_count{model="haiku",provider="codex_responses"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="10"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="25"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="50"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="70"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="80"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="90"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="95"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="100"} 0
+coditor_context_fill_percent_bucket{model="haiku",provider="unknown",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="haiku",provider="unknown"} 0
+coditor_context_fill_percent_count{model="haiku",provider="unknown"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="10"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="25"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="50"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="70"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="80"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="90"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="95"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="100"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="codex_responses",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="opus",provider="codex_responses"} 0
+coditor_context_fill_percent_count{model="opus",provider="codex_responses"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="10"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="25"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="50"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="70"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="80"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="90"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="95"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="100"} 0
+coditor_context_fill_percent_bucket{model="opus",provider="unknown",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="opus",provider="unknown"} 0
+coditor_context_fill_percent_count{model="opus",provider="unknown"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="10"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="25"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="50"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="70"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="80"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="90"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="95"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="100"} 0
+coditor_context_fill_percent_bucket{model="other",provider="codex_responses",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="other",provider="codex_responses"} 0
+coditor_context_fill_percent_count{model="other",provider="codex_responses"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="10"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="25"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="50"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="70"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="80"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="90"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="95"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="100"} 0
+coditor_context_fill_percent_bucket{model="other",provider="unknown",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="other",provider="unknown"} 0
+coditor_context_fill_percent_count{model="other",provider="unknown"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="10"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="25"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="50"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="70"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="80"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="90"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="95"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="100"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="codex_responses",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="sonnet",provider="codex_responses"} 0
+coditor_context_fill_percent_count{model="sonnet",provider="codex_responses"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="10"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="25"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="50"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="70"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="80"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="90"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="95"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="100"} 0
+coditor_context_fill_percent_bucket{model="sonnet",provider="unknown",le="+Inf"} 0
+coditor_context_fill_percent_sum{model="sonnet",provider="unknown"} 0
+coditor_context_fill_percent_count{model="sonnet",provider="unknown"} 0
+# HELP coditor_degraded_sessions_total Sessions whose diagnosis reported at least one degradation cause.
+# TYPE coditor_degraded_sessions_total counter
+coditor_degraded_sessions_total 0
+# HELP coditor_estimated_cache_waste_dollars_total Estimated avoidable cache rebuild waste in USD from the active pricing catalog.
+# TYPE coditor_estimated_cache_waste_dollars_total counter
+coditor_estimated_cache_waste_dollars_total{model="haiku"} 0
+coditor_estimated_cache_waste_dollars_total{model="opus"} 0
+coditor_estimated_cache_waste_dollars_total{model="other"} 0
+coditor_estimated_cache_waste_dollars_total{model="sonnet"} 0
+# HELP coditor_estimated_cost_dollars_total Total estimated cost in USD from the active pricing catalog.
+# TYPE coditor_estimated_cost_dollars_total counter
+coditor_estimated_cost_dollars_total{model="haiku"} 0
+coditor_estimated_cost_dollars_total{model="opus"} 0
+coditor_estimated_cost_dollars_total{model="other"} 0
+coditor_estimated_cost_dollars_total{model="sonnet"} 0
+# HELP coditor_estimated_session_cost_dollars Estimated session costs in USD from the active pricing catalog.
+# TYPE coditor_estimated_session_cost_dollars histogram
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="0.01"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="0.05"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="0.1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="0.5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="10"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="50"} 0
+coditor_estimated_session_cost_dollars_bucket{model="haiku",le="+Inf"} 0
+coditor_estimated_session_cost_dollars_sum{model="haiku"} 0
+coditor_estimated_session_cost_dollars_count{model="haiku"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="0.01"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="0.05"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="0.1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="0.5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="10"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="50"} 0
+coditor_estimated_session_cost_dollars_bucket{model="opus",le="+Inf"} 0
+coditor_estimated_session_cost_dollars_sum{model="opus"} 0
+coditor_estimated_session_cost_dollars_count{model="opus"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="0.01"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="0.05"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="0.1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="0.5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="10"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="50"} 0
+coditor_estimated_session_cost_dollars_bucket{model="other",le="+Inf"} 0
+coditor_estimated_session_cost_dollars_sum{model="other"} 0
+coditor_estimated_session_cost_dollars_count{model="other"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="0.01"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="0.05"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="0.1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="0.5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="1"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="5"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="10"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="50"} 0
+coditor_estimated_session_cost_dollars_bucket{model="sonnet",le="+Inf"} 0
+coditor_estimated_session_cost_dollars_sum{model="sonnet"} 0
+coditor_estimated_session_cost_dollars_count{model="sonnet"} 0
+# HELP coditor_history_avg_estimated_session_cost_dollars Historical average estimated session cost in USD by rolling window and model family.
+# TYPE coditor_history_avg_estimated_session_cost_dollars gauge
+coditor_history_avg_estimated_session_cost_dollars{model="haiku",window="1d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="haiku",window="30d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="haiku",window="7d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="opus",window="1d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="opus",window="30d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="opus",window="7d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="other",window="1d"} 0.004534054054054057
+coditor_history_avg_estimated_session_cost_dollars{model="other",window="30d"} 0.004534054054054057
+coditor_history_avg_estimated_session_cost_dollars{model="other",window="7d"} 0.004534054054054057
+coditor_history_avg_estimated_session_cost_dollars{model="sonnet",window="1d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="sonnet",window="30d"} 0
+coditor_history_avg_estimated_session_cost_dollars{model="sonnet",window="7d"} 0
+# HELP coditor_history_cache_events Historical cache event counts by rolling window and cache event type.
+# TYPE coditor_history_cache_events gauge
+coditor_history_cache_events{event_type="miss_thrash",window="1d"} 0
+coditor_history_cache_events{event_type="miss_thrash",window="30d"} 0
+coditor_history_cache_events{event_type="miss_thrash",window="7d"} 0
+coditor_history_cache_events{event_type="miss_ttl",window="1d"} 0
+coditor_history_cache_events{event_type="miss_ttl",window="30d"} 0
+coditor_history_cache_events{event_type="miss_ttl",window="7d"} 0
+# HELP coditor_history_cache_hit_ratio Historical token-weighted cache reuse share by rolling window.
+# TYPE coditor_history_cache_hit_ratio gauge
+coditor_history_cache_hit_ratio{window="1d"} 0
+coditor_history_cache_hit_ratio{window="30d"} 0
+coditor_history_cache_hit_ratio{window="7d"} 0
+# HELP coditor_history_degraded_causes Historical degraded cause counts by rolling window.
+# TYPE coditor_history_degraded_causes gauge
+coditor_history_degraded_causes{cause_type="cache_miss_thrash",window="1d"} 0
+coditor_history_degraded_causes{cause_type="cache_miss_thrash",window="30d"} 0
+coditor_history_degraded_causes{cause_type="cache_miss_thrash",window="7d"} 0
+coditor_history_degraded_causes{cause_type="cache_miss_ttl",window="1d"} 0
+coditor_history_degraded_causes{cause_type="cache_miss_ttl",window="30d"} 0
+coditor_history_degraded_causes{cause_type="cache_miss_ttl",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_accounting_anomaly",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_accounting_anomaly",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_accounting_anomaly",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_context_fill",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_context_fill",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_context_fill",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_reasoning_share",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_reasoning_share",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_high_reasoning_share",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_low_cached_input_reuse",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_low_cached_input_reuse",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_low_cached_input_reuse",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_mcp_tool_failures",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_mcp_tool_failures",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_mcp_tool_failures",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_model_mismatch",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_model_mismatch",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_model_mismatch",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_repeated_tool_failures",window="1d"} 0
+coditor_history_degraded_causes{cause_type="codex_repeated_tool_failures",window="30d"} 0
+coditor_history_degraded_causes{cause_type="codex_repeated_tool_failures",window="7d"} 0
+coditor_history_degraded_causes{cause_type="codex_response_failed",window="1d"} 4
+coditor_history_degraded_causes{cause_type="codex_response_failed",window="30d"} 4
+coditor_history_degraded_causes{cause_type="codex_response_failed",window="7d"} 4
+coditor_history_degraded_causes{cause_type="codex_response_incomplete",window="1d"} 4
+coditor_history_degraded_causes{cause_type="codex_response_incomplete",window="30d"} 4
+coditor_history_degraded_causes{cause_type="codex_response_incomplete",window="7d"} 4
+coditor_history_degraded_causes{cause_type="compaction_suspected",window="1d"} 0
+coditor_history_degraded_causes{cause_type="compaction_suspected",window="30d"} 0
+coditor_history_degraded_causes{cause_type="compaction_suspected",window="7d"} 0
+coditor_history_degraded_causes{cause_type="context_bloat",window="1d"} 0
+coditor_history_degraded_causes{cause_type="context_bloat",window="30d"} 0
+coditor_history_degraded_causes{cause_type="context_bloat",window="7d"} 0
+coditor_history_degraded_causes{cause_type="harness_pressure",window="1d"} 0
+coditor_history_degraded_causes{cause_type="harness_pressure",window="30d"} 0
+coditor_history_degraded_causes{cause_type="harness_pressure",window="7d"} 0
+coditor_history_degraded_causes{cause_type="model_fallback",window="1d"} 0
+coditor_history_degraded_causes{cause_type="model_fallback",window="30d"} 0
+coditor_history_degraded_causes{cause_type="model_fallback",window="7d"} 0
+coditor_history_degraded_causes{cause_type="near_compaction",window="1d"} 0
+coditor_history_degraded_causes{cause_type="near_compaction",window="30d"} 0
+coditor_history_degraded_causes{cause_type="near_compaction",window="7d"} 0
+coditor_history_degraded_causes{cause_type="tool_failure_streak",window="1d"} 0
+coditor_history_degraded_causes{cause_type="tool_failure_streak",window="30d"} 0
+coditor_history_degraded_causes{cause_type="tool_failure_streak",window="7d"} 0
+# HELP coditor_history_degraded_session_ratio Historical degraded session ratio by rolling window.
+# TYPE coditor_history_degraded_session_ratio gauge
+coditor_history_degraded_session_ratio{window="1d"} 0.21621621621621623
+coditor_history_degraded_session_ratio{window="30d"} 0.21621621621621623
+coditor_history_degraded_session_ratio{window="7d"} 0.21621621621621623
+# HELP coditor_history_degraded_sessions Historical degraded session counts by rolling window.
+# TYPE coditor_history_degraded_sessions gauge
+coditor_history_degraded_sessions{window="1d"} 8
+coditor_history_degraded_sessions{window="30d"} 8
+coditor_history_degraded_sessions{window="7d"} 8
+# HELP coditor_history_estimated_cache_waste_dollars Historical estimated cache rebuild waste in USD by rolling window and model family.
+# TYPE coditor_history_estimated_cache_waste_dollars gauge
+coditor_history_estimated_cache_waste_dollars{model="haiku",window="1d"} 0
+coditor_history_estimated_cache_waste_dollars{model="haiku",window="30d"} 0
+coditor_history_estimated_cache_waste_dollars{model="haiku",window="7d"} 0
+coditor_history_estimated_cache_waste_dollars{model="opus",window="1d"} 0
+coditor_history_estimated_cache_waste_dollars{model="opus",window="30d"} 0
+coditor_history_estimated_cache_waste_dollars{model="opus",window="7d"} 0
+coditor_history_estimated_cache_waste_dollars{model="other",window="1d"} 0
+coditor_history_estimated_cache_waste_dollars{model="other",window="30d"} 0
+coditor_history_estimated_cache_waste_dollars{model="other",window="7d"} 0
+coditor_history_estimated_cache_waste_dollars{model="sonnet",window="1d"} 0
+coditor_history_estimated_cache_waste_dollars{model="sonnet",window="30d"} 0
+coditor_history_estimated_cache_waste_dollars{model="sonnet",window="7d"} 0
+# HELP coditor_history_estimated_spend_dollars Historical estimated cost in USD by rolling window.
+# TYPE coditor_history_estimated_spend_dollars gauge
+coditor_history_estimated_spend_dollars{window="1d"} 0
+coditor_history_estimated_spend_dollars{window="30d"} 0
+coditor_history_estimated_spend_dollars{window="7d"} 0
+# HELP coditor_history_estimated_spend_dollars_by_model Historical estimated cost in USD by rolling window and model family.
+# TYPE coditor_history_estimated_spend_dollars_by_model gauge
+coditor_history_estimated_spend_dollars_by_model{model="haiku",window="1d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="haiku",window="30d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="haiku",window="7d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="opus",window="1d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="opus",window="30d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="opus",window="7d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="other",window="1d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="other",window="30d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="other",window="7d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="sonnet",window="1d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="sonnet",window="30d"} 0
+coditor_history_estimated_spend_dollars_by_model{model="sonnet",window="7d"} 0
+# HELP coditor_history_model_fallbacks Historical silent model fallback counts by rolling window.
+# TYPE coditor_history_model_fallbacks gauge
+coditor_history_model_fallbacks{actual="haiku",requested="haiku",window="1d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="haiku",window="30d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="haiku",window="7d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="opus",window="1d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="opus",window="30d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="opus",window="7d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="other",window="1d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="other",window="30d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="other",window="7d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="sonnet",window="1d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="sonnet",window="30d"} 0
+coditor_history_model_fallbacks{actual="haiku",requested="sonnet",window="7d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="haiku",window="1d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="haiku",window="30d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="haiku",window="7d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="opus",window="1d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="opus",window="30d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="opus",window="7d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="other",window="1d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="other",window="30d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="other",window="7d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="sonnet",window="1d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="sonnet",window="30d"} 0
+coditor_history_model_fallbacks{actual="opus",requested="sonnet",window="7d"} 0
+coditor_history_model_fallbacks{actual="other",requested="haiku",window="1d"} 0
+coditor_history_model_fallbacks{actual="other",requested="haiku",window="30d"} 0
+coditor_history_model_fallbacks{actual="other",requested="haiku",window="7d"} 0
+coditor_history_model_fallbacks{actual="other",requested="opus",window="1d"} 0
+coditor_history_model_fallbacks{actual="other",requested="opus",window="30d"} 0
+coditor_history_model_fallbacks{actual="other",requested="opus",window="7d"} 0
+coditor_history_model_fallbacks{actual="other",requested="other",window="1d"} 0
+coditor_history_model_fallbacks{actual="other",requested="other",window="30d"} 0
+coditor_history_model_fallbacks{actual="other",requested="other",window="7d"} 0
+coditor_history_model_fallbacks{actual="other",requested="sonnet",window="1d"} 0
+coditor_history_model_fallbacks{actual="other",requested="sonnet",window="30d"} 0
+coditor_history_model_fallbacks{actual="other",requested="sonnet",window="7d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="haiku",window="1d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="haiku",window="30d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="haiku",window="7d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="opus",window="1d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="opus",window="30d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="opus",window="7d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="other",window="1d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="other",window="30d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="other",window="7d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="sonnet",window="1d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="sonnet",window="30d"} 0
+coditor_history_model_fallbacks{actual="sonnet",requested="sonnet",window="7d"} 0
+# HELP coditor_history_refresh_timestamp_seconds Unix timestamp of the last successful historical gauge refresh.
+# TYPE coditor_history_refresh_timestamp_seconds gauge
+coditor_history_refresh_timestamp_seconds 1777543631
+# HELP coditor_history_sessions Historical finalized session counts by rolling window.
+# TYPE coditor_history_sessions gauge
+coditor_history_sessions{window="1d"} 37
+coditor_history_sessions{window="30d"} 37
+coditor_history_sessions{window="7d"} 37
+# HELP coditor_mcp_events_total MCP lifecycle events observed by source.
+# TYPE coditor_mcp_events_total counter
+coditor_mcp_events_total{event_type="called",server="unknown",source="hook",tool="unknown"} 0
+coditor_mcp_events_total{event_type="called",server="unknown",source="proxy",tool="unknown"} 0
+coditor_mcp_events_total{event_type="denied",server="unknown",source="hook",tool="unknown"} 0
+coditor_mcp_events_total{event_type="denied",server="unknown",source="proxy",tool="unknown"} 0
+coditor_mcp_events_total{event_type="failed",server="unknown",source="hook",tool="unknown"} 0
+coditor_mcp_events_total{event_type="failed",server="unknown",source="proxy",tool="unknown"} 0
+coditor_mcp_events_total{event_type="succeeded",server="unknown",source="hook",tool="unknown"} 0
+coditor_mcp_events_total{event_type="succeeded",server="unknown",source="proxy",tool="unknown"} 0
+# HELP coditor_mcp_server_calls_total MCP tool calls observed in assistant responses, split by MCP server.
+# TYPE coditor_mcp_server_calls_total counter
+coditor_mcp_server_calls_total{server="unknown"} 0
+# HELP coditor_mcp_server_failures_total MCP tool failures observed from tool_result blocks, split by MCP server.
+# TYPE coditor_mcp_server_failures_total counter
+coditor_mcp_server_failures_total{server="unknown"} 0
+# HELP coditor_mcp_tool_calls_total MCP tool calls observed in assistant responses, split by MCP server and tool.
+# TYPE coditor_mcp_tool_calls_total counter
+coditor_mcp_tool_calls_total{server="unknown",tool="unknown"} 0
+# HELP coditor_mcp_tool_failures_total MCP tool failures observed from tool_result blocks, split by MCP server and tool.
+# TYPE coditor_mcp_tool_failures_total counter
+coditor_mcp_tool_failures_total{server="unknown",tool="unknown"} 0
+# HELP coditor_model_fallback_total Silent model fallback events.
+# TYPE coditor_model_fallback_total counter
+coditor_model_fallback_total{actual="haiku",requested="haiku"} 0
+coditor_model_fallback_total{actual="haiku",requested="opus"} 0
+coditor_model_fallback_total{actual="haiku",requested="other"} 0
+coditor_model_fallback_total{actual="haiku",requested="sonnet"} 0
+coditor_model_fallback_total{actual="opus",requested="haiku"} 0
+coditor_model_fallback_total{actual="opus",requested="opus"} 0
+coditor_model_fallback_total{actual="opus",requested="other"} 0
+coditor_model_fallback_total{actual="opus",requested="sonnet"} 0
+coditor_model_fallback_total{actual="other",requested="haiku"} 0
+coditor_model_fallback_total{actual="other",requested="opus"} 0
+coditor_model_fallback_total{actual="other",requested="other"} 0
+coditor_model_fallback_total{actual="other",requested="sonnet"} 0
+coditor_model_fallback_total{actual="sonnet",requested="haiku"} 0
+coditor_model_fallback_total{actual="sonnet",requested="opus"} 0
+coditor_model_fallback_total{actual="sonnet",requested="other"} 0
+coditor_model_fallback_total{actual="sonnet",requested="sonnet"} 0
+# HELP coditor_projected_exhaustion_seconds Projected seconds until the weekly token budget is exhausted.
+# TYPE coditor_projected_exhaustion_seconds gauge
+coditor_projected_exhaustion_seconds -1
+# HELP coditor_requests_total Completed turns observed by coditor-core.
+# TYPE coditor_requests_total counter
+coditor_requests_total{model="haiku"} 0
+coditor_requests_total{model="opus"} 0
+coditor_requests_total{model="other"} 0
+coditor_requests_total{model="sonnet"} 0
+# HELP coditor_session_turns Observed number of turns per session.
+# TYPE coditor_session_turns histogram
+coditor_session_turns_bucket{le="1"} 0
+coditor_session_turns_bucket{le="3"} 0
+coditor_session_turns_bucket{le="5"} 0
+coditor_session_turns_bucket{le="10"} 0
+coditor_session_turns_bucket{le="20"} 0
+coditor_session_turns_bucket{le="50"} 0
+coditor_session_turns_bucket{le="100"} 0
+coditor_session_turns_bucket{le="+Inf"} 0
+coditor_session_turns_sum 0
+coditor_session_turns_count 0
+# HELP coditor_sessions_degraded_total Degraded sessions by cause type.
+# TYPE coditor_sessions_degraded_total counter
+coditor_sessions_degraded_total{cause_type="cache_miss_thrash"} 0
+coditor_sessions_degraded_total{cause_type="cache_miss_ttl"} 0
+coditor_sessions_degraded_total{cause_type="codex_accounting_anomaly"} 0
+coditor_sessions_degraded_total{cause_type="codex_high_context_fill"} 0
+coditor_sessions_degraded_total{cause_type="codex_high_reasoning_share"} 0
+coditor_sessions_degraded_total{cause_type="codex_low_cached_input_reuse"} 0
+coditor_sessions_degraded_total{cause_type="codex_mcp_tool_failures"} 0
+coditor_sessions_degraded_total{cause_type="codex_model_mismatch"} 0
+coditor_sessions_degraded_total{cause_type="codex_repeated_tool_failures"} 0
+coditor_sessions_degraded_total{cause_type="codex_response_failed"} 0
+coditor_sessions_degraded_total{cause_type="codex_response_incomplete"} 0
+coditor_sessions_degraded_total{cause_type="compaction_suspected"} 0
+coditor_sessions_degraded_total{cause_type="context_bloat"} 0
+coditor_sessions_degraded_total{cause_type="harness_pressure"} 0
+coditor_sessions_degraded_total{cause_type="model_fallback"} 0
+coditor_sessions_degraded_total{cause_type="near_compaction"} 0
+coditor_sessions_degraded_total{cause_type="tool_failure_streak"} 0
+coditor_sessions_degraded_total{cause_type="unknown"} 0
+# HELP coditor_skill_events_total Skill lifecycle events observed or inferred by coditor.
+# TYPE coditor_skill_events_total counter
+coditor_skill_events_total{event_type="expected",skill="unknown",source="heuristic"} 0
+coditor_skill_events_total{event_type="expected",skill="unknown",source="hook"} 0
+coditor_skill_events_total{event_type="expected",skill="unknown",source="proxy"} 0
+coditor_skill_events_total{event_type="failed",skill="unknown",source="heuristic"} 0
+coditor_skill_events_total{event_type="failed",skill="unknown",source="hook"} 0
+coditor_skill_events_total{event_type="failed",skill="unknown",source="proxy"} 0
+coditor_skill_events_total{event_type="fired",skill="unknown",source="heuristic"} 0
+coditor_skill_events_total{event_type="fired",skill="unknown",source="hook"} 0
+coditor_skill_events_total{event_type="fired",skill="unknown",source="proxy"} 0
+coditor_skill_events_total{event_type="misfired",skill="unknown",source="heuristic"} 0
+coditor_skill_events_total{event_type="misfired",skill="unknown",source="hook"} 0
+coditor_skill_events_total{event_type="misfired",skill="unknown",source="proxy"} 0
+coditor_skill_events_total{event_type="missed",skill="unknown",source="heuristic"} 0
+coditor_skill_events_total{event_type="missed",skill="unknown",source="hook"} 0
+coditor_skill_events_total{event_type="missed",skill="unknown",source="proxy"} 0
+# HELP coditor_tokens_total Tokens observed by turn and token kind.
+# TYPE coditor_tokens_total counter
+coditor_tokens_total{kind="cache_create",model="haiku"} 0
+coditor_tokens_total{kind="cache_create",model="opus"} 0
+coditor_tokens_total{kind="cache_create",model="other"} 0
+coditor_tokens_total{kind="cache_create",model="sonnet"} 0
+coditor_tokens_total{kind="cache_read",model="haiku"} 0
+coditor_tokens_total{kind="cache_read",model="opus"} 0
+coditor_tokens_total{kind="cache_read",model="other"} 0
+coditor_tokens_total{kind="cache_read",model="sonnet"} 0
+coditor_tokens_total{kind="input",model="haiku"} 0
+coditor_tokens_total{kind="input",model="opus"} 0
+coditor_tokens_total{kind="input",model="other"} 0
+coditor_tokens_total{kind="input",model="sonnet"} 0
+coditor_tokens_total{kind="output",model="haiku"} 0
+coditor_tokens_total{kind="output",model="opus"} 0
+coditor_tokens_total{kind="output",model="other"} 0
+coditor_tokens_total{kind="output",model="sonnet"} 0
+# HELP coditor_tool_calls_total Tool calls observed in assistant responses.
+# TYPE coditor_tool_calls_total counter
+coditor_tool_calls_total{tool="unknown"} 0
+# HELP coditor_tool_failures_total Tool failures observed from tool_result blocks.
+# TYPE coditor_tool_failures_total counter
+coditor_tool_failures_total{tool="unknown"} 0
+# HELP coditor_turn_duration_seconds Observed turn durations in seconds.
+# TYPE coditor_turn_duration_seconds histogram
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.005"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.01"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.025"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.05"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.1"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.25"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="0.5"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="1"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="2.5"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="5"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="10"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="30"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="60"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="120"} 0
+coditor_turn_duration_seconds_bucket{model="haiku",le="+Inf"} 0
+coditor_turn_duration_seconds_sum{model="haiku"} 0
+coditor_turn_duration_seconds_count{model="haiku"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.005"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.01"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.025"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.05"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.1"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.25"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="0.5"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="1"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="2.5"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="5"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="10"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="30"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="60"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="120"} 0
+coditor_turn_duration_seconds_bucket{model="opus",le="+Inf"} 0
+coditor_turn_duration_seconds_sum{model="opus"} 0
+coditor_turn_duration_seconds_count{model="opus"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.005"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.01"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.025"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.05"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.1"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.25"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="0.5"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="1"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="2.5"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="5"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="10"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="30"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="60"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="120"} 0
+coditor_turn_duration_seconds_bucket{model="other",le="+Inf"} 0
+coditor_turn_duration_seconds_sum{model="other"} 0
+coditor_turn_duration_seconds_count{model="other"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.005"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.01"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.025"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.05"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.1"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.25"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="0.5"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="1"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="2.5"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="5"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="10"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="30"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="60"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="120"} 0
+coditor_turn_duration_seconds_bucket{model="sonnet",le="+Inf"} 0
+coditor_turn_duration_seconds_sum{model="sonnet"} 0
+coditor_turn_duration_seconds_count{model="sonnet"} 0
+# HELP coditor_weekly_tokens_remaining Remaining weekly tokens under the active or suggested budget.
+# TYPE coditor_weekly_tokens_remaining gauge
+coditor_weekly_tokens_remaining -1
+# HELP coditor_weekly_tokens_used Tokens used since Monday 00:00 UTC.
+# TYPE coditor_weekly_tokens_used gauge
+coditor_weekly_tokens_used 43760

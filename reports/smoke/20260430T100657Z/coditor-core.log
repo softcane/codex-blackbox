@@ -1,0 +1,5 @@
+coditor-core-1  | {"timestamp":"2026-04-30T10:05:11.692896Z","level":"INFO","fields":{"message":"coditor-core v0.2.0"}}
+coditor-core-1  | {"timestamp":"2026-04-30T10:05:11.692911Z","level":"INFO","fields":{"message":"per-terminal session tracking enabled"}}
+coditor-core-1  | {"timestamp":"2026-04-30T10:05:11.693263Z","level":"INFO","fields":{"message":"using built-in model-family pricing","cost_source":"builtin_model_family_pricing","trusted_for_budget_enforcement":false}}
+coditor-core-1  | {"timestamp":"2026-04-30T10:05:11.693616Z","level":"INFO","fields":{"message":"HTTP server listening on 0.0.0.0:9090 (/health, /metrics, /api/hooks/claude-code, /api/hooks/codex, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)"}}
+coditor-core-1  | {"timestamp":"2026-04-30T10:05:11.693695Z","level":"INFO","fields":{"message":"gRPC ext_proc server starting","addr":"0.0.0.0:50051"}}
