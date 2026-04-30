@@ -61,6 +61,8 @@ static_resources:
                           upstream: "%UPSTREAM_HOST%"
                           request_id: "%REQ(X-REQUEST-ID)%"
                           response_flags: "%RESPONSE_FLAGS%"
+                          response_code_details: "%RESPONSE_CODE_DETAILS%"
+                          upstream_transport_failure_reason: "%UPSTREAM_TRANSPORT_FAILURE_REASON%"
 
                 http_filters:
                   - name: envoy.filters.http.ext_proc

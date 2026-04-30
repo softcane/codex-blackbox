@@ -653,6 +653,15 @@ for panel in dashboard.get("panels", []):
             if metric_name not in metric_names:
                 fail(f"Grafana panel {panel.get('title')!r} references missing metric {metric_name}")
 
+for panel in dashboard.get("panels", []):
+    title = panel.get("title") or ""
+    if "Codex" not in title:
+        continue
+    panel_text = json.dumps(panel).lower()
+    for copied_model_term in ("claude", "opus", "sonnet", "haiku", "legacy_claude"):
+        if copied_model_term in panel_text:
+            fail(f"Grafana Codex panel {title!r} references copied Claude model term {copied_model_term!r}")
+
 print("Prometheus and Grafana Phase 9A assertions passed")
 PY
     pass "Prometheus and Grafana expose Phase 9A fake-session observability"
@@ -674,7 +683,7 @@ assert_cli_dry_run() {
     if grep -q "forced_login_method\\|env_key\\|coditor-openai-responses\\|openai_base_url" "$output_path"; then
         fail "CLI dry-run should not print API-key or fake-provider overrides"
     fi
-    assert_file_contains "$output_path" "exec --ephemeral 'Phase 9A fake smoke' --json" "CLI dry-run preserves Codex args with ephemeral exec"
+    assert_file_contains "$output_path" "exec 'Phase 9A fake smoke' --json" "CLI dry-run preserves Codex args without injecting ephemeral exec"
 }
 
 assert_failure_open_after_core_stop() {

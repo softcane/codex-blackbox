@@ -1818,6 +1818,7 @@ fn build_diagnosis_response_json(
 #[allow(clippy::too_many_arguments)]
 fn build_session_summary_json(
     session_id: String,
+    display_name: String,
     started_at: Option<String>,
     outcome: String,
     degraded: bool,
@@ -1834,6 +1835,7 @@ fn build_session_summary_json(
 ) -> Value {
     serde_json::json!({
         "session_id": session_id,
+        "display_name": display_name,
         "started_at": started_at,
         "outcome": outcome,
         "degraded": degraded,
@@ -3501,6 +3503,21 @@ fn persist_codex_finalization_outcome(outcome: &CodexFinalizationOutcome) {
     }
 }
 
+fn repo_name_from_codex_initial_prompt(prompt: &str) -> Option<String> {
+    let marker = "AGENTS.md instructions for ";
+    let start = prompt.find(marker)? + marker.len();
+    let path = prompt[start..]
+        .split(|ch: char| ch.is_whitespace() || ch == '<')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'));
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+}
+
 fn codex_display_name(accounting: &codex_accounting::CodexTurnAccounting) -> String {
     accounting
         .identity
@@ -3509,7 +3526,30 @@ fn codex_display_name(accounting: &codex_accounting::CodexTurnAccounting) -> Str
         .and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty()))
         .map(str::to_string)
         .filter(|name| !name.is_empty())
+        .or_else(|| {
+            accounting
+                .first_user_prompt_excerpt
+                .as_deref()
+                .and_then(repo_name_from_codex_initial_prompt)
+        })
         .unwrap_or_else(|| accounting.requested_model.clone())
+}
+
+fn persisted_session_display_name(
+    session_id: &str,
+    model: Option<&str>,
+    initial_prompt: Option<&str>,
+) -> String {
+    initial_prompt
+        .and_then(repo_name_from_codex_initial_prompt)
+        .or_else(|| model.map(str::to_string))
+        .unwrap_or_else(|| {
+            if session_id.len() > 20 {
+                session_id[..20].to_string()
+            } else {
+                session_id.to_string()
+            }
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4413,6 +4453,11 @@ fn parse_request_body_metadata(
             })
         }
     }
+}
+
+fn should_skip_chatgpt_auxiliary_request_body(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    path.starts_with("/backend-api/") && !path.starts_with("/backend-api/codex/responses")
 }
 
 fn request_metadata_from_codex(
@@ -6218,6 +6263,7 @@ impl ExternalProcessor for CoditorProcessor {
             let mut codex_request_headers = codex_request::CodexRequestHeaders::default();
             let mut codex_observed_model_header: Option<String> = None;
             let mut current_codex_request: Option<codex_request::ParsedCodexRequest> = None;
+            let mut request_path = String::new();
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -6273,6 +6319,7 @@ impl ExternalProcessor for CoditorProcessor {
                             .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
                         request_anthropic_beta_values = extract_headers(h, "anthropic-beta");
                         codex_request_headers = codex_request_headers_from_ext_proc(h);
+                        request_path = extract_header(h, ":path").unwrap_or_default();
                         codex_observed_model_header = extract_header(h, "openai-model")
                             .or_else(|| extract_header(h, "x-openai-model"));
                         if let Some(header_model) = codex_observed_model_header.as_deref() {
@@ -6317,82 +6364,91 @@ impl ExternalProcessor for CoditorProcessor {
                         tool_results = parse_latest_tool_results(&b.body);
 
                         let mut blocked = false;
-                        match parse_request_body_metadata(&b.body, &codex_request_headers) {
-                            Some(request_metadata) => {
-                                response_accumulator =
-                                    SelectedResponseAccumulator::for_request_source(
-                                        request_metadata.source,
-                                    );
-                                current_codex_request = request_metadata.codex_request.clone();
-                                let request_source = match request_metadata.source {
+                        if should_skip_chatgpt_auxiliary_request_body(&request_path) {
+                            debug!(
+                                request_id = %request_id,
+                                path = %request_path,
+                                bytes = b.body.len(),
+                                "skipping non-model ChatGPT backend request body parse"
+                            );
+                        } else {
+                            match parse_request_body_metadata(&b.body, &codex_request_headers) {
+                                Some(request_metadata) => {
+                                    response_accumulator =
+                                        SelectedResponseAccumulator::for_request_source(
+                                            request_metadata.source,
+                                        );
+                                    current_codex_request = request_metadata.codex_request.clone();
+                                    let request_source = match request_metadata.source {
                                     RequestMetadataSource::CodexResponses => "codex_responses",
                                     RequestMetadataSource::TemporaryUnportedAnthropicFallback => {
                                         "temporary_unported_anthropic_fallback"
                                     }
                                 };
-                                info!(
-                                    phase = "request_body",
-                                    request_id = %request_id,
-                                    request_source,
-                                    model = %request_metadata.model,
-                                    message_count = request_metadata.message_count,
-                                    has_tools = request_metadata.has_tools,
-                                    system_prompt_length = request_metadata.system_prompt_length,
-                                    estimated_input_tokens = request_metadata.estimated_input_tokens,
-                                    sys_prompt_hash = request_metadata.session_hash,
-                                    session_id = %request_metadata.session_id,
-                                    request_model_header = codex_observed_model_header.as_deref().unwrap_or(""),
-                                    "ext_proc"
-                                );
-                                if let Some((err_type, msg)) = check_session_budget(
-                                    diagnosis::SESSIONS
-                                        .get(&request_metadata.session_hash)
-                                        .as_deref()
-                                        .map(|state| state.session_id.as_str()),
-                                ) {
-                                    warn!(request_id = %request_id, error_type = err_type, "request blocked");
-                                    let response = make_block_response(err_type, &msg);
-                                    if tx.send(Ok(response)).await.is_err() {
-                                        break;
+                                    info!(
+                                        phase = "request_body",
+                                        request_id = %request_id,
+                                        request_source,
+                                        model = %request_metadata.model,
+                                        message_count = request_metadata.message_count,
+                                        has_tools = request_metadata.has_tools,
+                                        system_prompt_length = request_metadata.system_prompt_length,
+                                        estimated_input_tokens = request_metadata.estimated_input_tokens,
+                                        sys_prompt_hash = request_metadata.session_hash,
+                                        session_id = %request_metadata.session_id,
+                                        request_model_header = codex_observed_model_header.as_deref().unwrap_or(""),
+                                        "ext_proc"
+                                    );
+                                    if let Some((err_type, msg)) = check_session_budget(
+                                        diagnosis::SESSIONS
+                                            .get(&request_metadata.session_hash)
+                                            .as_deref()
+                                            .map(|state| state.session_id.as_str()),
+                                    ) {
+                                        warn!(request_id = %request_id, error_type = err_type, "request blocked");
+                                        let response = make_block_response(err_type, &msg);
+                                        if tx.send(Ok(response)).await.is_err() {
+                                            break;
+                                        }
+                                        blocked = true;
                                     }
-                                    blocked = true;
+                                    sys_prompt_hash = request_metadata.session_hash;
+                                    working_dir_str = request_metadata.working_dir.clone();
+                                    // Only first turn carries a meaningful "initial prompt"; for mc>1
+                                    // messages[0] is still the original, but we only register the
+                                    // session once (see SESSIONS.get_mut in finalize_response), so
+                                    // passing the excerpt every time is harmless and first-write-wins.
+                                    user_prompt_excerpt_buf =
+                                        request_metadata.user_prompt_excerpt.clone();
+                                    if !blocked {
+                                        context_window_tokens = resolve_context_window_tokens(
+                                            request_context_window_hint,
+                                            &request_metadata.model,
+                                        );
+                                        // Codex request identities are available here; the
+                                        // copied Anthropic fallback still resolves session
+                                        // ids later in finalize_response.
+                                        REQUEST_STATE.insert(
+                                            request_id.clone(),
+                                            RequestMeta {
+                                                request_id: request_id.clone(),
+                                                session_id: request_metadata.session_id.clone(),
+                                                model: request_metadata.model.clone(),
+                                                message_count: request_metadata.message_count,
+                                                has_tools: request_metadata.has_tools,
+                                                system_prompt_length: request_metadata
+                                                    .system_prompt_length,
+                                                estimated_input_tokens: request_metadata
+                                                    .estimated_input_tokens,
+                                                started_at,
+                                            },
+                                        );
+                                        model = request_metadata.model;
+                                    }
                                 }
-                                sys_prompt_hash = request_metadata.session_hash;
-                                working_dir_str = request_metadata.working_dir.clone();
-                                // Only first turn carries a meaningful "initial prompt"; for mc>1
-                                // messages[0] is still the original, but we only register the
-                                // session once (see SESSIONS.get_mut in finalize_response), so
-                                // passing the excerpt every time is harmless and first-write-wins.
-                                user_prompt_excerpt_buf =
-                                    request_metadata.user_prompt_excerpt.clone();
-                                if !blocked {
-                                    context_window_tokens = resolve_context_window_tokens(
-                                        request_context_window_hint,
-                                        &request_metadata.model,
-                                    );
-                                    // Codex request identities are available here; the
-                                    // copied Anthropic fallback still resolves session
-                                    // ids later in finalize_response.
-                                    REQUEST_STATE.insert(
-                                        request_id.clone(),
-                                        RequestMeta {
-                                            request_id: request_id.clone(),
-                                            session_id: request_metadata.session_id.clone(),
-                                            model: request_metadata.model.clone(),
-                                            message_count: request_metadata.message_count,
-                                            has_tools: request_metadata.has_tools,
-                                            system_prompt_length: request_metadata
-                                                .system_prompt_length,
-                                            estimated_input_tokens: request_metadata
-                                                .estimated_input_tokens,
-                                            started_at,
-                                        },
-                                    );
-                                    model = request_metadata.model;
+                                None => {
+                                    warn!(request_id=%request_id, bytes=b.body.len(), path=%request_path, "failed to parse request JSON");
                                 }
-                            }
-                            None => {
-                                warn!(request_id=%request_id, bytes=b.body.len(), "failed to parse request JSON");
                             }
                         }
 
@@ -6821,7 +6877,7 @@ async fn handle_sessions(
 
         let mut stmt = conn
             .prepare(
-                "SELECT s.session_id, s.started_at, s.model, d.outcome, d.degraded, \
+                "SELECT s.session_id, s.started_at, s.model, s.initial_prompt, d.outcome, d.degraded, \
                         d.total_turns, d.causes_json, d.cache_hit_ratio \
                  FROM sessions s \
                  LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
@@ -6832,6 +6888,7 @@ async fn handle_sessions(
 
         type RecentSessionRow = (
             String,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -6848,10 +6905,11 @@ async fn handle_sessions(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i32>>(4)?.map(|value| value != 0),
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i32>>(5)?.map(|value| value != 0),
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<f64>>(8)?,
                 ))
             })
             .ok()?
@@ -6872,6 +6930,7 @@ async fn handle_sessions(
                     session_id,
                     started_at,
                     model,
+                    initial_prompt,
                     stored_outcome,
                     stored_degraded,
                     stored_total_turns,
@@ -6929,8 +6988,14 @@ async fn handle_sessions(
                         String::new()
                     };
                     let billed = billing.get(&session_id);
+                    let display_name = persisted_session_display_name(
+                        &session_id,
+                        model.as_deref(),
+                        initial_prompt.as_deref(),
+                    );
                     build_session_summary_json(
                         session_id,
+                        display_name,
                         started_at,
                         outcome,
                         degraded,
@@ -7960,11 +8025,13 @@ mod tests {
         infer_context_window_tokens, load_degradation_view_from_db, load_turn_snapshots_from_db,
         looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
         now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
-        persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
-        record_codex_turn_command, repair_persisted_session_artifacts,
-        repair_turn_snapshot_context_windows, request_uses_1m_context,
+        persist_billing_reconciliation, persisted_session_display_name, pricing,
+        query_historical_metrics, query_summary, record_codex_turn_command,
+        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
+        repo_name_from_codex_initial_prompt, request_uses_1m_context,
         resolve_context_window_tokens, score_recall_doc, seed_live_metric_labels_from_db,
-        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
+        session_timeout_secs, should_broadcast_quota_snapshot,
+        should_skip_chatgpt_auxiliary_request_body, skill_name_from_skill_file,
         skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
         table_columns, tokenize_search_text, tool_recall_context,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
@@ -9291,6 +9358,36 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let display = derive_display_name("/tmp/coditor", "claude-sonnet", hash);
         let _ = diagnosis::SESSIONS.remove(&hash);
         assert_eq!(display, "coditor-abc");
+    }
+
+    #[test]
+    fn codex_display_name_falls_back_to_agents_preamble_repo() {
+        let prompt = "# AGENTS.md instructions for /Users/pradeepsingh/code/nordic_hedge_fund\n\
+                      <INSTRUCTIONS>\n...";
+
+        assert_eq!(
+            repo_name_from_codex_initial_prompt(prompt).as_deref(),
+            Some("nordic_hedge_fund")
+        );
+        assert_eq!(
+            persisted_session_display_name("019ddf2c-4387", Some("gpt-5.5"), Some(prompt)),
+            "nordic_hedge_fund"
+        );
+    }
+
+    #[test]
+    fn chatgpt_auxiliary_requests_are_not_parsed_as_model_json() {
+        assert!(should_skip_chatgpt_auxiliary_request_body(
+            "/backend-api/wham/apps"
+        ));
+        assert!(should_skip_chatgpt_auxiliary_request_body(
+            "/backend-api/wham/apps?foo=bar"
+        ));
+        assert!(!should_skip_chatgpt_auxiliary_request_body(
+            "/backend-api/codex/responses"
+        ));
+        assert!(!should_skip_chatgpt_auxiliary_request_body("/v1/messages"));
+        assert!(!should_skip_chatgpt_auxiliary_request_body(""));
     }
 
     #[test]
@@ -10685,6 +10782,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     fn session_summary_uses_estimated_cost_fields_only() {
         let json = build_session_summary_json(
             "session_1".to_string(),
+            "coditor".to_string(),
             Some("2026-01-01T00:00:00Z".to_string()),
             "Completed".to_string(),
             false,
@@ -10712,6 +10810,10 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             json.get("billed_cost_dollars").and_then(|v| v.as_f64()),
             Some(0.98)
         );
+        assert_eq!(
+            json.get("display_name").and_then(|v| v.as_str()),
+            Some("coditor")
+        );
         assert!(json.get("total_cost_dollars").is_none());
     }
 
@@ -10719,6 +10821,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     fn sessions_response_exposes_cost_source_once_at_root() {
         let sessions = vec![build_session_summary_json(
             "session_1".to_string(),
+            "coditor".to_string(),
             Some("2026-01-01T00:00:00Z".to_string()),
             "Completed".to_string(),
             false,

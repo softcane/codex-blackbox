@@ -187,11 +187,12 @@ fn codex_dry_run_prints_overrides_and_preserves_user_args() {
     assert!(out.contains(r#"-c 'model_providers.coditor-openai.wire_api="responses"'"#));
     assert!(out.contains("-c model_providers.coditor-openai.supports_websockets=false"));
     assert!(out.contains("-c features.enable_request_compression=false"));
-    assert!(out.contains("Codex exec rollout files: disabled with --ephemeral"));
+    assert!(out.contains("wrapper does not inject --ephemeral"));
+    assert!(out.contains("Known Codex rollout-recording warning: suppressed"));
     assert!(out.contains("OPENAI_API_KEY is not used"));
     assert!(!out.contains("forced_login_method"));
     assert!(!out.contains("model_providers.coditor-openai-responses"));
-    assert!(out.contains("exec --ephemeral hello --json"));
+    assert!(out.contains("exec hello --json"));
 }
 
 #[test]
@@ -266,6 +267,7 @@ fn sessions_command_renders_sessions_from_api() {
           "sessions": [
             {
               "session_id": "session_abcdefghijklmnopqrstuvwxyz",
+              "display_name": "coditor",
               "model": "claude-sonnet-4-5-20250929",
               "total_turns": 7,
               "outcome": "Likely Completed",
@@ -288,7 +290,7 @@ fn sessions_command_renders_sessions_from_api() {
     );
     let out = stdout(&output);
     assert!(out.contains("Estimated cost source: built-in model-family pricing"));
-    assert!(out.contains("session_abcdefghijkl"));
+    assert!(out.contains("coditor"));
     assert!(out.contains("sonnet-4-5-20250929"));
     assert!(out.contains("$1.23"));
     assert!(out.contains("$1.11"));

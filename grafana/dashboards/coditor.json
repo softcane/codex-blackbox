@@ -206,7 +206,9 @@
         {
           "editorMode": "code",
           "expr": "100 * sum(coditor_tokens_total{provider=\"codex_responses\",kind=\"cached_input\"}) / clamp_min(sum(coditor_tokens_total{provider=\"codex_responses\",kind=\"input\"}), 1)",
+          "instant": true,
           "legendFormat": "",
+          "range": false,
           "refId": "A"
         }
       ],
@@ -334,7 +336,9 @@
         {
           "editorMode": "code",
           "expr": "sum by (model) (coditor_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0",
+          "instant": true,
           "legendFormat": "{{model}}",
+          "range": false,
           "refId": "A"
         }
       ],
@@ -383,7 +387,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_model_fallbacks{window=\"1d\",requested!~\"opus|sonnet|haiku|legacy_claude\",actual!~\"opus|sonnet|haiku|legacy_claude\"} > 0",
+          "expr": "coditor_history_model_fallbacks{window=\"1d\",requested=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\",actual=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} > 0",
           "legendFormat": "{{requested}} -> {{actual}}",
           "refId": "A"
         }
@@ -543,7 +547,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\",model!~\"opus|sonnet|haiku|legacy_claude\"}",
+          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} and on(model) (sum by (model) (coditor_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0)",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
@@ -1097,7 +1101,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\",model!~\"opus|sonnet|haiku|legacy_claude\"}",
+          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} and on(model) (sum by (model) (coditor_requests_total{provider=\"codex_responses\"}) > 0)",
           "legendFormat": "{{model}}",
           "refId": "A"
         }

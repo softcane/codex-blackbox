@@ -2,7 +2,7 @@ mod tmux;
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -1282,17 +1282,7 @@ fn codex_config_args(chatgpt_base_url: &str, codex_model_base_url: &str) -> Vec<
 }
 
 fn codex_child_args_with_defaults(command_args: &[String]) -> Vec<String> {
-    let mut args = command_args.to_vec();
-    if args.first().map(String::as_str) == Some("exec")
-        && !args.iter().any(|arg| arg == "--ephemeral")
-        && !matches!(
-            args.get(1).map(String::as_str),
-            Some("resume" | "review" | "help")
-        )
-    {
-        args.insert(1, "--ephemeral".to_string());
-    }
-    args
+    command_args.to_vec()
 }
 
 fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String> {
@@ -1343,7 +1333,10 @@ fn render_child_run_plan(plan: &ChildRunPlan) -> String {
             lines.push(format!(
                 "Request compression: disabled with features.{CODEX_REQUEST_COMPRESSION_FEATURE}=false"
             ));
-            lines.push("Codex exec rollout files: disabled with --ephemeral".to_string());
+            lines.push(
+                "Codex exec session persistence: wrapper does not inject --ephemeral".to_string(),
+            );
+            lines.push("Known Codex rollout-recording warning: suppressed".to_string());
             lines.push(
                 "Auth: uses existing Codex ChatGPT login; OPENAI_API_KEY is not used".to_string(),
             );
@@ -1393,7 +1386,8 @@ fn print_child_run_status(plan: &ChildRunPlan) {
             eprintln!(
                 "Coditor: request compression disabled via features.{CODEX_REQUEST_COMPRESSION_FEATURE}=false."
             );
-            eprintln!("Coditor: codex exec runs with --ephemeral to avoid local rollout persistence noise.");
+            eprintln!("Coditor: wrapper does not inject --ephemeral; Codex keeps its normal session persistence behavior.");
+            eprintln!("Coditor: suppressing known Codex rollout-recording warning; Coditor records traffic via proxy.");
             eprintln!("Coditor: OPENAI_API_KEY is not used for subscription mode.");
         }
         RunMode::PlainCommand => {
@@ -1422,6 +1416,53 @@ fn run_command_with_env(
         .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
 
     Ok(exit_code(status))
+}
+
+fn run_codex_command_with_filtered_stderr(
+    command: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) -> Result<i32, String> {
+    let mut child = Command::new(command);
+    child.args(args);
+    for (key, value) in envs {
+        child.env(key, value);
+    }
+    let mut child = child
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn {command}: {err}"))?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture child stderr".to_string())?;
+    let stderr_thread = std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) if should_suppress_codex_stderr_line(&line) => {}
+                Ok(line) => eprintln!("{line}"),
+                Err(err) => {
+                    eprintln!("Coditor: failed to read Codex stderr: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
+    let _ = stderr_thread.join();
+
+    Ok(exit_code(status))
+}
+
+fn should_suppress_codex_stderr_line(line: &str) -> bool {
+    line.contains("failed to record rollout items")
 }
 
 async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>) -> i32 {
@@ -1466,7 +1507,12 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
     };
 
     print_child_run_status(&plan);
-    let result = run_command_with_env(&plan.command, &plan.args, &plan.envs);
+    let result = match plan.mode {
+        RunMode::CodexSubscriptionProxy => {
+            run_codex_command_with_filtered_stderr(&plan.command, &plan.args, &plan.envs)
+        }
+        RunMode::PlainCommand => run_command_with_env(&plan.command, &plan.args, &plan.envs),
+    };
 
     if let Some(handle) = watcher.as_mut() {
         handle.stop();
@@ -2749,7 +2795,12 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     for s in sessions {
         let sid = s.get("session_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let short_sid = if sid.len() > 20 { &sid[..20] } else { sid };
+        let label = s
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(sid);
+        let short_sid = truncate_for_box(label, 20);
         let model = s.get("model").and_then(|v| v.as_str()).unwrap_or("?");
         let short_model = model.replace("claude-", "").replace("-20250514", "");
         let turns = s.get("total_turns").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -2968,8 +3019,8 @@ mod tests {
         context_status_line, event_session_id, extract_run_watch, format_duration_coarse,
         format_tokens, local_time_from_iso, model_change_line, parse_mcp_tool_name, push_unique,
         render_child_run_plan, render_codex_config_preview, shell_join, shell_quote,
-        truncate_for_box, watch_model_label, yaml_quote, ActiveSessions, Cli, Commands,
-        ConfigCommands, RunMode, WatchEvent,
+        should_suppress_codex_stderr_line, truncate_for_box, watch_model_label, yaml_quote,
+        ActiveSessions, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -3331,7 +3382,6 @@ mod tests {
             plan.args[override_arg_count..],
             [
                 "exec".to_string(),
-                "--ephemeral".to_string(),
                 "hello".to_string(),
                 "--json".to_string()
             ]
@@ -3380,12 +3430,23 @@ mod tests {
         assert!(preview.contains("Environment overrides:\n  (none)"));
         assert!(preview.contains("features.enable_request_compression=false"));
         assert!(preview.contains("Model provider override: coditor-openai"));
-        assert!(preview.contains("Codex exec rollout files: disabled with --ephemeral"));
+        assert!(preview.contains("wrapper does not inject --ephemeral"));
+        assert!(preview.contains("Known Codex rollout-recording warning: suppressed"));
         assert!(preview.contains("OPENAI_API_KEY is not used"));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api"));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api/codex"));
         assert!(preview.contains("codex -c"));
-        assert!(preview.contains("exec --ephemeral hello"));
+        assert!(preview.contains("exec hello"));
+    }
+
+    #[test]
+    fn codex_rollout_recording_warning_is_suppressed_narrowly() {
+        assert!(should_suppress_codex_stderr_line(
+            "2026-04-30T16:36:44Z ERROR codex_core::session: failed to record rollout items: thread missing"
+        ));
+        assert!(!should_suppress_codex_stderr_line(
+            "2026-04-30T16:36:44Z ERROR codex_core::session: failed to connect to websocket"
+        ));
     }
 
     #[test]
