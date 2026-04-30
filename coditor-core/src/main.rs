@@ -3805,6 +3805,223 @@ fn stored_tool_recall_context(
     }
 }
 
+#[derive(Debug)]
+struct PersistedWatchSession {
+    session_id: String,
+    model: Option<String>,
+    initial_prompt: Option<String>,
+}
+
+#[derive(Debug)]
+struct PersistedWatchTurn {
+    timestamp: String,
+    status: String,
+    requested_model: String,
+    served_model: Option<String>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    context_utilization: f64,
+    context_window_tokens: Option<u64>,
+    tool_calls: Vec<String>,
+}
+
+fn load_persisted_watch_sessions(
+    conn: &Connection,
+    session_filter: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<PersistedWatchSession>> {
+    if let Some(session_id) = session_filter {
+        let mut stmt = conn.prepare(
+            "SELECT session_id, model, initial_prompt \
+             FROM sessions WHERE session_id = ?1 LIMIT 1",
+        )?;
+        return stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok(PersistedWatchSession {
+                    session_id: row.get::<_, String>(0)?,
+                    model: row.get::<_, Option<String>>(1)?,
+                    initial_prompt: row.get::<_, Option<String>>(2)?,
+                })
+            })?
+            .collect();
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT session_id, model, initial_prompt \
+         FROM sessions \
+         WHERE request_count > 0 \
+         ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?1",
+    )?;
+    let mut sessions = stmt
+        .query_map(rusqlite::params![limit as i64], |row| {
+            Ok(PersistedWatchSession {
+                session_id: row.get::<_, String>(0)?,
+                model: row.get::<_, Option<String>>(1)?,
+                initial_prompt: row.get::<_, Option<String>>(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    sessions.reverse();
+    Ok(sessions)
+}
+
+fn load_persisted_watch_turns(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<PersistedWatchTurn>> {
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, codex_status, requested_model, actual_model, \
+                codex_input_tokens, codex_cached_input_tokens, \
+                codex_uncached_input_tokens, codex_output_tokens, \
+                codex_reasoning_output_tokens, codex_total_tokens, \
+                context_utilization, context_window_tokens, tool_calls \
+         FROM turn_snapshots \
+         WHERE session_id = ?1 AND provider = 'codex_responses' \
+         ORDER BY turn_number ASC",
+    )?;
+
+    let turns = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            let context_window_tokens = row
+                .get::<_, Option<i64>>(11)?
+                .map(|value| value.max(0) as u64)
+                .filter(|value| *value > 0);
+            let tool_calls_raw = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+            Ok(PersistedWatchTurn {
+                timestamp: row.get::<_, String>(0)?,
+                status: row
+                    .get::<_, Option<String>>(1)?
+                    .unwrap_or_else(|| "completed".to_string()),
+                requested_model: row
+                    .get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "unknown".to_string()),
+                served_model: row.get::<_, Option<String>>(3)?,
+                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+                cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+                uncached_input_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+                output_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+                reasoning_output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+                total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+                context_utilization: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                context_window_tokens,
+                tool_calls: parse_tool_calls_json(&tool_calls_raw),
+            })
+        })?
+        .collect();
+    turns
+}
+
+fn load_persisted_watch_replay_events(
+    conn: &Connection,
+    session_filter: Option<&str>,
+    limit: usize,
+) -> rusqlite::Result<Vec<watch::WatchEvent>> {
+    let sessions = load_persisted_watch_sessions(conn, session_filter, limit)?;
+    let mut events = Vec::new();
+
+    for session in sessions {
+        let display_name = persisted_session_display_name(
+            &session.session_id,
+            session.model.as_deref(),
+            session.initial_prompt.as_deref(),
+        );
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        events.push(watch::WatchEvent::SessionStart {
+            session_id: session.session_id.clone(),
+            display_name,
+            model,
+            initial_prompt: session.initial_prompt.clone(),
+        });
+
+        for turn in load_persisted_watch_turns(conn, &session.session_id)? {
+            for tool_name in &turn.tool_calls {
+                events.push(watch::WatchEvent::ToolUse {
+                    session_id: session.session_id.clone(),
+                    timestamp: turn.timestamp.clone(),
+                    tool_name: tool_name.clone(),
+                    summary: String::new(),
+                });
+            }
+
+            if let Some(served_model) = turn.served_model.as_ref() {
+                if served_model != &turn.requested_model {
+                    events.push(watch::WatchEvent::ModelFallback {
+                        session_id: session.session_id.clone(),
+                        requested: turn.requested_model.clone(),
+                        actual: served_model.clone(),
+                    });
+                }
+            }
+
+            events.push(watch::WatchEvent::CodexTurnSummary {
+                session_id: session.session_id.clone(),
+                status: turn.status,
+                requested_model: turn.requested_model,
+                served_model: turn.served_model,
+                input_tokens: turn.input_tokens,
+                cached_input_tokens: turn.cached_input_tokens,
+                uncached_input_tokens: turn.uncached_input_tokens,
+                output_tokens: turn.output_tokens,
+                reasoning_output_tokens: turn.reasoning_output_tokens,
+                total_tokens: turn.total_tokens,
+            });
+            events.push(watch::WatchEvent::ContextStatus {
+                session_id: session.session_id.clone(),
+                fill_percent: (turn.context_utilization * 100.0).clamp(0.0, 100.0),
+                context_window_tokens: turn.context_window_tokens,
+                turns_to_compact: None,
+            });
+        }
+    }
+
+    Ok(events)
+}
+
+fn watch_event_session_id(event: &watch::WatchEvent) -> Option<&str> {
+    match event {
+        watch::WatchEvent::ToolUse { session_id, .. }
+        | watch::WatchEvent::ToolResult { session_id, .. }
+        | watch::WatchEvent::SkillEvent { session_id, .. }
+        | watch::WatchEvent::McpEvent { session_id, .. }
+        | watch::WatchEvent::CacheEvent { session_id, .. }
+        | watch::WatchEvent::SessionStart { session_id, .. }
+        | watch::WatchEvent::SessionEnd { session_id, .. }
+        | watch::WatchEvent::FrustrationSignal { session_id, .. }
+        | watch::WatchEvent::CompactionLoop { session_id, .. }
+        | watch::WatchEvent::Diagnosis { session_id, .. }
+        | watch::WatchEvent::CacheWarning { session_id, .. }
+        | watch::WatchEvent::ModelFallback { session_id, .. }
+        | watch::WatchEvent::CodexTurnSummary { session_id, .. }
+        | watch::WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
+        watch::WatchEvent::RateLimitStatus { .. } => None,
+    }
+}
+
+fn should_load_persisted_watch_replay(
+    params: &std::collections::HashMap<String, String>,
+    session_filter: Option<&str>,
+    history: &[watch::WatchEvent],
+) -> bool {
+    let requested = session_filter.is_some()
+        || params
+            .get("replay")
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "recent"));
+    if !requested {
+        return false;
+    }
+
+    !history.iter().any(|event| {
+        watch_event_session_id(event).is_some() && event_matches_session(event, session_filter)
+    })
+}
+
 fn latest_response_summary_from_db(
     conn: &Connection,
     session_id: &str,
@@ -6697,6 +6914,22 @@ async fn handle_watch(
     let session_filter = params.get("session").cloned();
 
     let (history, mut rx) = watch::BROADCASTER.subscribe_with_history();
+    let should_load_persisted_replay =
+        should_load_persisted_watch_replay(&params, session_filter.as_deref(), &history);
+    let mut persisted_replay = if should_load_persisted_replay {
+        let session_filter_for_db = session_filter.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(db_path()).ok()?;
+            let _ = repair_persisted_session_artifacts(&conn);
+            load_persisted_watch_replay_events(&conn, session_filter_for_db.as_deref(), 20).ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // Look up stored session info synchronously before the stream starts.
     let synthetic_start = session_filter.as_ref().and_then(|sid| {
@@ -6714,11 +6947,25 @@ async fn handle_watch(
             }
         })
     });
+    if let Some(watch::WatchEvent::SessionStart { session_id, .. }) = synthetic_start.as_ref() {
+        persisted_replay.retain(|event| {
+            !matches!(event, watch::WatchEvent::SessionStart { session_id: persisted_id, .. } if persisted_id == session_id)
+        });
+    }
 
     let stream = async_stream::stream! {
         // Synthetic SessionStart first if we're filtered to a session.
         if let Some(ev) = synthetic_start {
             if let Ok(json) = serde_json::to_string(&ev) {
+                yield Ok(Event::default().data(json));
+            }
+        }
+
+        for event in persisted_replay {
+            if !event_matches_session(&event, session_filter.as_deref()) {
+                continue;
+            }
+            if let Ok(json) = serde_json::to_string(&event) {
                 yield Ok(Event::default().data(json));
             }
         }
@@ -8026,7 +8273,8 @@ mod tests {
         context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
         ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601,
         extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        infer_context_window_tokens, load_degradation_view_from_db, load_turn_snapshots_from_db,
+        infer_context_window_tokens, load_degradation_view_from_db,
+        load_persisted_watch_replay_events, load_turn_snapshots_from_db,
         looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
         now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
         persist_billing_reconciliation, persisted_session_display_name, pricing,
@@ -9758,6 +10006,60 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .causes
             .iter()
             .any(|cause| cause.cause_type == "codex_response_failed"));
+    }
+
+    #[test]
+    fn persisted_watch_replay_rebuilds_completed_codex_session_events() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        ensure_codex_persistence_columns(&conn).expect("ensure codex columns");
+        insert_session(
+            &conn,
+            "codex-watch-db",
+            "2026-04-30T12:00:00Z",
+            Some("2026-04-30T12:00:10Z"),
+            "gpt-5.5",
+            Some("# AGENTS.md instructions for /Users/pradeepsingh/code/coditor"),
+        );
+        insert_codex_turn_snapshot(&conn, "codex-watch-db", "completed", 1);
+
+        let events =
+            load_persisted_watch_replay_events(&conn, Some("codex-watch-db"), 8).expect("events");
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::watch::WatchEvent::SessionStart {
+                session_id,
+                display_name,
+                model,
+                ..
+            } if session_id == "codex-watch-db" && display_name == "coditor" && model == "gpt-5.5"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::watch::WatchEvent::CodexTurnSummary {
+                session_id,
+                status,
+                requested_model,
+                served_model: Some(served_model),
+                cached_input_tokens: 500,
+                reasoning_output_tokens: 20,
+                total_tokens: 1100,
+                ..
+            } if session_id == "codex-watch-db"
+                && status == "completed"
+                && requested_model == "gpt-codex-fixture"
+                && served_model == "gpt-codex-fixture"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::watch::WatchEvent::ContextStatus {
+                session_id,
+                fill_percent,
+                context_window_tokens: Some(128000),
+                ..
+            } if session_id == "codex-watch-db" && (fill_percent - 10.0).abs() < f64::EPSILON
+        )));
     }
 
     #[test]

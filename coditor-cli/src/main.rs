@@ -336,8 +336,14 @@ const GRAFANA_URL: &str = "http://127.0.0.1:3000";
 const GRAFANA_DASHBOARD_URL: &str = "http://127.0.0.1:3000/d/coditor-main";
 const CHATGPT_CODEX_BACKEND_PATH: &str = "/backend-api";
 const CODEX_MODEL_BACKEND_PATH: &str = "/backend-api/codex";
-const CODEX_MODEL_PROVIDER_ID: &str = "coditor-openai";
+const CODEX_MODEL_PROVIDER_ID: &str = "coditor-chatgpt";
 const CODEX_REQUEST_COMPRESSION_FEATURE: &str = "enable_request_compression";
+const CODEX_PARENT_SESSION_ENV_REMOVALS: &[&str] = &[
+    "CODEX_CI",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+    "CODEX_SHELL",
+    "CODEX_THREAD_ID",
+];
 const DEFAULT_CORE_IMAGE: &str =
     concat!("ghcr.io/softcane/coditor-core:v", env!("CARGO_PKG_VERSION"));
 const BUNDLED_ENVOY_YAML: &str = include_str!("../../envoy/envoy.yaml");
@@ -693,6 +699,13 @@ fn prepare_bundled_stack() -> Result<PathBuf, String> {
 fn resolve_compose_file() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("CODITOR_COMPOSE_FILE") {
         let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map_err(|err| format!("failed to resolve current directory: {err}"))?
+                .join(path)
+        };
         if path.is_file() {
             return Ok(path);
         }
@@ -1018,7 +1031,7 @@ async fn run_doctor() -> i32 {
     );
     print_check(
         "⚠",
-        "Live ChatGPT/Codex subscription traffic is not validated yet",
+        "Live ChatGPT/Codex subscription traffic is experimental; Codex 0.125.0 smoke is documented",
     );
 
     if !fixes.is_empty() {
@@ -1066,8 +1079,9 @@ async fn start_stack(no_grafana: bool) -> Result<(), String> {
         .args(["-p", "coditor"])
         .arg("-f")
         .arg(&compose_file)
-        .args(["up", "-d", "--build"])
+        .args(["up", "-d", "--build", "--remove-orphans"])
         .current_dir(compose_root)
+        .env_remove("COMPOSE_FILE")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -1088,6 +1102,7 @@ async fn start_stack(no_grafana: bool) -> Result<(), String> {
         .arg(&compose_file)
         .args(["restart", "envoy"])
         .current_dir(compose_root)
+        .env_remove("COMPOSE_FILE")
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -1221,11 +1236,33 @@ enum RunMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+enum ChildStdinMode {
+    Inherit,
+    Null,
+}
+
+impl ChildStdinMode {
+    fn stdio(&self) -> Stdio {
+        match self {
+            ChildStdinMode::Inherit => Stdio::inherit(),
+            ChildStdinMode::Null => Stdio::null(),
+        }
+    }
+}
+
+fn tmux_orchestrator_watch_url(base_url: &str) -> String {
+    format!("{}/watch?replay=recent", base_url.trim_end_matches('/'))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ChildRunPlan {
     command: String,
     args: Vec<String>,
     envs: Vec<(String, String)>,
+    env_removals: Vec<String>,
+    stdin_mode: ChildStdinMode,
     mode: RunMode,
+    requires_codex_observation: bool,
 }
 
 fn is_codex_command(command: &str) -> bool {
@@ -1279,15 +1316,49 @@ fn codex_subscription_config_overrides(
     ]
 }
 
-fn codex_config_args(chatgpt_base_url: &str, codex_model_base_url: &str) -> Vec<String> {
+fn codex_config_args_for_subscription(
+    chatgpt_base_url: &str,
+    codex_model_base_url: &str,
+) -> Vec<String> {
     codex_subscription_config_overrides(chatgpt_base_url, codex_model_base_url)
         .into_iter()
         .flat_map(|override_arg| ["-c".to_string(), override_arg])
         .collect()
 }
 
-fn codex_child_args_with_defaults(command_args: &[String]) -> Vec<String> {
-    command_args.to_vec()
+fn codex_child_args_with_subscription_overrides(
+    command_args: &[String],
+    chatgpt_base_url: &str,
+    codex_model_base_url: &str,
+) -> Vec<String> {
+    let config_args = codex_config_args_for_subscription(chatgpt_base_url, codex_model_base_url);
+    if let Some(exec_index) = command_args
+        .iter()
+        .position(|arg| matches!(arg.as_str(), "exec" | "e"))
+    {
+        let mut args = Vec::with_capacity(command_args.len() + config_args.len());
+        args.extend(command_args[..=exec_index].iter().cloned());
+        args.extend(config_args);
+        args.extend(command_args[exec_index + 1..].iter().cloned());
+        args
+    } else {
+        let mut args = config_args;
+        args.extend(command_args.iter().cloned());
+        args
+    }
+}
+
+fn codex_command_requires_observation(command_args: &[String]) -> bool {
+    if command_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        return false;
+    }
+
+    command_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "exec" | "e"))
 }
 
 fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String> {
@@ -1299,13 +1370,30 @@ fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String
     if is_codex_command(command) {
         let chatgpt_base_url = chatgpt_codex_proxy_base_url();
         let codex_model_base_url = codex_model_proxy_base_url();
-        let mut args = codex_config_args(&chatgpt_base_url, &codex_model_base_url);
-        args.extend(codex_child_args_with_defaults(command_args));
+        let is_exec_invocation = command_args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "exec" | "e"));
+        let requires_codex_observation = codex_command_requires_observation(command_args);
+        let args = codex_child_args_with_subscription_overrides(
+            command_args,
+            &chatgpt_base_url,
+            &codex_model_base_url,
+        );
         return Ok(ChildRunPlan {
             command: command.clone(),
             args,
             envs: Vec::new(),
+            env_removals: CODEX_PARENT_SESSION_ENV_REMOVALS
+                .iter()
+                .map(|key| key.to_string())
+                .collect(),
+            stdin_mode: if is_exec_invocation {
+                ChildStdinMode::Null
+            } else {
+                ChildStdinMode::Inherit
+            },
             mode: RunMode::CodexSubscriptionProxy,
+            requires_codex_observation,
         });
     }
 
@@ -1313,7 +1401,10 @@ fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String
         command: command.clone(),
         args: command_args.to_vec(),
         envs: Vec::new(),
+        env_removals: Vec::new(),
+        stdin_mode: ChildStdinMode::Inherit,
         mode: RunMode::PlainCommand,
+        requires_codex_observation: false,
     })
 }
 
@@ -1332,7 +1423,7 @@ fn render_child_run_plan(plan: &ChildRunPlan) -> String {
                 codex_model_proxy_base_url()
             ));
             lines.push(format!(
-                "Model provider override: {CODEX_MODEL_PROVIDER_ID} (responses, WebSocket disabled)"
+                "Model provider override: {CODEX_MODEL_PROVIDER_ID} (ChatGPT auth, Responses HTTP)"
             ));
             lines.push("Config files: not modified".to_string());
             lines.push(format!(
@@ -1345,6 +1436,12 @@ fn render_child_run_plan(plan: &ChildRunPlan) -> String {
             lines.push(
                 "Auth: uses existing Codex ChatGPT login; OPENAI_API_KEY is not used".to_string(),
             );
+            if plan.requires_codex_observation {
+                lines.push(
+                    "Post-run check: require Coditor to observe at least one Codex Responses request"
+                        .to_string(),
+                );
+            }
         }
         RunMode::PlainCommand => {
             lines.push("Mode: plain child command (not proxied)".to_string());
@@ -1367,6 +1464,23 @@ fn render_child_run_plan(plan: &ChildRunPlan) -> String {
         }
     }
 
+    lines.push("Environment removals:".to_string());
+    if plan.env_removals.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for key in &plan.env_removals {
+            lines.push(format!("  {key}"));
+        }
+    }
+
+    lines.push(match (&plan.mode, &plan.stdin_mode) {
+        (RunMode::CodexSubscriptionProxy, ChildStdinMode::Null) => {
+            "Child stdin: closed for Codex exec".to_string()
+        }
+        (_, ChildStdinMode::Null) => "Child stdin: closed".to_string(),
+        (_, ChildStdinMode::Inherit) => "Child stdin: inherited".to_string(),
+    });
+
     lines.join("\n") + "\n"
 }
 
@@ -1385,7 +1499,7 @@ fn print_child_run_status(plan: &ChildRunPlan) {
                 codex_model_proxy_base_url()
             );
             eprintln!(
-                "Coditor: model provider override {CODEX_MODEL_PROVIDER_ID} uses Responses with WebSocket disabled."
+                "Coditor: model provider override {CODEX_MODEL_PROVIDER_ID} uses ChatGPT auth with Responses HTTP."
             );
             eprintln!("Coditor: command-line config overrides only; ~/.codex/config.toml is not modified.");
             eprintln!(
@@ -1394,6 +1508,17 @@ fn print_child_run_status(plan: &ChildRunPlan) {
             eprintln!("Coditor: wrapper does not inject --ephemeral; Codex keeps its normal session persistence behavior.");
             eprintln!("Coditor: suppressing known Codex rollout-recording warning; Coditor records traffic via proxy.");
             eprintln!("Coditor: OPENAI_API_KEY is not used for subscription mode.");
+            if !plan.env_removals.is_empty() {
+                eprintln!(
+                    "Coditor: removing inherited Codex parent-session env vars from the child process."
+                );
+            }
+            if plan.requires_codex_observation {
+                eprintln!("Coditor: will fail this run if coditor-core observes no Codex Responses request.");
+            }
+            if plan.stdin_mode == ChildStdinMode::Null {
+                eprintln!("Coditor: child stdin is closed for Codex exec.");
+            }
         }
         RunMode::PlainCommand => {
             eprintln!("Coditor: launching non-Codex child command without proxy overrides.");
@@ -1405,14 +1530,19 @@ fn run_command_with_env(
     command: &str,
     args: &[String],
     envs: &[(String, String)],
+    env_removals: &[String],
+    stdin_mode: &ChildStdinMode,
 ) -> Result<i32, String> {
     let mut child = Command::new(command);
     child.args(args);
+    for key in env_removals {
+        child.env_remove(key);
+    }
     for (key, value) in envs {
         child.env(key, value);
     }
     let status = child
-        .stdin(Stdio::inherit())
+        .stdin(stdin_mode.stdio())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -1427,14 +1557,19 @@ fn run_codex_command_with_filtered_stderr(
     command: &str,
     args: &[String],
     envs: &[(String, String)],
+    env_removals: &[String],
+    stdin_mode: &ChildStdinMode,
 ) -> Result<i32, String> {
     let mut child = Command::new(command);
     child.args(args);
+    for key in env_removals {
+        child.env_remove(key);
+    }
     for (key, value) in envs {
         child.env(key, value);
     }
     let mut child = child
-        .stdin(Stdio::inherit())
+        .stdin(stdin_mode.stdio())
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
@@ -1472,6 +1607,66 @@ fn should_suppress_codex_stderr_line(line: &str) -> bool {
         || line.contains("write_stdin failed: stdin is closed for this session")
 }
 
+fn parse_codex_requests_total(metrics: &str) -> Option<f64> {
+    let mut total = 0.0;
+    let mut found = false;
+
+    for line in metrics.lines().map(str::trim) {
+        if line.starts_with("coditor_requests_total{")
+            && line.contains(r#"provider="codex_responses""#)
+        {
+            let Some(value) = line
+                .rsplit_once(' ')
+                .and_then(|(_, value)| value.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            total += value;
+            found = true;
+        }
+    }
+
+    found.then_some(total)
+}
+
+async fn fetch_codex_requests_total() -> Result<f64, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .map_err(|err| format!("failed to build metrics client: {err}"))?;
+    let metrics_url = format!("{}/metrics", coditor_core_url().trim_end_matches('/'));
+    let resp = client
+        .get(&metrics_url)
+        .send()
+        .await
+        .map_err(|err| format!("failed to fetch {metrics_url}: {err}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "failed to fetch {metrics_url}: HTTP {}",
+            resp.status()
+        ));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|err| format!("failed to read {metrics_url}: {err}"))?;
+    parse_codex_requests_total(&body).ok_or_else(|| {
+        "coditor_requests_total for provider=\"codex_responses\" is missing".to_string()
+    })
+}
+
+async fn wait_for_codex_observation_delta(before: f64, timeout: Duration) -> Result<bool, String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let after = fetch_codex_requests_total().await?;
+        if after > before {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(false)
+}
+
 async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>) -> i32 {
     let (watch, child_command) = extract_run_watch(watch_flag, command);
     if child_command.is_empty() {
@@ -1501,6 +1696,18 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
         return 1;
     }
 
+    let observed_before = if plan.requires_codex_observation {
+        match fetch_codex_requests_total().await {
+            Ok(value) => Some(value),
+            Err(err) => {
+                eprintln!("Error: Coditor observation pre-check failed: {err}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     let mut watcher = if watch {
         match start_watcher() {
             Ok(handle) => Some(handle),
@@ -1515,10 +1722,20 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
 
     print_child_run_status(&plan);
     let result = match plan.mode {
-        RunMode::CodexSubscriptionProxy => {
-            run_codex_command_with_filtered_stderr(&plan.command, &plan.args, &plan.envs)
-        }
-        RunMode::PlainCommand => run_command_with_env(&plan.command, &plan.args, &plan.envs),
+        RunMode::CodexSubscriptionProxy => run_codex_command_with_filtered_stderr(
+            &plan.command,
+            &plan.args,
+            &plan.envs,
+            &plan.env_removals,
+            &plan.stdin_mode,
+        ),
+        RunMode::PlainCommand => run_command_with_env(
+            &plan.command,
+            &plan.args,
+            &plan.envs,
+            &plan.env_removals,
+            &plan.stdin_mode,
+        ),
     };
 
     if let Some(handle) = watcher.as_mut() {
@@ -1526,7 +1743,24 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
     }
 
     match result {
-        Ok(code) => code,
+        Ok(code) => {
+            if code == 0 {
+                if let Some(before) = observed_before {
+                    match wait_for_codex_observation_delta(before, Duration::from_secs(5)).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eprintln!("Error: Codex exited successfully, but coditor-core did not observe any new provider=\"codex_responses\" request. Treating this as a failed Coditor proxy run.");
+                            return 1;
+                        }
+                        Err(err) => {
+                            eprintln!("Error: Coditor observation post-check failed: {err}");
+                            return 1;
+                        }
+                    }
+                }
+            }
+            code
+        }
         Err(err) => {
             eprintln!("Error: {err}");
             1
@@ -1667,6 +1901,15 @@ Default Coditor stack:
 
 Coditor passes these command-line overrides; ~/.codex/config.toml is not modified:
 {subscription_overrides}
+
+Coditor removes inherited parent-session variables from child Codex runs:
+  CODEX_CI
+  CODEX_INTERNAL_ORIGINATOR_OVERRIDE
+  CODEX_SHELL
+  CODEX_THREAD_ID
+
+Coditor closes child stdin for Codex runs so codex exec cannot consume harness
+manifests or shell-loop input.
 
 Suggested fake hook endpoint for Phase 7 fixture experiments:
   http://localhost:9091/api/hooks/codex
@@ -2640,7 +2883,7 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                let watch_url = format!("{}/watch", url.trim_end_matches('/'));
+                let watch_url = tmux_orchestrator_watch_url(&url);
                 if let Err(e) = orchestrator.run(&watch_url).await {
                     eprintln!("{}", format!("Orchestrator error: {}", e).red());
                     std::process::exit(1);
@@ -3021,13 +3264,14 @@ async fn connect_and_stream(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_child_run_plan, chatgpt_codex_proxy_base_url, codex_model_proxy_base_url,
-        codex_subscription_config_overrides, codex_turn_summary_line, compact_datetime_from_iso,
-        context_status_line, event_session_id, extract_run_watch, format_duration_coarse,
-        format_tokens, local_time_from_iso, model_change_line, parse_mcp_tool_name, push_unique,
-        render_child_run_plan, render_codex_config_preview, shell_join, shell_quote,
-        should_suppress_codex_stderr_line, truncate_for_box, watch_model_label, yaml_quote,
-        ActiveSessions, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
+        build_child_run_plan, chatgpt_codex_proxy_base_url, codex_command_requires_observation,
+        codex_model_proxy_base_url, codex_subscription_config_overrides, codex_turn_summary_line,
+        compact_datetime_from_iso, context_status_line, event_session_id, extract_run_watch,
+        format_duration_coarse, format_tokens, local_time_from_iso, model_change_line,
+        parse_codex_requests_total, parse_mcp_tool_name, push_unique, render_child_run_plan,
+        render_codex_config_preview, shell_join, shell_quote, should_suppress_codex_stderr_line,
+        tmux_orchestrator_watch_url, truncate_for_box, watch_model_label, yaml_quote,
+        ActiveSessions, ChildStdinMode, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -3336,11 +3580,20 @@ mod tests {
             &chatgpt_codex_proxy_base_url(),
             &codex_model_proxy_base_url(),
         );
-        let override_arg_count = overrides.len() * 2;
+        let args_after_exec_and_overrides = 1 + overrides.len() * 2;
 
         assert_eq!(plan.mode, RunMode::CodexSubscriptionProxy);
         assert_eq!(plan.command, "codex");
         assert!(plan.envs.is_empty());
+        assert_eq!(
+            plan.env_removals,
+            [
+                "CODEX_CI".to_string(),
+                "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".to_string(),
+                "CODEX_SHELL".to_string(),
+                "CODEX_THREAD_ID".to_string()
+            ]
+        );
         for override_arg in &overrides {
             assert!(
                 has_config_override(&plan.args, override_arg),
@@ -3358,40 +3611,36 @@ mod tests {
         ));
         assert!(has_config_override(
             &plan.args,
-            "model_provider=\"coditor-openai\""
+            "model_provider=\"coditor-chatgpt\""
         ));
         assert!(has_config_override(
             &plan.args,
-            "model_providers.coditor-openai.base_url=\"http://127.0.0.1:10000/backend-api/codex\""
+            "model_providers.coditor-chatgpt.base_url=\"http://127.0.0.1:10000/backend-api/codex\""
         ));
         assert!(has_config_override(
             &plan.args,
-            "model_providers.coditor-openai.wire_api=\"responses\""
+            "model_providers.coditor-chatgpt.wire_api=\"responses\""
         ));
         assert!(has_config_override(
             &plan.args,
-            "model_providers.coditor-openai.requires_openai_auth=true"
+            "model_providers.coditor-chatgpt.requires_openai_auth=true"
         ));
         assert!(has_config_override(
             &plan.args,
-            "model_providers.coditor-openai.supports_websockets=false"
+            "model_providers.coditor-chatgpt.supports_websockets=false"
         ));
+        assert!(plan.requires_codex_observation);
+        assert_eq!(plan.stdin_mode, ChildStdinMode::Null);
         assert!(!plan.args.iter().any(|arg| arg.contains("OPENAI_API_KEY")));
         assert!(!plan
             .args
             .iter()
             .any(|arg| arg.contains("forced_login_method")));
-        assert!(!plan
-            .args
-            .iter()
-            .any(|arg| arg.contains("coditor-openai-responses")));
+        assert!(!plan.args.iter().any(|arg| arg.contains("env_key")));
+        assert_eq!(plan.args[0], "exec");
         assert_eq!(
-            plan.args[override_arg_count..],
-            [
-                "exec".to_string(),
-                "hello".to_string(),
-                "--json".to_string()
-            ]
+            plan.args[args_after_exec_and_overrides..],
+            ["hello".to_string(), "--json".to_string()]
         );
     }
 
@@ -3403,7 +3652,37 @@ mod tests {
         assert_eq!(plan.mode, RunMode::CodexSubscriptionProxy);
         assert_eq!(plan.command, "/opt/homebrew/bin/codex");
         assert!(plan.envs.is_empty());
+        assert!(plan.env_removals.contains(&"CODEX_THREAD_ID".to_string()));
+        assert_eq!(plan.stdin_mode, ChildStdinMode::Inherit);
+        assert!(!plan.requires_codex_observation);
         assert!(plan.args.ends_with(&["--help".to_string()]));
+    }
+
+    #[test]
+    fn codex_observation_is_required_only_for_exec_turns() {
+        assert!(codex_command_requires_observation(&[
+            "exec".to_string(),
+            "hello".to_string()
+        ]));
+        assert!(codex_command_requires_observation(&[
+            "-m".to_string(),
+            "gpt-5.4".to_string(),
+            "e".to_string(),
+            "hello".to_string()
+        ]));
+        assert!(!codex_command_requires_observation(&["--help".to_string()]));
+        assert!(!codex_command_requires_observation(&[
+            "login".to_string(),
+            "status".to_string()
+        ]));
+    }
+
+    #[test]
+    fn tmux_orchestrator_requests_persisted_recent_replay() {
+        assert_eq!(
+            tmux_orchestrator_watch_url("http://localhost:9091/"),
+            "http://localhost:9091/watch?replay=recent"
+        );
     }
 
     #[test]
@@ -3419,6 +3698,8 @@ mod tests {
         assert_eq!(plan.command, "/bin/sh");
         assert_eq!(plan.args, ["-c".to_string(), "printf ok".to_string()]);
         assert!(plan.envs.is_empty());
+        assert!(plan.env_removals.is_empty());
+        assert_eq!(plan.stdin_mode, ChildStdinMode::Inherit);
         assert!(!plan
             .args
             .iter()
@@ -3435,15 +3716,38 @@ mod tests {
         assert!(preview.contains("experimental Codex ChatGPT subscription proxy"));
         assert!(preview.contains("Config files: not modified"));
         assert!(preview.contains("Environment overrides:\n  (none)"));
+        assert!(preview.contains("Environment removals:\n  CODEX_CI"));
+        assert!(preview.contains("CODEX_INTERNAL_ORIGINATOR_OVERRIDE"));
+        assert!(preview.contains("CODEX_SHELL"));
+        assert!(preview.contains("CODEX_THREAD_ID"));
+        assert!(preview.contains("Child stdin: closed for Codex exec"));
         assert!(preview.contains("features.enable_request_compression=false"));
-        assert!(preview.contains("Model provider override: coditor-openai"));
+        assert!(preview
+            .contains("Model provider override: coditor-chatgpt (ChatGPT auth, Responses HTTP)"));
         assert!(preview.contains("wrapper does not inject --ephemeral"));
         assert!(preview.contains("Known Codex rollout-recording warning: suppressed"));
         assert!(preview.contains("OPENAI_API_KEY is not used"));
+        assert!(preview.contains(
+            "Post-run check: require Coditor to observe at least one Codex Responses request"
+        ));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api"));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api/codex"));
-        assert!(preview.contains("codex -c"));
-        assert!(preview.contains("exec hello"));
+        assert!(preview.contains("codex exec -c"));
+        assert!(preview.contains("hello"));
+    }
+
+    #[test]
+    fn codex_request_metric_parser_sums_codex_provider() {
+        let metrics = r#"
+# HELP coditor_requests_total Total requests
+# TYPE coditor_requests_total counter
+coditor_requests_total{model="gpt-5.5",provider="codex_responses"} 2
+coditor_requests_total{model="gpt-5.4",provider="codex_responses"} 3
+coditor_requests_total{model="legacy_claude",provider="legacy_anthropic"} 99
+"#;
+
+        assert_eq!(parse_codex_requests_total(metrics), Some(5.0));
+        assert_eq!(parse_codex_requests_total("other_metric 1"), None);
     }
 
     #[test]
@@ -3525,20 +3829,18 @@ mod tests {
         assert!(preview.contains("coditor up"));
         assert!(preview.contains("~/.codex/config.toml is not modified"));
         assert!(preview.contains(r#"-c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#));
-        assert!(
-            preview.contains(
-                r#"-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
-            )
-        );
-        assert!(preview.contains(r#"-c 'model_provider="coditor-openai"'"#));
-        assert!(preview.contains(r#"-c 'model_providers.coditor-openai.wire_api="responses"'"#));
-        assert!(preview.contains("-c model_providers.coditor-openai.supports_websockets=false"));
+        assert!(preview.contains(r#"-c 'model_provider="coditor-chatgpt"'"#));
+        assert!(preview.contains(
+            r#"-c 'model_providers.coditor-chatgpt.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
+        ));
+        assert!(preview.contains("-c model_providers.coditor-chatgpt.supports_websockets=false"));
         assert!(preview.contains("-c features.enable_request_compression=false"));
         assert!(preview.contains("http://localhost:9091/api/hooks/codex"));
         assert!(preview.contains("coditor.codex_hook.v1"));
         assert!(preview.contains("does not use OPENAI_API_KEY"));
         assert!(preview.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
         assert!(!preview.contains("forced_login_method"));
+        assert!(!preview.contains("openai_base_url"));
     }
 
     #[test]

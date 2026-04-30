@@ -17,9 +17,9 @@ Run 3-4 Codex sessions through Coditor:
 
 Each session should be intentionally small and reversible. Prefer prompts that inspect files, list project structure, summarize tests, or read local docs. Do not use destructive prompts for the dogfood harness.
 
-## Proposed Harness
+## Harness
 
-Add a script such as:
+The real harness is:
 
 ```sh
 ./test/dogfood-codex-sessions.sh --sessions 4 --mode real
@@ -35,12 +35,30 @@ Suggested options:
 - `--keep-stack`: leave Docker Compose running after the test.
 - `--report-dir <path>`: write report artifacts to a chosen directory.
 
+`--mode real` uses the local Codex ChatGPT login and can contact
+`chatgpt.com`. It runs the subscription preflight first, starts `/watch`
+capture, launches real `codex exec` sessions through `coditor run -- codex`,
+then writes `summary.json`, `summary.md`, `/watch`, SQLite, Prometheus,
+Grafana, command, and Compose artifacts under `reports/dogfood/<timestamp>/`.
+
+`--mode fixture` delegates to `./test/e2e-openai-responses-full.sh` and is only
+a Phase 9A fake regression convenience. It is not a real dogfood substitute.
+
+First live result: on 2026-04-30 UTC / 2026-05-01 Europe/Stockholm, the harness
+ran four real Codex 0.125.0 sessions and produced a `partial` report. It passed
+session launch, same/different repo coverage, `/watch` session/turn/context
+events, SQLite, Prometheus, and Grafana checks. It reported missing real tool
+and MCP watch telemetry. The detailed log is in `docs/real-codex-smoke.md`.
+
 ## What The Harness Should Do
 
 1. Start the Coditor stack.
 2. Verify `coditor-core`, Envoy, Prometheus, and Grafana are reachable.
 3. Start a `/watch` capture before launching Codex sessions.
 4. Launch 3-4 Codex sessions through `coditor run -- codex ...`.
+   Redirect each child process stdin from `/dev/null`; `codex exec` may read
+   inherited stdin, and validation manifests must not be consumable by child
+   sessions.
 5. Use prompt fixtures for:
    - read-only repo inspection
    - file search/read
@@ -140,8 +158,20 @@ cargo run -q -p coditor-cli -- preflight codex-subscription -- codex exec \
   "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
 ```
 
-The preflight starts the subscription-mode stack and prints the live command,
-but it must stop before the first real Codex call until explicitly approved.
+The preflight starts the subscription-mode stack and prints the live command.
+Use it before future live runs to confirm the config without launching a Codex
+turn.
+
+After explicit approval and a passing Phase 9A fake gate, the smallest real
+smoke can be run through the same harness:
+
+```sh
+./test/dogfood-codex-sessions.sh --mode real --sessions 1 --repos same \
+  --report-dir reports/dogfood/smoke-$(date -u +%Y%m%dT%H%M%SZ)
+```
+
+Record future smoke outcomes in `docs/real-codex-smoke.md` with the date, Codex
+version, command/config, observed events, rollback command, and limitations.
 
 ### Tool And MCP Assertions
 
@@ -197,6 +227,9 @@ Start real multi-session dogfood testing only after these are true:
   failed/incomplete streams, watch replay, persistence, observability, CLI
   dry-run, and failure-open behavior.
 
+Those minimum gates were satisfied before the first live run recorded in
+`docs/real-codex-smoke.md`.
+
 For the full version that checks tools, MCP, diagnosis, Prometheus, and Grafana, also complete:
 
 - Phase 6C: watch/tmux Codex rendering polish.
@@ -235,3 +268,6 @@ and produce a report that answers:
 - Did Grafana load dashboards backed by real metrics?
 - Did tool and MCP events appear when expected?
 - What is still missing, skipped, or failing?
+
+The current answer is intentionally `partial`: the harness runs and reports the
+state accurately, while real tool and MCP watch telemetry remain missing.

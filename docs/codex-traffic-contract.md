@@ -1,10 +1,11 @@
 # Codex/OpenAI Traffic Contract
 
-Status: fixture/manual proxy contract only. Coditor has an experimental
-ChatGPT/Codex subscription wrapper path, but real Codex/OpenAI traffic is not
-validated yet.
+Status: fixture contract plus experimental live-smoke validation. Coditor has a
+ChatGPT/Codex subscription wrapper path that passed a first real Codex 0.125.0
+smoke test on 2026-04-30 UTC, but live support remains experimental and
+limited by the gaps recorded in `docs/real-codex-smoke.md`.
 This document defines the fake Responses traffic shape used to drive fixtures
-and tests until a real Codex capture verifies or replaces it.
+and the live observations that have been verified so far.
 
 References:
 
@@ -267,8 +268,9 @@ Example static validation:
 ./test/validate-openai-config.sh
 ```
 
-This config is the default Codex CLI wrapper path. Live traffic is still not
-validated until a ChatGPT-auth Codex smoke runs through it.
+This config is the default Codex CLI wrapper path. A ChatGPT-auth Codex 0.125.0
+smoke has now run through it; future Codex versions and broader behavior still
+need revalidation.
 
 ## Phase 6B CLI Wrapper
 
@@ -281,25 +283,51 @@ through `chatgpt_base_url`, which defaults to
 `https://chatgpt.com/backend-api/`, while model turns need the
 `https://chatgpt.com/backend-api/codex` Responses route.
 
-Coditor uses command-line config overrides only. It points auxiliary calls at
-the local proxy and installs a custom `coditor-openai` model provider for model
-turns so WebSocket transport can be disabled while preserving ChatGPT auth:
+Coditor uses command-line config overrides only. For `codex exec`, these
+overrides must be attached to the `exec` subcommand; root-level `codex -c ...`
+overrides are validated by Codex 0.125 but do not reach the in-process
+app-server thread start path. The wrapper points auxiliary calls at the local
+proxy and installs a ChatGPT-auth custom provider for model turns so WebSocket
+transport can be disabled:
 
 ```text
 -c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'
--c 'model_provider="coditor-openai"'
--c 'model_providers.coditor-openai.name="OpenAI"'
--c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'
--c 'model_providers.coditor-openai.wire_api="responses"'
--c 'model_providers.coditor-openai.requires_openai_auth=true'
--c 'model_providers.coditor-openai.supports_websockets=false'
+-c 'model_provider="coditor-chatgpt"'
+-c 'model_providers.coditor-chatgpt.name="OpenAI"'
+-c 'model_providers.coditor-chatgpt.base_url="http://127.0.0.1:10000/backend-api/codex"'
+-c 'model_providers.coditor-chatgpt.wire_api="responses"'
+-c 'model_providers.coditor-chatgpt.requires_openai_auth=true'
+-c 'model_providers.coditor-chatgpt.supports_websockets=false'
 -c features.enable_request_compression=false
 ```
 
 This path must preserve the current Codex ChatGPT login. It must not set
 `OPENAI_API_KEY`, `env_key`, or `forced_login_method`.
 
-The wrapper preserves user-provided Codex arguments after those overrides.
+The wrapper preserves user-provided Codex arguments after those overrides. For
+`codex exec` turns, the wrapper also treats a zero child exit as a failed
+Coditor proxy run if `coditor-core` does not observe a new
+`provider="codex_responses"` request.
+The wrapper closes child stdin for Codex runs. This keeps `codex exec` from
+reading orchestration manifests or shell-loop input in validation harnesses;
+prompts should be passed as explicit Codex arguments.
+
+`coditor watch --tmux` connects its orchestrator to `/watch?replay=recent`.
+When the 30-second in-memory watch ring has expired, `coditor-core` rebuilds a
+bounded recent Codex replay from SQLite using persisted `sessions` and
+`turn_snapshots`, then continues streaming live events.
+
+Envoy stdout access logs intentionally omit `%RESPONSE_CODE_DETAILS%` on the
+Codex subscription path. Some successful HTTP 200 streaming responses are
+reported by Envoy as `downstream_remote_disconnect` after Codex has already
+consumed the completed Responses stream; Coditor classifies success from the
+core parser/finalizer and persisted turn status instead.
+
+When Coditor itself is launched from Codex Desktop, the wrapper removes
+inherited parent-session variables (`CODEX_CI`,
+`CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, `CODEX_SHELL`, and `CODEX_THREAD_ID`)
+from the child Codex process. This keeps the child run on the explicit CLI
+config path instead of reusing the parent app/thread context.
 
 Use `coditor run --dry-run -- codex ...` or `coditor config codex` to inspect
 the generated config without launching Codex.
@@ -321,6 +349,67 @@ coditor preflight codex-subscription -- codex exec ...
 The preflight verifies local Codex ChatGPT login, starts the subscription-mode
 stack, and prints the exact command. It must stop before any real Codex call
 until the user approves the live smoke.
+
+Phase 9B live smoke result:
+
+- Date: 2026-04-30 UTC / 2026-05-01 Europe/Stockholm.
+- Codex CLI: `codex-cli 0.125.0`.
+- Command: `./test/dogfood-codex-sessions.sh --mode real --sessions 1
+  --repos same --report-dir reports/dogfood/smoke-20260430T223720Z`.
+- Coditor observed real `provider="codex_responses"` traffic through Envoy.
+- `/watch` emitted `SessionStart`, `CodexTurnSummary`, and `ContextStatus`.
+- Served model was captured as `gpt-5.5`.
+- No Codex cached input was represented as an Anthropic `CacheEvent`.
+
+Operational lessons from the first live run:
+
+- Stale fake Compose services can contaminate the default subscription stack;
+  live harnesses pre-clean with `docker compose down --remove-orphans`.
+- Docker Compose `COMPOSE_FILE` must be cleared and `CODITOR_COMPOSE_FILE`
+  should point at an absolute `docker-compose.yml` path.
+- Real Codex prompt excerpts begin with injected AGENTS instructions, so live
+  harness correlation uses Codex JSONL `thread.started` ids in addition to
+  prompt markers.
+- `codex exec` child stdin is closed for wrapper runs so harness manifests
+  cannot be consumed as prompt input.
+
+## Phase 9C Automated Dogfood Harness
+
+`test/dogfood-codex-sessions.sh` is the real multi-session dogfood harness. In
+`--mode real` it launches 1-4 `codex exec` sessions through
+`coditor run -- codex ...`, captures `/watch`, copies SQLite state, queries
+Prometheus and Grafana, and writes both machine-readable and human-readable
+reports under `reports/dogfood/<timestamp>/`.
+
+The first four-session run used:
+
+```sh
+./test/dogfood-codex-sessions.sh --mode real --sessions 4 --repos mixed \
+  --include-mcp --timeout-seconds 600 \
+  --report-dir reports/dogfood/full-20260430T223917Z
+```
+
+Outcome: `partial`.
+
+Verified:
+
+- 4 real Codex child sessions exited `0`.
+- Same-repo and different-repo coverage both appeared.
+- `/watch` captured `SessionStart`, `CodexTurnSummary`, and `ContextStatus`
+  for the real sessions.
+- SQLite persisted Codex sessions/requests with served model values and token
+  math that did not double-count cached input.
+- Prometheus exposed bounded Codex request, token, duration, and context
+  metrics without session ids in labels.
+- Grafana was reachable and the provisioned `coditor-main` dashboard loaded.
+
+Still missing:
+
+- Real local command/tool execution appeared in Codex JSONL as
+  `command_execution`, but Coditor did not emit `ToolUse` or `ToolResult` watch
+  events.
+- The MCP prompt reached `openaiDeveloperDocs`; its MCP tool call was cancelled
+  inside the child session, and Coditor did not emit `McpEvent` watch events.
 
 ## Phase 7 Fake Codex Hook Contract
 
@@ -495,19 +584,29 @@ Resolved MVP decisions:
   local `/backend-api` and `/backend-api/codex`, forwarding to `chatgpt.com`.
 - Codex request compression is disabled for that wrapper path with
   `features.enable_request_compression=false`.
+- The Codex 0.125.0 ChatGPT subscription model path reaches
+  `/backend-api/codex/responses` through the wrapper, and the current Responses
+  SSE accumulator handled completed real streams in the Phase 9B/9C runs.
+- Live prompt-excerpt matching is insufficient because Codex prepends AGENTS
+  instructions; the real harness correlates sessions from Codex JSONL
+  `thread.started` ids.
 
-Still unknown until a real capture:
+Still unknown or incomplete after the first real capture:
 
-- Whether the live ChatGPT/Codex subscription response stream is byte-for-byte
-  compatible with the existing Responses SSE accumulator.
+- Whether future Codex versions keep the same ChatGPT/Codex subscription route,
+  config override behavior, and streaming shape.
 - Codex hook schema and whether hooks are authoritative for sessions, only
   enrich proxy sessions, or only provide tool telemetry.
 - Source of cwd/working directory: request metadata, Codex hook payload, config,
   or fallback inference.
 - Session id precedence across `session_id` header, hook id, response id,
   conversation id, and fallback hash.
-- Whether Codex emits tool ids/results in Responses SSE, hooks, or both.
+- Whether Codex emits complete tool ids/results and MCP events in Responses
+  SSE, hooks, JSONL, or a combination Coditor should correlate.
+- Whether pricing for long-context or subscription-served models can ever be
+  trusted for budget enforcement.
 
-Until these are resolved with a real capture, the fixtures under
-`test/fixtures/` are only a planning and TDD artifact. They must not be used to
-claim real Codex compatibility.
+Until these are resolved, the fixtures under `test/fixtures/` are only a
+planning and TDD artifact, and the Phase 9B/9C reports are scoped evidence for
+the local Codex 0.125.0 ChatGPT-auth subscription path rather than a broad
+compatibility claim.

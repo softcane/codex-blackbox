@@ -691,17 +691,21 @@ assert_cli_dry_run() {
     assert_file_contains "$output_path" "Mode: experimental Codex ChatGPT subscription proxy" "CLI dry-run uses subscription proxy mode"
     assert_file_contains "$output_path" "Config files: not modified" "CLI dry-run is read-only"
     assert_file_contains "$output_path" "chatgpt_base_url" "CLI dry-run prints ChatGPT backend proxy override"
-    assert_file_contains "$output_path" "model_provider=\"coditor-openai\"" "CLI dry-run selects Coditor custom provider"
-    assert_file_contains "$output_path" "model_providers.coditor-openai.base_url=\"http://127.0.0.1:10000/backend-api/codex\"" "CLI dry-run routes model turns through Coditor"
-    assert_file_contains "$output_path" "model_providers.coditor-openai.wire_api=\"responses\"" "CLI dry-run uses Responses wire API"
-    assert_file_contains "$output_path" "model_providers.coditor-openai.requires_openai_auth=true" "CLI dry-run preserves ChatGPT auth"
-    assert_file_contains "$output_path" "model_providers.coditor-openai.supports_websockets=false" "CLI dry-run disables Codex WebSocket transport"
+    assert_file_contains "$output_path" "model_provider=\"coditor-chatgpt\"" "CLI dry-run uses the Coditor ChatGPT subscription provider"
+    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.base_url=\"http://127.0.0.1:10000/backend-api/codex\"" "CLI dry-run routes model turns through Coditor"
+    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.requires_openai_auth=true" "CLI dry-run preserves ChatGPT auth"
+    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.supports_websockets=false" "CLI dry-run forces HTTP Responses through Envoy"
     assert_file_contains "$output_path" "OPENAI_API_KEY is not used" "CLI dry-run labels subscription auth"
+    assert_file_contains "$output_path" "Environment removals:" "CLI dry-run prints inherited Codex env removals"
+    assert_file_contains "$output_path" "CODEX_THREAD_ID" "CLI dry-run removes parent Codex thread env"
+    assert_file_contains "$output_path" "Child stdin: closed for Codex exec" "CLI dry-run closes Codex stdin for harness safety"
     assert_file_contains "$output_path" "features.enable_request_compression=false" "CLI dry-run disables request compression"
-    if grep -q "forced_login_method\\|env_key\\|coditor-openai-responses\\|openai_base_url" "$output_path"; then
-        fail "CLI dry-run should not print API-key or fake-provider overrides"
+    assert_file_contains "$output_path" "Post-run check: require Coditor to observe at least one Codex Responses request" "CLI dry-run labels observation gate"
+    if grep -q "forced_login_method\\|env_key\\|openai_base_url\\|coditor-openai\\|coditor-openai-responses" "$output_path"; then
+        fail "CLI dry-run should not print API-key or stale custom/fake-provider overrides"
     fi
-    assert_file_contains "$output_path" "exec 'Phase 9A fake smoke' --json" "CLI dry-run preserves Codex args without injecting ephemeral exec"
+    assert_file_contains "$output_path" "exec -c" "CLI dry-run attaches subscription overrides to Codex exec"
+    assert_file_contains "$output_path" "'Phase 9A fake smoke' --json" "CLI dry-run preserves Codex args without injecting ephemeral exec"
 }
 
 assert_failure_open_after_core_stop() {

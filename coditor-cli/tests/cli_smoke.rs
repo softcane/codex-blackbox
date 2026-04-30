@@ -153,13 +153,17 @@ fn config_codex_prints_read_only_future_override() {
     assert!(out.contains("coditor up"));
     assert!(out.contains("~/.codex/config.toml is not modified"));
     assert!(out.contains(r#"-c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#));
-    assert!(out.contains(r#"-c 'model_provider="coditor-openai"'"#));
+    assert!(out.contains(r#"-c 'model_provider="coditor-chatgpt"'"#));
     assert!(out.contains(
-        r#"-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
+        r#"-c 'model_providers.coditor-chatgpt.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
     ));
-    assert!(out.contains("-c model_providers.coditor-openai.supports_websockets=false"));
+    assert!(out.contains("-c model_providers.coditor-chatgpt.supports_websockets=false"));
     assert!(out.contains("-c features.enable_request_compression=false"));
+    assert!(out.contains("Coditor removes inherited parent-session variables"));
+    assert!(out.contains("Coditor closes child stdin for Codex runs"));
+    assert!(out.contains("CODEX_THREAD_ID"));
     assert!(out.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
+    assert!(!out.contains("model_providers.coditor-openai"));
 }
 
 #[test]
@@ -179,20 +183,30 @@ fn codex_dry_run_prints_overrides_and_preserves_user_args() {
     assert!(out.contains("Mode: experimental Codex ChatGPT subscription proxy"));
     assert!(out.contains("Config files: not modified"));
     assert!(out.contains("Environment overrides:\n  (none)"));
-    assert!(out.contains(r#"codex -c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#));
-    assert!(out.contains(r#"-c 'model_provider="coditor-openai"'"#));
+    assert!(out.contains("Environment removals:\n  CODEX_CI"));
+    assert!(out.contains("Child stdin: closed for Codex exec"));
+    assert!(out.contains("CODEX_INTERNAL_ORIGINATOR_OVERRIDE"));
+    assert!(out.contains("CODEX_SHELL"));
+    assert!(out.contains("CODEX_THREAD_ID"));
+    assert!(
+        out.contains(r#"codex exec -c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#)
+    );
+    assert!(out.contains(r#"-c 'model_provider="coditor-chatgpt"'"#));
     assert!(out.contains(
-        r#"-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
+        r#"-c 'model_providers.coditor-chatgpt.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
     ));
-    assert!(out.contains(r#"-c 'model_providers.coditor-openai.wire_api="responses"'"#));
-    assert!(out.contains("-c model_providers.coditor-openai.supports_websockets=false"));
+    assert!(out.contains("-c model_providers.coditor-chatgpt.supports_websockets=false"));
     assert!(out.contains("-c features.enable_request_compression=false"));
     assert!(out.contains("wrapper does not inject --ephemeral"));
     assert!(out.contains("Known Codex rollout-recording warning: suppressed"));
     assert!(out.contains("OPENAI_API_KEY is not used"));
+    assert!(out.contains(
+        "Post-run check: require Coditor to observe at least one Codex Responses request"
+    ));
     assert!(!out.contains("forced_login_method"));
-    assert!(!out.contains("model_providers.coditor-openai-responses"));
-    assert!(out.contains("exec hello --json"));
+    assert!(!out.contains("openai_base_url"));
+    assert!(!out.contains("model_providers.coditor-openai"));
+    assert!(out.contains("hello --json"));
 }
 
 #[test]
@@ -203,6 +217,7 @@ fn non_codex_dry_run_has_no_proxy_overrides() {
     let out = stdout(&output);
     assert!(out.contains("Mode: plain child command (not proxied)"));
     assert!(out.contains("Environment overrides:\n  (none)"));
+    assert!(out.contains("Environment removals:\n  (none)"));
     assert!(!out.contains("ANTHROPIC_BASE_URL"));
     assert!(!out.contains("coditor-openai-responses"));
     assert!(!out.contains("features.enable_request_compression=false"));
