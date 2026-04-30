@@ -22,9 +22,9 @@ Coditor expects Codex/OpenAI model traffic to use:
 POST /v1/responses
 ```
 
-The copied Phase 0 baseline still routes Anthropic-shaped traffic. Envoy must
-not be retargeted to OpenAI until Phase 2 or later explicitly implements and
-validates the request parser, response accumulator, and routing/auth mode.
+The copied Phase 0 baseline still routes Anthropic-shaped traffic by default.
+OpenAI routing must remain opt-in until CLI/runtime wiring is deliberately
+changed and validated.
 
 ## Request Fields Coditor Needs
 
@@ -164,6 +164,34 @@ Phase 5A adds a local-only fake OpenAI Responses upstream for Envoy tests:
 
 This e2e path uses no OpenAI credentials and does not contact real OpenAI or
 real Codex services.
+
+## Phase 5B Manual OpenAI API-Key Mode
+
+Phase 5B adds an experimental/manual Envoy path for OpenAI API-key mode:
+
+- `envoy/envoy.openai.yaml` routes `POST /v1/responses` to
+  `api.openai.com:443`.
+- The OpenAI upstream uses TLS with SNI `api.openai.com` and host rewrite
+  `api.openai.com`.
+- ext_proc remains enabled with `failure_mode_allow: true`.
+- request bodies remain `BUFFERED` because the current request parser expects a
+  complete plaintext JSON body.
+- response bodies remain `STREAMED` so Responses SSE chunks reach the
+  accumulator.
+- `docker-compose.openai.yml` mounts the OpenAI Envoy config as an explicit
+  override.
+
+Example static validation:
+
+```sh
+./test/validate-openai-config.sh
+```
+
+Manual OpenAI mode is not the default stack and is not wired into the Coditor
+CLI. Running it against real OpenAI would require the caller to provide an
+`Authorization: Bearer ...` header; this phase does not require credentials and
+does not validate real OpenAI/Codex traffic. ChatGPT-auth Codex backend routing
+is still unsupported and unverified.
 
 ## Headers To Verify Later
 
