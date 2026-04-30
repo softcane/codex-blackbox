@@ -1,0 +1,10 @@
+{
+  "schema": "coditor.codex_hook.v1",
+  "event": "tool_start",
+  "session_id": "codex-hook-session-malformed-001",
+  "tool": {
+    "input": {
+      "path": "Cargo.toml"
+    }
+  }
+}

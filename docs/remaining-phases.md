@@ -56,12 +56,14 @@ Done when inline watch and tmux views make sense for Codex fake sessions.
 
 ### Phase 7: Codex Hooks Integration
 
-Add `/api/hooks/codex` and hook-helper/config output if Codex hooks are available:
+Add `/api/hooks/codex` and hook-helper/config output in a fake-first way:
 
-- parse fake Codex hook payloads
-- decide whether hooks create sessions or enrich proxy sessions
-- correlate hook ids with proxy session ids
-- emit tool events without duplicating proxy events
+- parse fake Codex hook payloads under the `coditor.codex_hook.v1` fixture
+  contract
+- treat prompt/session hooks as provisional in-memory watch sessions while the
+  proxy remains authoritative for durable turns
+- correlate hook ids with proxy session ids when `proxy_session_id` is present
+- emit tool and MCP watch events without duplicating proxy tool starts
 
 Done when fake hook payloads produce expected watch events and hook failures cannot affect model traffic.
 

@@ -1,0 +1,19 @@
+{
+  "schema": "coditor.codex_hook.v1",
+  "event": "tool_finish",
+  "session_id": "codex-hook-session-001",
+  "proxy_session_id": "codex-session-fixture-001",
+  "tool": {
+    "id": "ctc_fixture_read_file_001",
+    "name": "read_file",
+    "input": {
+      "path": "Cargo.toml"
+    },
+    "outcome": "succeeded",
+    "duration_ms": 42
+  },
+  "cwd": "/Users/pradeepsingh/code/coditor",
+  "model": "gpt-codex-fixture",
+  "permission_mode": "workspace-write",
+  "source": "fake-hook"
+}

@@ -1,0 +1,19 @@
+{
+  "schema": "coditor.codex_hook.v1",
+  "event": "mcp_tool_finish",
+  "session_id": "codex-hook-session-001",
+  "proxy_session_id": "codex-session-fixture-001",
+  "mcp": {
+    "server": "github",
+    "tool": "get_issue",
+    "input": {
+      "owner": "example",
+      "repo": "coditor",
+      "issue_number": 7
+    }
+  },
+  "outcome": "succeeded",
+  "cwd": "/Users/pradeepsingh/code/coditor",
+  "model": "gpt-codex-fixture",
+  "source": "fake-hook"
+}

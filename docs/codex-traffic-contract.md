@@ -292,6 +292,75 @@ child commands still use the temporary unported `ANTHROPIC_BASE_URL` fallback.
 Use `coditor run --dry-run -- codex ...` or `coditor config codex` to inspect
 the generated config without launching Codex.
 
+## Phase 7 Fake Codex Hook Contract
+
+Phase 7 adds a fixture-only hook endpoint:
+
+```text
+POST /api/hooks/codex
+```
+
+The endpoint accepts JSON bodies matching the checked-in
+`coditor.codex_hook.v1` fixture contract under `test/fixtures/`. It always
+returns a safe JSON response with HTTP `202 Accepted`; unknown events, missing
+fields, or invalid JSON are reported as `ignored` rather than panicking. This
+endpoint is not in the model traffic path, and hook failures must not affect
+Responses forwarding.
+
+Fixture fields Coditor currently understands:
+
+- `schema`: expected fixture marker, currently `coditor.codex_hook.v1`.
+- `event`: one of `prompt_submit`, `session_start`, `tool_start`,
+  `tool_finish`, `tool_failure`, `mcp_tool_start`, `mcp_tool_finish`, or
+  `mcp_tool_failure`. Legacy-style aliases such as `pre_tool_use` and
+  `post_tool_use` are tolerated for fixture convenience.
+- `session_id`: hook/session id emitted by the hook source.
+- `proxy_session_id`: optional Coditor proxy session id. When present, Coditor
+  records a `session_id -> proxy_session_id` correlation and emits watch events
+  under the proxy session id.
+- `request_id`: optional per-turn request id for fixture correlation. It is
+  captured only as contract context in Phase 7 and is not persisted as a hook
+  row.
+- `cwd`: optional working directory. Prompt/session hooks use its final path
+  component as the provisional watch display name.
+- `model`: optional requested model string for provisional `SessionStart`.
+- `source`: optional hook source label. Tool/MCP details may include it.
+- `permission_mode` or `permission`: optional permission/mode label. Tool/MCP
+  details may include it.
+- `prompt`: optional prompt excerpt for `SessionStart`.
+- `tool`: optional object with `id`, `name`, `input`, `outcome`, and
+  `duration_ms` for regular tool events.
+- `mcp`: optional object with `server`, `tool`, and `input` for MCP events.
+
+Watch event mapping:
+
+- `prompt_submit` and `session_start` emit a provisional `SessionStart`.
+  Provisional sessions are in-memory only; durable SQLite request/session
+  history still comes from proxy finalization.
+- `tool_start` emits `ToolUse`.
+- `tool_finish` emits `ToolResult` with a successful outcome.
+- `tool_failure` emits `ToolResult` with a failed outcome.
+- `mcp_tool_start`, `mcp_tool_finish`, and `mcp_tool_failure` emit `McpEvent`
+  with `called`, `succeeded`, or `failed` event types.
+- Codex Responses tool calls observed by the proxy also emit `ToolUse`.
+  A short-lived dedupe key suppresses duplicate hook/proxy reports for the same
+  session, tool name, and summary/outcome.
+
+Limitations:
+
+- This is not a real Codex hook schema. Real hook names, payload fields,
+  permission labels, source labels, and MCP naming must be verified in a later
+  capture.
+- Hooks are not authoritative for cost, token accounting, context fill,
+  persistence, diagnosis, or session completion.
+- Hook session correlation is best-effort. `proxy_session_id` wins when present;
+  remembered `session_id -> proxy_session_id` mappings are used for later hook
+  payloads from the same fixture session.
+- Dedupe is intentionally conservative and local to recent in-memory events.
+  It prevents obvious watch duplication but is not durable cross-process state.
+- `coditor config codex` prints the suggested hook endpoint read-only. Coditor
+  does not modify `~/.codex/config.toml`.
+
 ## Headers To Verify Later
 
 The fake contract records these headers as candidates to verify in real Codex

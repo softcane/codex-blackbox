@@ -1441,6 +1441,13 @@ Manual stack for API-key experiments:
 Coditor passes these command-line overrides; ~/.codex/config.toml is not modified:
 {overrides}
 
+Suggested fake hook endpoint for Phase 7 fixture experiments:
+  http://localhost:9091/api/hooks/codex
+
+Hook config is not applied automatically. The endpoint currently accepts the
+checked-in coditor.codex_hook.v1 fixture contract only; real Codex hook support
+is not validated.
+
 # API-key mode requires OPENAI_API_KEY in the environment.
 # ChatGPT-auth Codex backend routing is not supported or verified.
 "#
@@ -3231,6 +3238,8 @@ mod tests {
         assert!(preview
             .contains(r#"-c 'model_providers.coditor-openai-responses.wire_api="responses"'"#));
         assert!(preview.contains("-c features.enable_request_compression=false"));
+        assert!(preview.contains("http://localhost:9091/api/hooks/codex"));
+        assert!(preview.contains("coditor.codex_hook.v1"));
         assert!(preview.contains("OPENAI_API_KEY"));
         assert!(preview.contains("ChatGPT-auth Codex backend routing is not supported or verified"));
     }

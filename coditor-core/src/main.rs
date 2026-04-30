@@ -3089,6 +3089,15 @@ fn build_codex_finalization_outcome(
             }
         }
 
+        for tool in &accounting.tool_calls {
+            watch_events.push(watch::WatchEvent::ToolUse {
+                session_id: accounting.identity.session_id.clone(),
+                timestamp: now_iso8601(),
+                tool_name: codex_tool_name(tool),
+                summary: summarize_codex_tool_input(tool),
+            });
+        }
+
         watch_events.push(watch::WatchEvent::CodexTurnSummary {
             session_id: accounting.identity.session_id.clone(),
             status: codex_status_label(&accounting.status).to_string(),
@@ -3160,6 +3169,13 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
     for event in &outcome.watch_events {
         match event {
             watch::WatchEvent::SessionStart { .. } if !newly_started => {}
+            watch::WatchEvent::ToolUse { tool_name, .. } => {
+                if codex_watch_event_is_duplicate_or_remember(event) {
+                    continue;
+                }
+                metrics::record_tool_call(tool_name);
+                watch::BROADCASTER.broadcast(event.clone());
+            }
             watch::WatchEvent::ModelFallback {
                 requested, actual, ..
             } => {
@@ -3273,6 +3289,18 @@ fn codex_tool_name(tool: &codex_response::CodexToolCallSummary) -> String {
     tool.name
         .clone()
         .unwrap_or_else(|| format!("custom_tool_call:{}", tool.id))
+}
+
+fn summarize_codex_tool_input(tool: &codex_response::CodexToolCallSummary) -> String {
+    let input = tool.input.trim();
+    if input.is_empty() {
+        return tool.id.clone();
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(input) {
+        return summarize_hook_tool_input(Some(&value))
+            .unwrap_or_else(|| truncate_detail(input, 100));
+    }
+    truncate_detail(input, 100)
 }
 
 fn codex_tool_names_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
@@ -4055,6 +4083,11 @@ impl AutoWeeklyBudgetCache {
 
 static AUTO_WEEKLY_BUDGET_CACHE: LazyLock<Mutex<AutoWeeklyBudgetCache>> =
     LazyLock::new(|| Mutex::new(AutoWeeklyBudgetCache::new()));
+static CODEX_HOOK_SESSION_CORRELATIONS: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static CODEX_TOOL_EVENT_DEDUP: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const CODEX_TOOL_EVENT_DEDUP_TTL: Duration = Duration::from_secs(300);
 
 fn percentile_nearest_rank(mut values: Vec<u64>, percentile: f64) -> Option<u64> {
     if values.is_empty() {
@@ -4551,6 +4584,33 @@ struct McpTelemetryEvent {
     detail: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct CodexHookToolTelemetry {
+    id: Option<String>,
+    name: String,
+    input_summary: Option<String>,
+    duration_ms: u64,
+    outcome: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexHookBuildResult {
+    status: &'static str,
+    reason: Option<String>,
+    hook_session_id: Option<String>,
+    proxy_session_id: Option<String>,
+    resolved_session_id: Option<String>,
+    watch_events: Vec<watch::WatchEvent>,
+}
+
+#[derive(Clone, Debug)]
+struct CodexHookProcessResult {
+    status: &'static str,
+    reason: Option<String>,
+    events_emitted: usize,
+    duplicates_suppressed: usize,
+}
+
 #[derive(Default)]
 struct SkillTurnState {
     expected: HashSet<String>,
@@ -4664,6 +4724,696 @@ fn summarize_hook_tool_input(value: Option<&Value>) -> Option<String> {
     serde_json::to_string(value)
         .ok()
         .map(|json| truncate_detail(&json, 100))
+}
+
+fn non_empty_hook_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn codex_hook_value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn codex_hook_string_field(value: &Value, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        value
+            .get(*name)
+            .and_then(Value::as_str)
+            .and_then(non_empty_hook_string)
+    })
+}
+
+fn codex_hook_nested_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        codex_hook_value_at_path(value, path)
+            .and_then(Value::as_str)
+            .and_then(non_empty_hook_string)
+    })
+}
+
+fn codex_hook_first_string(
+    value: &Value,
+    names: &[&str],
+    nested_paths: &[&[&str]],
+) -> Option<String> {
+    codex_hook_string_field(value, names).or_else(|| codex_hook_nested_string(value, nested_paths))
+}
+
+fn normalize_codex_hook_event(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '.' | '-' | ' ') {
+                '_'
+            } else {
+                ch.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+fn codex_hook_event_name(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["event", "event_type", "hook_event_name"],
+        &[&["hook", "event"], &["codex", "event"]],
+    )
+    .map(|event| normalize_codex_hook_event(&event))
+}
+
+fn codex_hook_session_id(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &[
+            "session_id",
+            "codex_session_id",
+            "hook_session_id",
+            "conversation_id",
+        ],
+        &[
+            &["session", "id"],
+            &["codex", "session_id"],
+            &["metadata", "session_id"],
+            &["client_metadata", "session_id"],
+        ],
+    )
+}
+
+fn codex_hook_proxy_session_id(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &[
+            "proxy_session_id",
+            "coditor_session_id",
+            "coditor_proxy_session_id",
+        ],
+        &[
+            &["coditor", "session_id"],
+            &["metadata", "proxy_session_id"],
+            &["metadata", "coditor_session_id"],
+            &["client_metadata", "proxy_session_id"],
+        ],
+    )
+}
+
+fn resolve_codex_hook_session_ids(
+    payload: &Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let hook_session_id = codex_hook_session_id(payload);
+    let proxy_session_id = codex_hook_proxy_session_id(payload);
+
+    if let (Some(hook), Some(proxy)) = (hook_session_id.as_ref(), proxy_session_id.as_ref()) {
+        CODEX_HOOK_SESSION_CORRELATIONS
+            .lock()
+            .unwrap()
+            .insert(hook.clone(), proxy.clone());
+    }
+
+    let remembered = hook_session_id.as_ref().and_then(|hook| {
+        CODEX_HOOK_SESSION_CORRELATIONS
+            .lock()
+            .unwrap()
+            .get(hook)
+            .cloned()
+    });
+    let resolved = proxy_session_id
+        .clone()
+        .or(remembered)
+        .or_else(|| hook_session_id.clone());
+
+    (hook_session_id, proxy_session_id, resolved)
+}
+
+fn codex_hook_model(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["model", "requested_model"],
+        &[
+            &["codex", "model"],
+            &["session", "model"],
+            &["metadata", "model"],
+        ],
+    )
+}
+
+fn codex_hook_cwd(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["cwd", "working_directory"],
+        &[
+            &["session", "cwd"],
+            &["codex", "cwd"],
+            &["metadata", "cwd"],
+            &["client_metadata", "cwd"],
+        ],
+    )
+}
+
+fn codex_hook_source(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["source", "permission_source"],
+        &[&["tool", "source"], &["metadata", "source"]],
+    )
+}
+
+fn codex_hook_permission_mode(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["permission_mode", "permission"],
+        &[
+            &["tool", "permission_mode"],
+            &["tool", "permission"],
+            &["metadata", "permission_mode"],
+        ],
+    )
+}
+
+fn codex_hook_prompt_excerpt(payload: &Value) -> Option<String> {
+    let raw = codex_hook_first_string(
+        payload,
+        &["prompt", "input", "message"],
+        &[
+            &["prompt", "text"],
+            &["session", "prompt"],
+            &["metadata", "prompt"],
+        ],
+    )?;
+    Some(truncate_detail(&raw, 160))
+}
+
+fn codex_hook_display_name(payload: &Value, model: &str) -> String {
+    codex_hook_cwd(payload)
+        .as_deref()
+        .and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty()))
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| model.to_string())
+}
+
+fn codex_hook_tool_input_value(payload: &Value) -> Option<&Value> {
+    payload
+        .get("tool_input")
+        .or_else(|| payload.get("input"))
+        .or_else(|| codex_hook_value_at_path(payload, &["tool", "input"]))
+        .or_else(|| codex_hook_value_at_path(payload, &["tool_call", "input"]))
+        .or_else(|| codex_hook_value_at_path(payload, &["mcp", "input"]))
+}
+
+fn codex_hook_tool_name(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["tool_name", "name"],
+        &[
+            &["tool", "name"],
+            &["tool", "tool_name"],
+            &["tool_call", "name"],
+            &["mcp", "tool"],
+        ],
+    )
+}
+
+fn codex_hook_tool_id(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["tool_call_id", "call_id", "tool_id"],
+        &[&["tool", "id"], &["tool_call", "id"], &["mcp", "id"]],
+    )
+}
+
+fn codex_hook_duration_ms(payload: &Value) -> u64 {
+    let direct = payload.get("duration_ms");
+    let nested = codex_hook_value_at_path(payload, &["tool", "duration_ms"])
+        .or_else(|| codex_hook_value_at_path(payload, &["tool_call", "duration_ms"]));
+    direct
+        .or(nested)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().map(|duration| duration.max(0.0) as u64))
+        })
+        .unwrap_or(0)
+}
+
+fn codex_hook_outcome(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["outcome", "status", "result"],
+        &[
+            &["tool", "outcome"],
+            &["tool", "status"],
+            &["tool_call", "outcome"],
+            &["error", "message"],
+        ],
+    )
+}
+
+fn codex_hook_tool_telemetry(payload: &Value) -> Option<CodexHookToolTelemetry> {
+    let name = codex_hook_tool_name(payload)?;
+    Some(CodexHookToolTelemetry {
+        id: codex_hook_tool_id(payload),
+        name,
+        input_summary: summarize_hook_tool_input(codex_hook_tool_input_value(payload)),
+        duration_ms: codex_hook_duration_ms(payload),
+        outcome: codex_hook_outcome(payload),
+    })
+}
+
+fn codex_hook_detail(payload: &Value, base: Option<String>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(base) = base.filter(|value| !value.trim().is_empty()) {
+        parts.push(base);
+    }
+    if let Some(source) = codex_hook_source(payload) {
+        parts.push(format!("source={source}"));
+    }
+    if let Some(permission_mode) = codex_hook_permission_mode(payload) {
+        parts.push(format!("permission={permission_mode}"));
+    }
+    if let Some(cwd) = codex_hook_cwd(payload) {
+        parts.push(format!("cwd={cwd}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" | "))
+    }
+}
+
+fn codex_hook_mcp_parts(
+    payload: &Value,
+    fallback_tool_name: Option<&str>,
+) -> Option<(String, String)> {
+    let explicit_server = codex_hook_first_string(
+        payload,
+        &["mcp_server"],
+        &[&["mcp", "server"], &["tool", "mcp_server"]],
+    );
+    let explicit_tool = codex_hook_first_string(
+        payload,
+        &["mcp_tool"],
+        &[&["mcp", "tool"], &["tool", "mcp_tool"]],
+    );
+    if let (Some(server), Some(tool)) = (explicit_server, explicit_tool) {
+        return Some((server, tool));
+    }
+
+    fallback_tool_name.and_then(metrics::mcp_tool_labels)
+}
+
+fn build_codex_hook_watch_events(payload: &Value, timestamp: String) -> CodexHookBuildResult {
+    let (hook_session_id, proxy_session_id, resolved_session_id) =
+        resolve_codex_hook_session_ids(payload);
+    let Some(event_name) = codex_hook_event_name(payload) else {
+        return CodexHookBuildResult {
+            status: "ignored",
+            reason: Some("missing_event".to_string()),
+            hook_session_id,
+            proxy_session_id,
+            resolved_session_id,
+            watch_events: Vec::new(),
+        };
+    };
+
+    let Some(session_id) = resolved_session_id.clone() else {
+        return CodexHookBuildResult {
+            status: "ignored",
+            reason: Some("missing_session_id".to_string()),
+            hook_session_id,
+            proxy_session_id,
+            resolved_session_id,
+            watch_events: Vec::new(),
+        };
+    };
+
+    let mut watch_events = Vec::new();
+    let mut ignored_reason = None;
+
+    match event_name.as_str() {
+        "session_start" | "prompt_submit" | "user_prompt_submit" => {
+            let model = codex_hook_model(payload).unwrap_or_else(|| "unknown".to_string());
+            watch_events.push(watch::WatchEvent::SessionStart {
+                session_id: session_id.clone(),
+                display_name: codex_hook_display_name(payload, &model),
+                model,
+                initial_prompt: codex_hook_prompt_excerpt(payload),
+            });
+        }
+        "tool_start" | "pre_tool_use" => {
+            if let Some(tool) = codex_hook_tool_telemetry(payload) {
+                let summary = codex_hook_detail(
+                    payload,
+                    tool.input_summary
+                        .or_else(|| tool.id.as_ref().map(|id| format!("id={id}"))),
+                )
+                .unwrap_or_else(|| "started".to_string());
+                watch_events.push(watch::WatchEvent::ToolUse {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    tool_name: tool.name,
+                    summary,
+                });
+            } else {
+                ignored_reason = Some("missing_tool_name".to_string());
+            }
+        }
+        "tool_finish" | "tool_end" | "post_tool_use" => {
+            if let Some(tool) = codex_hook_tool_telemetry(payload) {
+                let outcome = codex_hook_detail(
+                    payload,
+                    tool.outcome.or_else(|| Some("succeeded".to_string())),
+                )
+                .unwrap_or_else(|| "succeeded".to_string());
+                watch_events.push(watch::WatchEvent::ToolResult {
+                    session_id: session_id.clone(),
+                    tool_name: tool.name,
+                    outcome,
+                    duration_ms: tool.duration_ms,
+                });
+            } else {
+                ignored_reason = Some("missing_tool_name".to_string());
+            }
+        }
+        "tool_failure" | "tool_failed" | "post_tool_use_failure" | "permission_denied" => {
+            if let Some(tool) = codex_hook_tool_telemetry(payload) {
+                let outcome =
+                    codex_hook_detail(payload, tool.outcome.or_else(|| Some("failed".to_string())))
+                        .unwrap_or_else(|| "failed".to_string());
+                watch_events.push(watch::WatchEvent::ToolResult {
+                    session_id: session_id.clone(),
+                    tool_name: tool.name,
+                    outcome,
+                    duration_ms: tool.duration_ms,
+                });
+            } else {
+                ignored_reason = Some("missing_tool_name".to_string());
+            }
+        }
+        "mcp_tool_start" | "mcp_start" => {
+            let tool = codex_hook_tool_telemetry(payload);
+            if let Some((server, mcp_tool)) =
+                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
+            {
+                watch_events.push(watch::WatchEvent::McpEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    server,
+                    tool: mcp_tool,
+                    event_type: "called".to_string(),
+                    source: "hook".to_string(),
+                    detail: codex_hook_detail(payload, tool.and_then(|tool| tool.input_summary)),
+                });
+            } else {
+                ignored_reason = Some("missing_mcp_tool".to_string());
+            }
+        }
+        "mcp_tool_finish" | "mcp_finish" => {
+            let tool = codex_hook_tool_telemetry(payload);
+            if let Some((server, mcp_tool)) =
+                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
+            {
+                watch_events.push(watch::WatchEvent::McpEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    server,
+                    tool: mcp_tool,
+                    event_type: "succeeded".to_string(),
+                    source: "hook".to_string(),
+                    detail: codex_hook_detail(
+                        payload,
+                        tool.and_then(|tool| tool.outcome.or(tool.input_summary)),
+                    ),
+                });
+            } else {
+                ignored_reason = Some("missing_mcp_tool".to_string());
+            }
+        }
+        "mcp_tool_failure" | "mcp_failed" | "mcp_failure" => {
+            let tool = codex_hook_tool_telemetry(payload);
+            if let Some((server, mcp_tool)) =
+                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
+            {
+                watch_events.push(watch::WatchEvent::McpEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    server,
+                    tool: mcp_tool,
+                    event_type: "failed".to_string(),
+                    source: "hook".to_string(),
+                    detail: codex_hook_detail(
+                        payload,
+                        tool.and_then(|tool| tool.outcome.or(tool.input_summary)),
+                    ),
+                });
+            } else {
+                ignored_reason = Some("missing_mcp_tool".to_string());
+            }
+        }
+        _ => ignored_reason = Some("unknown_event".to_string()),
+    }
+
+    CodexHookBuildResult {
+        status: if watch_events.is_empty() {
+            "ignored"
+        } else {
+            "accepted"
+        },
+        reason: ignored_reason,
+        hook_session_id,
+        proxy_session_id,
+        resolved_session_id: Some(session_id),
+        watch_events,
+    }
+}
+
+fn upsert_codex_hook_session(
+    session_id: &str,
+    display_name: &str,
+    model: &str,
+    initial_prompt: Option<&String>,
+) -> bool {
+    if session_id.trim().is_empty() {
+        return false;
+    }
+    let session_key = codex_request::fallback_session_hash("", session_id);
+    if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&session_key) {
+        existing.last_activity = Instant::now();
+        existing.cache_warning_sent = true;
+        if existing.initial_prompt.is_none() {
+            existing.initial_prompt = initial_prompt.cloned();
+        }
+        if existing.model == "unknown" && model != "unknown" {
+            existing.model = model.to_string();
+        }
+        return false;
+    }
+
+    diagnosis::SESSIONS.insert(
+        session_key,
+        diagnosis::SessionState {
+            session_id: session_id.to_string(),
+            display_name: display_name.to_string(),
+            model: model.to_string(),
+            initial_prompt: initial_prompt.cloned(),
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
+            session_inserted: false,
+            cache_warning_sent: true,
+        },
+    );
+    true
+}
+
+fn codex_watch_event_dedupe_key(event: &watch::WatchEvent) -> Option<String> {
+    match event {
+        watch::WatchEvent::ToolUse {
+            session_id,
+            tool_name,
+            summary,
+            ..
+        } => Some(format!(
+            "{}|tool_use|{}|{}",
+            session_id,
+            tool_name.trim(),
+            summary.trim()
+        )),
+        watch::WatchEvent::ToolResult {
+            session_id,
+            tool_name,
+            outcome,
+            ..
+        } => Some(format!(
+            "{}|tool_result|{}|{}",
+            session_id,
+            tool_name.trim(),
+            outcome.trim()
+        )),
+        watch::WatchEvent::McpEvent {
+            session_id,
+            server,
+            tool,
+            event_type,
+            detail,
+            ..
+        } => Some(format!(
+            "{}|mcp|{}|{}|{}|{}",
+            session_id,
+            server.trim(),
+            tool.trim(),
+            event_type.trim(),
+            detail.as_deref().unwrap_or("").trim()
+        )),
+        _ => None,
+    }
+}
+
+fn codex_watch_event_is_duplicate_or_remember(event: &watch::WatchEvent) -> bool {
+    let Some(key) = codex_watch_event_dedupe_key(event) else {
+        return false;
+    };
+    let now = Instant::now();
+    let mut seen = CODEX_TOOL_EVENT_DEDUP.lock().unwrap();
+    seen.retain(|_, first_seen| now.duration_since(*first_seen) < CODEX_TOOL_EVENT_DEDUP_TTL);
+    if seen.contains_key(&key) {
+        return true;
+    }
+    seen.insert(key, now);
+    false
+}
+
+fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookProcessResult {
+    let built = build_codex_hook_watch_events(payload, timestamp);
+    let mut result = CodexHookProcessResult {
+        status: built.status,
+        reason: built.reason.clone(),
+        events_emitted: 0,
+        duplicates_suppressed: 0,
+    };
+
+    debug!(
+        hook_session_id = built.hook_session_id.as_deref().unwrap_or(""),
+        proxy_session_id = built.proxy_session_id.as_deref().unwrap_or(""),
+        resolved_session_id = built.resolved_session_id.as_deref().unwrap_or(""),
+        status = built.status,
+        reason = built.reason.as_deref().unwrap_or(""),
+        events = built.watch_events.len(),
+        "processed Codex hook payload"
+    );
+
+    for event in built.watch_events {
+        match event {
+            watch::WatchEvent::SessionStart {
+                session_id,
+                display_name,
+                model,
+                initial_prompt,
+            } => {
+                if !upsert_codex_hook_session(
+                    &session_id,
+                    &display_name,
+                    &model,
+                    initial_prompt.as_ref(),
+                ) {
+                    result.duplicates_suppressed += 1;
+                    continue;
+                }
+                watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
+                    session_id,
+                    display_name,
+                    model,
+                    initial_prompt,
+                });
+                metrics::set_active_sessions(active_session_count());
+                result.events_emitted += 1;
+            }
+            event @ watch::WatchEvent::ToolUse { .. } => {
+                let tool_name = match &event {
+                    watch::WatchEvent::ToolUse { tool_name, .. } => tool_name.clone(),
+                    _ => unreachable!(),
+                };
+                if codex_watch_event_is_duplicate_or_remember(&event) {
+                    result.duplicates_suppressed += 1;
+                    continue;
+                }
+                metrics::record_tool_call(&tool_name);
+                watch::BROADCASTER.broadcast(event);
+                result.events_emitted += 1;
+            }
+            event @ watch::WatchEvent::ToolResult { .. } => {
+                let (tool_name, outcome) = match &event {
+                    watch::WatchEvent::ToolResult {
+                        tool_name, outcome, ..
+                    } => (tool_name.clone(), outcome.clone()),
+                    _ => unreachable!(),
+                };
+                if codex_watch_event_is_duplicate_or_remember(&event) {
+                    result.duplicates_suppressed += 1;
+                    continue;
+                }
+                let outcome_lower = outcome.to_ascii_lowercase();
+                if outcome_lower.contains("fail") || outcome_lower.contains("denied") {
+                    metrics::record_tool_failures(&tool_name, 1);
+                }
+                watch::BROADCASTER.broadcast(event);
+                result.events_emitted += 1;
+            }
+            watch::WatchEvent::McpEvent {
+                session_id,
+                timestamp,
+                server,
+                tool,
+                event_type,
+                source,
+                detail,
+            } => {
+                let event = watch::WatchEvent::McpEvent {
+                    session_id,
+                    timestamp,
+                    server,
+                    tool,
+                    event_type,
+                    source,
+                    detail,
+                };
+                if codex_watch_event_is_duplicate_or_remember(&event) {
+                    result.duplicates_suppressed += 1;
+                    continue;
+                }
+                if let watch::WatchEvent::McpEvent {
+                    session_id,
+                    timestamp,
+                    server,
+                    tool,
+                    event_type,
+                    source,
+                    detail,
+                } = event
+                {
+                    emit_mcp_event(McpTelemetryEvent {
+                        session_id,
+                        timestamp,
+                        server,
+                        tool,
+                        event_type,
+                        source,
+                        detail,
+                    });
+                }
+                result.events_emitted += 1;
+            }
+            other => {
+                watch::BROADCASTER.broadcast(other);
+                result.events_emitted += 1;
+            }
+        }
+    }
+
+    result
 }
 
 fn remember_skill_turn_event(event: &SkillTelemetryEvent) {
@@ -5578,6 +6328,29 @@ async fn handle_metrics() -> impl IntoResponse {
 async fn handle_claude_code_hook(Json(payload): Json<Value>) -> impl IntoResponse {
     process_claude_code_hook_payload(&payload, now_iso8601());
     StatusCode::NO_CONTENT
+}
+
+async fn handle_codex_hook(body: axum::body::Bytes) -> impl IntoResponse {
+    let result = match serde_json::from_slice::<Value>(&body) {
+        Ok(payload) => process_codex_hook_payload(&payload, now_iso8601()),
+        Err(err) => CodexHookProcessResult {
+            status: "ignored",
+            reason: Some(format!("invalid_json: {err}")),
+            events_emitted: 0,
+            duplicates_suppressed: 0,
+        },
+    };
+    let body = serde_json::json!({
+        "status": result.status,
+        "reason": result.reason,
+        "events_emitted": result.events_emitted,
+        "duplicates_suppressed": result.duplicates_suppressed,
+    });
+    (
+        StatusCode::ACCEPTED,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    )
 }
 
 async fn handle_summary() -> impl IntoResponse {
@@ -6510,6 +7283,7 @@ async fn http_server() {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/api/hooks/claude-code", post(handle_claude_code_hook))
+        .route("/api/hooks/codex", post(handle_codex_hook))
         .route("/api/summary", get(handle_summary))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -6530,7 +7304,7 @@ async fn http_server() {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.clone());
-    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/hooks/codex, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -6864,10 +7638,11 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        build_codex_finalization_outcome, build_diagnosis_response_json,
-        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
-        canonical_telemetry_name, clean_user_prompt, codex_request_headers_from_ext_proc,
-        codex_response_headers_from_ext_proc, compact_response_summary, context_fill_percent,
+        build_codex_finalization_outcome, build_codex_hook_watch_events,
+        build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
+        build_summary_response_json, canonical_telemetry_name, clean_user_prompt,
+        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
+        codex_watch_event_is_duplicate_or_remember, compact_response_summary, context_fill_percent,
         context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
         ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601,
         extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
@@ -8303,6 +9078,216 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 .contains("\"other\"")
         );
         assert_eq!(summarize_hook_tool_input(None), None);
+    }
+
+    fn codex_hook_fixture(name: &str) -> serde_json::Value {
+        let raw = match name {
+            "prompt_submit" => {
+                include_str!("../../test/fixtures/codex_hook_prompt_submit.json")
+            }
+            "tool_start" => include_str!("../../test/fixtures/codex_hook_tool_start.json"),
+            "tool_finish" => include_str!("../../test/fixtures/codex_hook_tool_finish.json"),
+            "tool_failure" => include_str!("../../test/fixtures/codex_hook_tool_failure.json"),
+            "mcp_tool_finish" => {
+                include_str!("../../test/fixtures/codex_hook_mcp_tool_finish.json")
+            }
+            "malformed_tool" => {
+                include_str!("../../test/fixtures/codex_hook_malformed_tool.json")
+            }
+            other => panic!("unknown Codex hook fixture: {other}"),
+        };
+        serde_json::from_str(raw).expect("parse Codex hook fixture")
+    }
+
+    #[test]
+    fn codex_hook_prompt_submit_fixture_produces_session_start_and_correlation() {
+        let payload = codex_hook_fixture("prompt_submit");
+        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:00Z".to_string());
+
+        assert_eq!(built.status, "accepted");
+        assert_eq!(
+            built.hook_session_id.as_deref(),
+            Some("codex-hook-session-001")
+        );
+        assert_eq!(
+            built.proxy_session_id.as_deref(),
+            Some("codex-session-fixture-001")
+        );
+        assert_eq!(
+            built.resolved_session_id.as_deref(),
+            Some("codex-session-fixture-001")
+        );
+        assert!(built.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::SessionStart {
+                    session_id,
+                    display_name,
+                    model,
+                    initial_prompt: Some(prompt),
+                } if session_id == "codex-session-fixture-001"
+                    && display_name == "coditor"
+                    && model == "gpt-codex-fixture"
+                    && prompt.contains("Inspect the Coditor workspace")
+            )
+        }));
+
+        let mut followup = codex_hook_fixture("tool_start");
+        followup
+            .as_object_mut()
+            .expect("object fixture")
+            .remove("proxy_session_id");
+        let followup = build_codex_hook_watch_events(&followup, "2026-04-30T12:00:01Z".to_string());
+        assert_eq!(
+            followup.resolved_session_id.as_deref(),
+            Some("codex-session-fixture-001")
+        );
+    }
+
+    #[test]
+    fn codex_hook_tool_start_and_finish_fixtures_produce_tool_events() {
+        let start = codex_hook_fixture("tool_start");
+        let start = build_codex_hook_watch_events(&start, "2026-04-30T12:00:02Z".to_string());
+        assert_eq!(start.status, "accepted");
+        assert!(start.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::ToolUse {
+                    session_id,
+                    tool_name,
+                    summary,
+                    ..
+                } if session_id == "codex-session-fixture-001"
+                    && tool_name == "read_file"
+                    && summary.contains("Cargo.toml")
+                    && summary.contains("permission=workspace-write")
+            )
+        }));
+
+        let finish = codex_hook_fixture("tool_finish");
+        let finish = build_codex_hook_watch_events(&finish, "2026-04-30T12:00:03Z".to_string());
+        assert_eq!(finish.status, "accepted");
+        assert!(finish.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::ToolResult {
+                    session_id,
+                    tool_name,
+                    outcome,
+                    duration_ms,
+                } if session_id == "codex-session-fixture-001"
+                    && tool_name == "read_file"
+                    && outcome.contains("succeeded")
+                    && duration_ms == &42
+            )
+        }));
+    }
+
+    #[test]
+    fn codex_hook_tool_failure_fixture_produces_failed_tool_result() {
+        let payload = codex_hook_fixture("tool_failure");
+        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:04Z".to_string());
+        assert_eq!(built.status, "accepted");
+        assert!(built.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::ToolResult {
+                    tool_name,
+                    outcome,
+                    duration_ms,
+                    ..
+                } if tool_name == "shell"
+                    && outcome.contains("failed")
+                    && outcome.contains("missing-target")
+                    && duration_ms == &81
+            )
+        }));
+    }
+
+    #[test]
+    fn codex_hook_mcp_fixture_produces_mcp_event() {
+        let payload = codex_hook_fixture("mcp_tool_finish");
+        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:05Z".to_string());
+        assert_eq!(built.status, "accepted");
+        assert!(built.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::McpEvent {
+                    session_id,
+                    server,
+                    tool,
+                    event_type,
+                    source,
+                    ..
+                } if session_id == "codex-session-fixture-001"
+                    && server == "github"
+                    && tool == "get_issue"
+                    && event_type == "succeeded"
+                    && source == "hook"
+            )
+        }));
+    }
+
+    #[test]
+    fn codex_hook_unknown_and_malformed_payloads_are_ignored_safely() {
+        let unknown = serde_json::json!({
+            "event": "future_hook_event",
+            "session_id": "codex-hook-session-unknown",
+        });
+        let unknown = build_codex_hook_watch_events(&unknown, "2026-04-30T12:00:06Z".to_string());
+        assert_eq!(unknown.status, "ignored");
+        assert_eq!(unknown.reason.as_deref(), Some("unknown_event"));
+        assert!(unknown.watch_events.is_empty());
+
+        let malformed = codex_hook_fixture("malformed_tool");
+        let malformed =
+            build_codex_hook_watch_events(&malformed, "2026-04-30T12:00:07Z".to_string());
+        assert_eq!(malformed.status, "ignored");
+        assert_eq!(malformed.reason.as_deref(), Some("missing_tool_name"));
+        assert!(malformed.watch_events.is_empty());
+    }
+
+    #[test]
+    fn codex_hook_duplicate_tool_events_are_suppressed_by_key() {
+        let event = super::watch::WatchEvent::ToolUse {
+            session_id: "codex-dedupe-session-001".to_string(),
+            timestamp: "2026-04-30T12:00:08Z".to_string(),
+            tool_name: "read_file".to_string(),
+            summary: "Cargo.toml".to_string(),
+        };
+
+        assert!(!codex_watch_event_is_duplicate_or_remember(&event));
+        assert!(codex_watch_event_is_duplicate_or_remember(&event));
+    }
+
+    #[test]
+    fn codex_finalization_emits_tool_use_for_responses_tool_calls() {
+        let request = parse_codex_fixture_request("phase-7-tool-session-001");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_tool_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "phase-7-tool-request-001",
+            &request,
+            &response,
+            Duration::from_millis(20),
+            128_000,
+        );
+
+        assert!(outcome.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::ToolUse {
+                    session_id,
+                    tool_name,
+                    summary,
+                    ..
+                } if session_id == "phase-7-tool-session-001"
+                    && tool_name == "read_file"
+                    && summary == "Cargo.toml"
+            )
+        }));
     }
 
     #[test]
