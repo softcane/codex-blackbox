@@ -594,7 +594,12 @@ fn bundled_compose_yaml(stack_dir: &Path) -> String {
       coditor-core:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/10000'"]
+      test:
+        - CMD-SHELL
+        - >
+          bash -c 'exec 3<>/dev/tcp/localhost/9901;
+          printf "GET /ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          head -n 1 <&3 | grep -q " 200 "'
       interval: 5s
       timeout: 3s
       retries: 5
@@ -1463,6 +1468,8 @@ fn run_codex_command_with_filtered_stderr(
 
 fn should_suppress_codex_stderr_line(line: &str) -> bool {
     line.contains("failed to record rollout items")
+        || line == "Reading additional input from stdin..."
+        || line.contains("write_stdin failed: stdin is closed for this session")
 }
 
 async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>) -> i32 {
@@ -3444,8 +3451,17 @@ mod tests {
         assert!(should_suppress_codex_stderr_line(
             "2026-04-30T16:36:44Z ERROR codex_core::session: failed to record rollout items: thread missing"
         ));
+        assert!(should_suppress_codex_stderr_line(
+            "Reading additional input from stdin..."
+        ));
+        assert!(should_suppress_codex_stderr_line(
+            "write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"
+        ));
         assert!(!should_suppress_codex_stderr_line(
             "2026-04-30T16:36:44Z ERROR codex_core::session: failed to connect to websocket"
+        ));
+        assert!(!should_suppress_codex_stderr_line(
+            "ERROR codex_core::session: failed to read stdin: permission denied"
         ));
     }
 
@@ -3666,6 +3682,8 @@ mod tests {
     fn bundled_compose_uses_release_image_and_quoted_volume_mounts() {
         let yaml = super::bundled_compose_yaml(Path::new("/tmp/coditor test"));
         assert!(yaml.contains(super::DEFAULT_CORE_IMAGE));
+        assert!(yaml.contains("GET /ready HTTP/1.1"));
+        assert!(yaml.contains("/dev/tcp/localhost/9901"));
         assert!(yaml.contains("\"/tmp/coditor test/envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro\""));
         assert!(yaml
             .contains("\"/tmp/coditor test/grafana/dashboards:/var/lib/grafana/dashboards:ro\""));
