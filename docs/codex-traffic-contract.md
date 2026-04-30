@@ -148,6 +148,80 @@ context status, and model fallback labels where applicable. Unknown/untrusted
 Codex pricing contributes no estimated cost and is not used for session budget
 enforcement.
 
+## Phase 4C SQLite Persistence
+
+Phase 4C persists fixture Codex turns to SQLite without reusing Anthropic cache
+TTL/rebuild semantics. Codex rows use the existing `sessions`, `requests`, and
+`turn_snapshots` tables so history remains repairable, but Codex-specific values
+are stored in explicit `codex_*` fields.
+
+Existing generic fields used for Codex:
+
+- `sessions.session_id`: Codex session identity resolved from request metadata
+  or fallback hash.
+- `sessions.model`: requested Codex model for the session.
+- `sessions.initial_prompt`: first user-visible prompt excerpt when available.
+- `sessions.total_input_tokens` and `sessions.total_output_tokens`: generic
+  totals for all persisted providers.
+- `requests.request_id`, `requests.session_id`, and `requests.timestamp`: the
+  immutable per-turn request row identity.
+- `requests.input_tokens` and `requests.output_tokens`: Codex input/output
+  totals, matching provider top-level usage.
+- `turn_snapshots.input_tokens` and `turn_snapshots.output_tokens`: Codex
+  input/output totals for the persisted turn.
+- `turn_snapshots.requested_model` and `turn_snapshots.actual_model`: requested
+  model and served model when known.
+
+Codex-native fields added in Phase 4C:
+
+- `sessions.total_codex_input_tokens`
+- `sessions.total_codex_cached_input_tokens`
+- `sessions.total_codex_uncached_input_tokens`
+- `sessions.total_codex_output_tokens`
+- `sessions.total_codex_reasoning_output_tokens`
+- `sessions.total_codex_tokens`
+- `requests.provider`
+- `requests.requested_model`
+- `requests.served_model`
+- `requests.codex_status`
+- `requests.codex_input_tokens`
+- `requests.codex_cached_input_tokens`
+- `requests.codex_uncached_input_tokens`
+- `requests.codex_output_tokens`
+- `requests.codex_reasoning_output_tokens`
+- `requests.codex_total_tokens`
+- `requests.codex_response_id`
+- `requests.codex_prompt_excerpt`
+- `requests.codex_tool_calls`
+- `requests.codex_accounting_anomalies`
+- `turn_snapshots.request_id`
+- `turn_snapshots.provider`
+- `turn_snapshots.codex_status`
+- `turn_snapshots.codex_input_tokens`
+- `turn_snapshots.codex_cached_input_tokens`
+- `turn_snapshots.codex_uncached_input_tokens`
+- `turn_snapshots.codex_output_tokens`
+- `turn_snapshots.codex_reasoning_output_tokens`
+- `turn_snapshots.codex_total_tokens`
+- `turn_snapshots.codex_response_id`
+- `turn_snapshots.codex_prompt_excerpt`
+- `turn_snapshots.codex_tool_calls`
+- `turn_snapshots.codex_accounting_anomalies`
+
+For Codex rows, copied Anthropic cache columns remain non-authoritative:
+
+- `requests.cache_read_tokens` is written as `0` for Codex.
+- `requests.cache_creation_tokens` is written as `0` for Codex.
+- `turn_snapshots.cache_read_tokens` is written as `0` for Codex.
+- `turn_snapshots.cache_creation_tokens` is written as `0` for Codex.
+- `requests.cache_event` is left `NULL` for Codex; Codex cached input does not
+  emit or imply an Anthropic TTL/rebuild cache event.
+
+Unknown OpenAI/Codex pricing is persisted as explicit unpriced zero cost with a
+`codex_unpriced:unknown_model:<model>` cost source and
+`trusted_for_budget_enforcement = 0`. This prevents historical summary paths
+from falling back to copied Anthropic pricing for Codex models.
+
 ## Phase 5A Fake Envoy E2E
 
 Phase 5A adds a local-only fake OpenAI Responses upstream for Envoy tests:

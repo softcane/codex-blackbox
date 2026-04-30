@@ -333,6 +333,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     total_output_tokens INTEGER DEFAULT 0,
     total_cache_read_tokens INTEGER DEFAULT 0,
     total_cache_creation_tokens INTEGER DEFAULT 0,
+    total_codex_input_tokens INTEGER DEFAULT 0,
+    total_codex_cached_input_tokens INTEGER DEFAULT 0,
+    total_codex_uncached_input_tokens INTEGER DEFAULT 0,
+    total_codex_output_tokens INTEGER DEFAULT 0,
+    total_codex_reasoning_output_tokens INTEGER DEFAULT 0,
+    total_codex_tokens INTEGER DEFAULT 0,
     total_cost_dollars REAL DEFAULT 0.0,
     cache_waste_dollars REAL DEFAULT 0.0,
     request_count INTEGER DEFAULT 0,
@@ -355,6 +361,20 @@ CREATE TABLE IF NOT EXISTS requests (
     duration_ms INTEGER,
     tool_calls TEXT,
     cache_event TEXT,
+    provider TEXT,
+    requested_model TEXT,
+    served_model TEXT,
+    codex_status TEXT,
+    codex_input_tokens INTEGER DEFAULT 0,
+    codex_cached_input_tokens INTEGER DEFAULT 0,
+    codex_uncached_input_tokens INTEGER DEFAULT 0,
+    codex_output_tokens INTEGER DEFAULT 0,
+    codex_reasoning_output_tokens INTEGER DEFAULT 0,
+    codex_total_tokens INTEGER DEFAULT 0,
+    codex_response_id TEXT,
+    codex_prompt_excerpt TEXT,
+    codex_tool_calls TEXT,
+    codex_accounting_anomalies TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -389,6 +409,19 @@ CREATE TABLE IF NOT EXISTS turn_snapshots (
     requested_model       TEXT,
     actual_model          TEXT,
     response_summary      TEXT,
+    request_id            TEXT,
+    provider              TEXT,
+    codex_status          TEXT,
+    codex_input_tokens    INTEGER DEFAULT 0,
+    codex_cached_input_tokens INTEGER DEFAULT 0,
+    codex_uncached_input_tokens INTEGER DEFAULT 0,
+    codex_output_tokens   INTEGER DEFAULT 0,
+    codex_reasoning_output_tokens INTEGER DEFAULT 0,
+    codex_total_tokens    INTEGER DEFAULT 0,
+    codex_response_id     TEXT,
+    codex_prompt_excerpt  TEXT,
+    codex_tool_calls      TEXT,
+    codex_accounting_anomalies TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -489,6 +522,32 @@ enum DbCommand {
         tool_calls_list: Vec<(String, String)>,
         cache_event: String,
     },
+    RecordCodexTurn {
+        request_id: String,
+        session_id: String,
+        timestamp: String,
+        requested_model: String,
+        served_model: Option<String>,
+        status: String,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        uncached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_output_tokens: u64,
+        total_tokens: u64,
+        duration_ms: u64,
+        context_utilization: f64,
+        context_window_tokens: u64,
+        initial_prompt: Option<String>,
+        response_id: Option<String>,
+        tool_names_json: String,
+        tool_calls_json: String,
+        tool_calls_list: Vec<(String, String)>,
+        accounting_anomalies_json: String,
+        cost_dollars: f64,
+        cost_source: String,
+        trusted_for_budget_enforcement: bool,
+    },
     WriteTurnSnapshot {
         session_id: String,
         turn_number: u32,
@@ -575,12 +634,31 @@ static DB_TX: LazyLock<std_mpsc::Sender<DbCommand>> = LazyLock::new(|| {
     tx
 });
 
-fn ensure_turn_snapshot_model_columns(conn: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(turn_snapshots)")?;
-    let columns: HashSet<String> = stmt
+fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt
         .query_map([], |row| row.get::<_, String>(1))?
         .filter_map(|row| row.ok())
         .collect();
+    Ok(columns)
+}
+
+fn ensure_columns(
+    conn: &Connection,
+    table: &str,
+    columns: &[(&str, &str)],
+) -> rusqlite::Result<()> {
+    let existing = table_columns(conn, table)?;
+    for (name, definition) in columns {
+        if !existing.contains(*name) {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {definition}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_turn_snapshot_model_columns(conn: &Connection) -> rusqlite::Result<()> {
+    let columns = table_columns(conn, "turn_snapshots")?;
 
     if !columns.contains("requested_model") {
         conn.execute(
@@ -611,11 +689,7 @@ fn ensure_turn_snapshot_model_columns(conn: &Connection) -> rusqlite::Result<()>
 }
 
 fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
-    let columns: HashSet<String> = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|row| row.ok())
-        .collect();
+    let columns = table_columns(conn, "sessions")?;
 
     if !columns.contains("initial_prompt") {
         conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT", [])?;
@@ -628,11 +702,7 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(requests)")?;
-    let columns: HashSet<String> = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .filter_map(|row| row.ok())
-        .collect();
+    let columns = table_columns(conn, "requests")?;
 
     if !columns.contains("cost_source") {
         conn.execute("ALTER TABLE requests ADD COLUMN cost_source TEXT", [])?;
@@ -645,6 +715,105 @@ fn ensure_request_cost_columns(conn: &Connection) -> rusqlite::Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_codex_persistence_columns(conn: &Connection) -> rusqlite::Result<()> {
+    ensure_columns(
+        conn,
+        "sessions",
+        &[
+            (
+                "total_codex_input_tokens",
+                "total_codex_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "total_codex_cached_input_tokens",
+                "total_codex_cached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "total_codex_uncached_input_tokens",
+                "total_codex_uncached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "total_codex_output_tokens",
+                "total_codex_output_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "total_codex_reasoning_output_tokens",
+                "total_codex_reasoning_output_tokens INTEGER DEFAULT 0",
+            ),
+            ("total_codex_tokens", "total_codex_tokens INTEGER DEFAULT 0"),
+        ],
+    )?;
+    ensure_columns(
+        conn,
+        "requests",
+        &[
+            ("provider", "provider TEXT"),
+            ("requested_model", "requested_model TEXT"),
+            ("served_model", "served_model TEXT"),
+            ("codex_status", "codex_status TEXT"),
+            ("codex_input_tokens", "codex_input_tokens INTEGER DEFAULT 0"),
+            (
+                "codex_cached_input_tokens",
+                "codex_cached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_uncached_input_tokens",
+                "codex_uncached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_output_tokens",
+                "codex_output_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_reasoning_output_tokens",
+                "codex_reasoning_output_tokens INTEGER DEFAULT 0",
+            ),
+            ("codex_total_tokens", "codex_total_tokens INTEGER DEFAULT 0"),
+            ("codex_response_id", "codex_response_id TEXT"),
+            ("codex_prompt_excerpt", "codex_prompt_excerpt TEXT"),
+            ("codex_tool_calls", "codex_tool_calls TEXT"),
+            (
+                "codex_accounting_anomalies",
+                "codex_accounting_anomalies TEXT",
+            ),
+        ],
+    )?;
+    ensure_columns(
+        conn,
+        "turn_snapshots",
+        &[
+            ("request_id", "request_id TEXT"),
+            ("provider", "provider TEXT"),
+            ("codex_status", "codex_status TEXT"),
+            ("codex_input_tokens", "codex_input_tokens INTEGER DEFAULT 0"),
+            (
+                "codex_cached_input_tokens",
+                "codex_cached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_uncached_input_tokens",
+                "codex_uncached_input_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_output_tokens",
+                "codex_output_tokens INTEGER DEFAULT 0",
+            ),
+            (
+                "codex_reasoning_output_tokens",
+                "codex_reasoning_output_tokens INTEGER DEFAULT 0",
+            ),
+            ("codex_total_tokens", "codex_total_tokens INTEGER DEFAULT 0"),
+            ("codex_response_id", "codex_response_id TEXT"),
+            ("codex_prompt_excerpt", "codex_prompt_excerpt TEXT"),
+            ("codex_tool_calls", "codex_tool_calls TEXT"),
+            (
+                "codex_accounting_anomalies",
+                "codex_accounting_anomalies TEXT",
+            ),
+        ],
+    )
 }
 
 fn repair_turn_snapshot_context_windows(conn: &Connection) -> rusqlite::Result<()> {
@@ -791,6 +960,10 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
         eprintln!("Failed to migrate requests cost columns: {e}");
         return;
     }
+    if let Err(e) = ensure_codex_persistence_columns(&conn) {
+        eprintln!("Failed to migrate Codex persistence columns: {e}");
+        return;
+    }
     if let Err(e) = repair_turn_snapshot_context_windows(&conn) {
         eprintln!("Failed to repair turn_snapshots context windows: {e}");
         return;
@@ -886,6 +1059,187 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         output_tokens,
                         cache_read_tokens,
                         cache_creation_tokens,
+                        cost_dollars,
+                        timestamp,
+                    ],
+                );
+            }
+            DbCommand::RecordCodexTurn {
+                request_id,
+                session_id,
+                timestamp,
+                requested_model,
+                served_model,
+                status,
+                input_tokens,
+                cached_input_tokens,
+                uncached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens,
+                duration_ms,
+                context_utilization,
+                context_window_tokens,
+                initial_prompt,
+                response_id,
+                tool_names_json,
+                tool_calls_json,
+                tool_calls_list,
+                accounting_anomalies_json,
+                cost_dollars,
+                cost_source,
+                trusted_for_budget_enforcement,
+            } => {
+                let model_for_row = served_model
+                    .as_deref()
+                    .unwrap_or(requested_model.as_str())
+                    .to_string();
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, initial_prompt) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        &session_id,
+                        &timestamp,
+                        &requested_model,
+                        &initial_prompt
+                    ],
+                );
+
+                let inserted_rows = conn
+                    .execute(
+                        "INSERT OR IGNORE INTO requests (
+                            request_id, session_id, timestamp, model, input_tokens, output_tokens,
+                            cache_read_tokens, cache_creation_tokens, cost_dollars, cost_source,
+                            trusted_for_budget_enforcement, duration_ms, tool_calls, cache_event,
+                            provider, requested_model, served_model, codex_status,
+                            codex_input_tokens, codex_cached_input_tokens,
+                            codex_uncached_input_tokens, codex_output_tokens,
+                            codex_reasoning_output_tokens, codex_total_tokens, codex_response_id,
+                            codex_prompt_excerpt, codex_tool_calls,
+                            codex_accounting_anomalies
+                         ) VALUES (
+                            ?1, ?2, ?3, ?4, ?5, ?6,
+                            0, 0, ?7, ?8, ?9, ?10, ?11, NULL,
+                            'codex_responses', ?12, ?13, ?14,
+                            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                         )",
+                        rusqlite::params![
+                            &request_id,
+                            &session_id,
+                            &timestamp,
+                            &model_for_row,
+                            input_tokens,
+                            output_tokens,
+                            cost_dollars,
+                            &cost_source,
+                            trusted_for_budget_enforcement as i32,
+                            duration_ms,
+                            &tool_names_json,
+                            &requested_model,
+                            &served_model,
+                            &status,
+                            input_tokens,
+                            cached_input_tokens,
+                            uncached_input_tokens,
+                            output_tokens,
+                            reasoning_output_tokens,
+                            total_tokens,
+                            &response_id,
+                            &initial_prompt,
+                            &tool_calls_json,
+                            &accounting_anomalies_json,
+                        ],
+                    )
+                    .unwrap_or(0);
+
+                if inserted_rows == 0 {
+                    continue;
+                }
+
+                for (name, ts) in &tool_calls_list {
+                    let _ = conn.execute(
+                        "INSERT INTO tool_calls (request_id, timestamp, tool_name) VALUES (?1,?2,?3)",
+                        rusqlite::params![&request_id, ts, name],
+                    );
+                }
+
+                let turn_number = conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(turn_number), 0) + 1 \
+                         FROM turn_snapshots WHERE session_id = ?1",
+                        rusqlite::params![&session_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(1)
+                    .max(1) as u32;
+
+                let _ = conn.execute(
+                    "INSERT INTO turn_snapshots (
+                        session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                        cache_creation_tokens, output_tokens, ttft_ms, tool_calls,
+                        tool_failures, gap_from_prev_secs, context_utilization,
+                        context_window_tokens, frustration_signals, requested_model,
+                        actual_model, response_summary, request_id, provider, codex_status,
+                        codex_input_tokens, codex_cached_input_tokens,
+                        codex_uncached_input_tokens, codex_output_tokens,
+                        codex_reasoning_output_tokens, codex_total_tokens, codex_response_id,
+                        codex_prompt_excerpt, codex_tool_calls,
+                        codex_accounting_anomalies
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, 0, 0, ?5, ?6, ?7,
+                        0, 0.0, ?8, ?9, 0, ?10, ?11, NULL, ?12,
+                        'codex_responses', ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                        ?20, ?21, ?22, ?23
+                     )",
+                    rusqlite::params![
+                        &session_id,
+                        turn_number,
+                        &timestamp,
+                        input_tokens,
+                        output_tokens,
+                        duration_ms,
+                        &tool_names_json,
+                        context_utilization,
+                        context_window_tokens,
+                        &requested_model,
+                        &served_model,
+                        &request_id,
+                        &status,
+                        input_tokens,
+                        cached_input_tokens,
+                        uncached_input_tokens,
+                        output_tokens,
+                        reasoning_output_tokens,
+                        total_tokens,
+                        &response_id,
+                        &initial_prompt,
+                        &tool_calls_json,
+                        &accounting_anomalies_json,
+                    ],
+                );
+
+                let _ = conn.execute(
+                    "UPDATE sessions SET \
+                     total_input_tokens = total_input_tokens + ?2, \
+                     total_output_tokens = total_output_tokens + ?3, \
+                     total_codex_input_tokens = total_codex_input_tokens + ?2, \
+                     total_codex_cached_input_tokens = total_codex_cached_input_tokens + ?4, \
+                     total_codex_uncached_input_tokens = total_codex_uncached_input_tokens + ?5, \
+                     total_codex_output_tokens = total_codex_output_tokens + ?3, \
+                     total_codex_reasoning_output_tokens = total_codex_reasoning_output_tokens + ?6, \
+                     total_codex_tokens = total_codex_tokens + ?7, \
+                     total_cost_dollars = total_cost_dollars + ?8, \
+                     request_count = request_count + 1, \
+                     ended_at = ?9 \
+                     WHERE session_id = ?1",
+                    rusqlite::params![
+                        session_id,
+                        input_tokens,
+                        output_tokens,
+                        cached_input_tokens,
+                        uncached_input_tokens,
+                        reasoning_output_tokens,
+                        total_tokens,
                         cost_dollars,
                         timestamp,
                     ],
@@ -2776,6 +3130,7 @@ fn finalize_codex_response(
 fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration: Duration) {
     let newly_started = upsert_codex_session(&outcome.accounting);
     record_codex_runtime_counters(&outcome.accounting);
+    persist_codex_finalization_outcome(outcome);
 
     let metric_model = outcome
         .accounting
@@ -2880,8 +3235,135 @@ fn log_codex_finalization_outcome(outcome: &CodexFinalizationOutcome) {
         trusted_for_budget_enforcement = outcome.accounting.pricing.trusted_for_budget_enforcement,
         duration_ms = outcome.duration_ms,
         anomalies = ?outcome.accounting.anomalies,
-        "Codex response finalized without SQLite persistence"
+        "Codex response finalized"
     );
+}
+
+fn codex_status_label(status: &codex_accounting::CodexTurnStatus) -> &'static str {
+    match status {
+        codex_accounting::CodexTurnStatus::Completed => "completed",
+        codex_accounting::CodexTurnStatus::Failed => "failed",
+        codex_accounting::CodexTurnStatus::Incomplete => "incomplete",
+        codex_accounting::CodexTurnStatus::Unknown => "unknown",
+    }
+}
+
+fn codex_cost_source(accounting: &codex_accounting::CodexTurnAccounting) -> String {
+    match &accounting.pricing.status {
+        codex_accounting::CodexPricingStatus::UnknownModel { model } => {
+            format!("codex_unpriced:unknown_model:{model}")
+        }
+    }
+}
+
+fn codex_tool_name(tool: &codex_response::CodexToolCallSummary) -> String {
+    tool.name
+        .clone()
+        .unwrap_or_else(|| format!("custom_tool_call:{}", tool.id))
+}
+
+fn codex_tool_names_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
+    let names = accounting
+        .tool_calls
+        .iter()
+        .map(codex_tool_name)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn codex_tool_calls_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
+    let calls = accounting
+        .tool_calls
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "id": tool.id.as_str(),
+                "name": tool.name.as_deref(),
+                "input": tool.input.as_str(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&calls).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn codex_tool_calls_list(
+    accounting: &codex_accounting::CodexTurnAccounting,
+    timestamp: &str,
+) -> Vec<(String, String)> {
+    accounting
+        .tool_calls
+        .iter()
+        .map(|tool| (codex_tool_name(tool), timestamp.to_string()))
+        .collect()
+}
+
+fn codex_accounting_anomalies_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
+    let anomalies = accounting
+        .anomalies
+        .iter()
+        .map(|anomaly| match anomaly {
+            codex_accounting::CodexAccountingAnomaly::CachedInputExceedsInput {
+                input_tokens,
+                cached_input_tokens,
+            } => serde_json::json!({
+                "type": "cached_input_exceeds_input",
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached_input_tokens,
+            }),
+            codex_accounting::CodexAccountingAnomaly::ReportedTotalTokensMismatch {
+                reported_total_tokens,
+                local_total_tokens,
+            } => serde_json::json!({
+                "type": "reported_total_tokens_mismatch",
+                "reported_total_tokens": reported_total_tokens,
+                "local_total_tokens": local_total_tokens,
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&anomalies).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: String) -> DbCommand {
+    let accounting = &outcome.accounting;
+    DbCommand::RecordCodexTurn {
+        request_id: outcome.request_id.clone(),
+        session_id: accounting.identity.session_id.clone(),
+        timestamp: timestamp.clone(),
+        requested_model: accounting.requested_model.clone(),
+        served_model: accounting.served_model.clone(),
+        status: codex_status_label(&accounting.status).to_string(),
+        input_tokens: accounting.input_tokens,
+        cached_input_tokens: accounting.cached_input_tokens,
+        uncached_input_tokens: accounting.uncached_input_tokens,
+        output_tokens: accounting.output_tokens,
+        reasoning_output_tokens: accounting.reasoning_output_tokens,
+        total_tokens: accounting.total_tokens,
+        duration_ms: outcome.duration_ms,
+        context_utilization: outcome.context_fill_percent / 100.0,
+        context_window_tokens: outcome.context_window_tokens,
+        initial_prompt: accounting.first_user_prompt_excerpt.clone(),
+        response_id: accounting.identity.response_id.clone(),
+        tool_names_json: codex_tool_names_json(accounting),
+        tool_calls_json: codex_tool_calls_json(accounting),
+        tool_calls_list: codex_tool_calls_list(accounting, &timestamp),
+        accounting_anomalies_json: codex_accounting_anomalies_json(accounting),
+        cost_dollars: accounting.pricing.cost_dollars.unwrap_or(0.0),
+        cost_source: codex_cost_source(accounting),
+        trusted_for_budget_enforcement: accounting.pricing.trusted_for_budget_enforcement,
+    }
+}
+
+fn persist_codex_finalization_outcome(outcome: &CodexFinalizationOutcome) {
+    if outcome.accounting.identity.session_id.is_empty() {
+        return;
+    }
+    if let Err(err) = DB_TX.send(record_codex_turn_command(outcome, now_iso8601())) {
+        warn!(
+            request_id = %outcome.request_id,
+            error = %err,
+            "failed to queue Codex turn persistence"
+        );
+    }
 }
 
 fn codex_display_name(accounting: &codex_accounting::CodexTurnAccounting) -> String {
@@ -6372,17 +6854,19 @@ mod tests {
         build_session_summary_json, build_sessions_response_json, build_summary_response_json,
         canonical_telemetry_name, clean_user_prompt, codex_request_headers_from_ext_proc,
         codex_response_headers_from_ext_proc, compact_response_summary, context_fill_percent,
-        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis, ensure_session_columns,
-        epoch_to_iso8601, extract_explicit_skill_refs, extract_header, extract_headers,
-        extract_working_dir, infer_context_window_tokens, load_degradation_view_from_db,
-        looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
-        now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
+        ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601,
+        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
+        infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
+        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
+        parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
         persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        request_uses_1m_context, resolve_context_window_tokens, score_recall_doc,
-        seed_live_metric_labels_from_db, session_timeout_secs, should_broadcast_quota_snapshot,
-        skill_name_from_skill_file, skill_name_from_tool_input_json, strip_model_1m_alias,
-        summarize_hook_tool_input, tokenize_search_text, tool_recall_context,
+        record_codex_turn_command, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, request_uses_1m_context,
+        resolve_context_window_tokens, score_recall_doc, seed_live_metric_labels_from_db,
+        session_timeout_secs, should_broadcast_quota_snapshot, skill_name_from_skill_file,
+        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
+        table_columns, tokenize_search_text, tool_recall_context,
         upstream_request_adjustment_for_body, BillingReconciliationInput,
         BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult,
         ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
@@ -6983,6 +7467,575 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
+    fn codex_persistence_migration_adds_codex_native_columns_to_legacy_tables() {
+        let conn = create_history_test_db();
+
+        ensure_codex_persistence_columns(&conn).expect("migrate codex columns");
+
+        let session_columns = table_columns(&conn, "sessions").expect("session columns");
+        let request_columns = table_columns(&conn, "requests").expect("request columns");
+        let turn_columns = table_columns(&conn, "turn_snapshots").expect("turn columns");
+
+        assert!(session_columns.contains("total_codex_cached_input_tokens"));
+        assert!(session_columns.contains("total_codex_reasoning_output_tokens"));
+        assert!(request_columns.contains("codex_cached_input_tokens"));
+        assert!(request_columns.contains("codex_uncached_input_tokens"));
+        assert!(request_columns.contains("codex_reasoning_output_tokens"));
+        assert!(request_columns.contains("codex_total_tokens"));
+        assert!(turn_columns.contains("request_id"));
+        assert!(turn_columns.contains("codex_status"));
+        assert!(turn_columns.contains("codex_cached_input_tokens"));
+        assert!(turn_columns.contains("codex_reasoning_output_tokens"));
+    }
+
+    #[test]
+    fn codex_persistence_completed_fake_turn_writes_immutable_request_and_turn() {
+        let path = unique_test_db_path("codex-persist-completed");
+        let request = parse_codex_fixture_request("phase-4c-session-001");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture-served"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4c-001",
+            &request,
+            &response,
+            Duration::from_millis(42),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+        let timestamp = "2026-04-30T12:00:00Z".to_string();
+
+        run_db_writer_commands(
+            &path,
+            vec![
+                record_codex_turn_command(&outcome, timestamp.clone()),
+                record_codex_turn_command(&outcome, timestamp),
+            ],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let request_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+            .expect("request count");
+        let turn_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turn_snapshots", [], |row| row.get(0))
+            .expect("turn count");
+        assert_eq!(request_count, 1);
+        assert_eq!(turn_count, 1);
+
+        let (
+            provider,
+            model,
+            requested_model,
+            served_model,
+            status,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            codex_cached_input_tokens,
+            codex_uncached_input_tokens,
+            codex_reasoning_output_tokens,
+            codex_total_tokens,
+            cost_dollars,
+            cost_source,
+            trusted_for_budget_enforcement,
+            response_id,
+            prompt_excerpt,
+            tool_calls_json,
+            anomalies_json,
+        ): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            f64,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT provider, model, requested_model, served_model, codex_status,
+                        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                        codex_cached_input_tokens, codex_uncached_input_tokens,
+                        codex_reasoning_output_tokens, codex_total_tokens, cost_dollars,
+                        cost_source, trusted_for_budget_enforcement, codex_response_id,
+                        codex_prompt_excerpt, codex_tool_calls, codex_accounting_anomalies
+                 FROM requests WHERE request_id = 'req-phase-4c-001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
+                        row.get(16)?,
+                        row.get(17)?,
+                        row.get(18)?,
+                        row.get(19)?,
+                    ))
+                },
+            )
+            .expect("load codex request");
+
+        assert_eq!(provider, "codex_responses");
+        assert_eq!(model, "gpt-codex-fixture-served");
+        assert_eq!(requested_model, "gpt-codex-fixture");
+        assert_eq!(served_model, "gpt-codex-fixture-served");
+        assert_eq!(status, "completed");
+        assert_eq!(input_tokens, 1280);
+        assert_eq!(output_tokens, 96);
+        assert_eq!(cache_read_tokens, 0);
+        assert_eq!(cache_creation_tokens, 0);
+        assert_eq!(codex_cached_input_tokens, 512);
+        assert_eq!(codex_uncached_input_tokens, 768);
+        assert_eq!(codex_reasoning_output_tokens, 32);
+        assert_eq!(codex_total_tokens, 1376);
+        assert_eq!(cost_dollars, 0.0);
+        assert!(cost_source.starts_with("codex_unpriced:unknown_model:"));
+        assert_eq!(trusted_for_budget_enforcement, 0);
+        assert_eq!(response_id, "resp_fixture_text_001");
+        assert_eq!(prompt_excerpt, "Summarize the current repository status.");
+        assert_eq!(tool_calls_json, "[]");
+        assert_eq!(anomalies_json, "[]");
+
+        let (
+            turn_request_id,
+            turn_provider,
+            turn_status,
+            turn_cache_read_tokens,
+            turn_cached_input_tokens,
+            turn_reasoning_tokens,
+            turn_total_tokens,
+            turn_context_utilization,
+            turn_context_window_tokens,
+        ): (String, String, String, i64, i64, i64, i64, f64, i64) = conn
+            .query_row(
+                "SELECT request_id, provider, codex_status, cache_read_tokens,
+                        codex_cached_input_tokens, codex_reasoning_output_tokens,
+                        codex_total_tokens, context_utilization, context_window_tokens
+                 FROM turn_snapshots WHERE session_id = 'phase-4c-session-001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .expect("load codex turn");
+
+        assert_eq!(turn_request_id, "req-phase-4c-001");
+        assert_eq!(turn_provider, "codex_responses");
+        assert_eq!(turn_status, "completed");
+        assert_eq!(turn_cache_read_tokens, 0);
+        assert_eq!(turn_cached_input_tokens, 512);
+        assert_eq!(turn_reasoning_tokens, 32);
+        assert_eq!(turn_total_tokens, 1376);
+        assert_eq!(
+            turn_context_window_tokens,
+            STANDARD_CONTEXT_WINDOW_TOKENS as i64
+        );
+        assert!(turn_context_utilization < 0.01);
+
+        let (
+            request_count,
+            total_input_tokens,
+            total_output_tokens,
+            total_cache_read_tokens,
+            total_codex_cached_input_tokens,
+            total_codex_uncached_input_tokens,
+            total_codex_reasoning_output_tokens,
+            total_codex_tokens,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT request_count, total_input_tokens, total_output_tokens,
+                        total_cache_read_tokens, total_codex_cached_input_tokens,
+                        total_codex_uncached_input_tokens,
+                        total_codex_reasoning_output_tokens, total_codex_tokens
+                 FROM sessions WHERE session_id = 'phase-4c-session-001'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("load codex session totals");
+
+        assert_eq!(request_count, 1);
+        assert_eq!(total_input_tokens, 1280);
+        assert_eq!(total_output_tokens, 96);
+        assert_eq!(total_cache_read_tokens, 0);
+        assert_eq!(total_codex_cached_input_tokens, 512);
+        assert_eq!(total_codex_uncached_input_tokens, 768);
+        assert_eq!(total_codex_reasoning_output_tokens, 32);
+        assert_eq!(total_codex_tokens, 1376);
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn codex_persistence_parallel_same_repo_prompts_create_distinct_sessions() {
+        let path = unique_test_db_path("codex-persist-parallel");
+        let first = br#"{
+          "model": "gpt-codex-fixture",
+          "input": "inspect package metadata",
+          "metadata": { "cwd": "/tmp/coditor-parallel" }
+        }"#;
+        let second = br#"{
+          "model": "gpt-codex-fixture",
+          "input": "summarize repository docs",
+          "metadata": { "cwd": "/tmp/coditor-parallel" }
+        }"#;
+        let first_request = super::codex_request::parse_codex_responses_request(
+            first,
+            super::codex_request::CodexRequestHeaders::default(),
+        )
+        .expect("parse first codex request");
+        let second_request = super::codex_request::parse_codex_responses_request(
+            second,
+            super::codex_request::CodexRequestHeaders::default(),
+        )
+        .expect("parse second codex request");
+        assert_ne!(first_request.session.id, second_request.session.id);
+
+        let response = super::codex_response::CodexResponseSummary {
+            status: super::codex_response::CodexResponseStatus::Completed,
+            served_model: Some("gpt-codex-fixture".to_string()),
+            usage: super::codex_response::CodexUsage {
+                input_tokens: 20,
+                cached_input_tokens: 8,
+                uncached_input_tokens: 12,
+                output_tokens: 4,
+                reasoning_output_tokens: 1,
+                total_tokens: 24,
+            },
+            ..Default::default()
+        };
+        let first_outcome = build_codex_finalization_outcome(
+            "req-phase-4c-parallel-001",
+            &first_request,
+            &response,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+        let second_outcome = build_codex_finalization_outcome(
+            "req-phase-4c-parallel-002",
+            &second_request,
+            &response,
+            Duration::from_millis(12),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        run_db_writer_commands(
+            &path,
+            vec![
+                record_codex_turn_command(&first_outcome, "2026-04-30T12:00:01Z".to_string()),
+                record_codex_turn_command(&second_outcome, "2026-04-30T12:00:02Z".to_string()),
+            ],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let sessions: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT session_id) FROM sessions",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count sessions");
+        let turns: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turn_snapshots", [], |row| row.get(0))
+            .expect("count turns");
+        let prompts = conn
+            .prepare("SELECT initial_prompt FROM sessions ORDER BY initial_prompt")
+            .expect("prepare prompt query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query prompts")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect prompts");
+
+        assert_eq!(sessions, 2);
+        assert_eq!(turns, 2);
+        assert_eq!(
+            prompts,
+            vec![
+                "inspect package metadata".to_string(),
+                "summarize repository docs".to_string()
+            ]
+        );
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn codex_persistence_saturates_anomalous_cached_input_and_records_anomaly() {
+        let path = unique_test_db_path("codex-persist-anomaly");
+        let request = parse_codex_fixture_request("phase-4c-session-anomaly");
+        let response = super::codex_response::CodexResponseSummary {
+            status: super::codex_response::CodexResponseStatus::Completed,
+            served_model: Some("gpt-codex-fixture".to_string()),
+            usage: super::codex_response::CodexUsage {
+                input_tokens: 10,
+                cached_input_tokens: 30,
+                uncached_input_tokens: 0,
+                output_tokens: 5,
+                reasoning_output_tokens: 2,
+                total_tokens: 15,
+            },
+            ..Default::default()
+        };
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4c-anomaly",
+            &request,
+            &response,
+            Duration::from_millis(5),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        run_db_writer_commands(
+            &path,
+            vec![record_codex_turn_command(
+                &outcome,
+                "2026-04-30T12:00:03Z".to_string(),
+            )],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let (uncached_input_tokens, total_tokens, anomalies_json): (i64, i64, String) = conn
+            .query_row(
+                "SELECT codex_uncached_input_tokens, codex_total_tokens,
+                        codex_accounting_anomalies
+                 FROM requests WHERE request_id = 'req-phase-4c-anomaly'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load anomaly request");
+        let anomalies: serde_json::Value =
+            serde_json::from_str(&anomalies_json).expect("parse anomalies json");
+
+        assert_eq!(uncached_input_tokens, 0);
+        assert_eq!(total_tokens, 15);
+        assert!(anomalies.to_string().contains("cached_input_exceeds_input"));
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn codex_persistence_failed_and_incomplete_statuses_are_stored() {
+        let path = unique_test_db_path("codex-persist-status");
+        let failed_request = parse_codex_fixture_request("phase-4c-session-failed");
+        let incomplete_request = parse_codex_fixture_request("phase-4c-session-incomplete");
+        let failed = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_failed_stream.sse"),
+            None,
+        );
+        let incomplete = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_incomplete_stream.sse"),
+            None,
+        );
+        let failed_outcome = build_codex_finalization_outcome(
+            "req-phase-4c-failed",
+            &failed_request,
+            &failed,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+        let incomplete_outcome = build_codex_finalization_outcome(
+            "req-phase-4c-incomplete",
+            &incomplete_request,
+            &incomplete,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        run_db_writer_commands(
+            &path,
+            vec![
+                record_codex_turn_command(&failed_outcome, "2026-04-30T12:00:04Z".to_string()),
+                record_codex_turn_command(&incomplete_outcome, "2026-04-30T12:00:05Z".to_string()),
+            ],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let statuses = conn
+            .prepare("SELECT codex_status FROM requests ORDER BY request_id")
+            .expect("prepare status query")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query statuses")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect statuses");
+        let turns: i64 = conn
+            .query_row("SELECT COUNT(*) FROM turn_snapshots", [], |row| row.get(0))
+            .expect("count turns");
+
+        assert_eq!(
+            statuses,
+            vec!["failed".to_string(), "incomplete".to_string()]
+        );
+        assert_eq!(turns, 2);
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn codex_persistence_tool_summaries_are_stored_without_cache_event() {
+        let path = unique_test_db_path("codex-persist-tools");
+        let request = parse_codex_fixture_request("phase-4c-session-tools");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_tool_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4c-tools",
+            &request,
+            &response,
+            Duration::from_millis(25),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        run_db_writer_commands(
+            &path,
+            vec![record_codex_turn_command(
+                &outcome,
+                "2026-04-30T12:00:06Z".to_string(),
+            )],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let (tool_names_json, tool_calls_json, cache_event): (String, String, Option<String>) =
+            conn.query_row(
+                "SELECT tool_calls, codex_tool_calls, cache_event
+                 FROM requests WHERE request_id = 'req-phase-4c-tools'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load tool summaries");
+        let tool_call_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("count tool call rows");
+
+        assert_eq!(tool_names_json, r#"["read_file"]"#);
+        assert!(tool_calls_json.contains("ctc_fixture_read_file_001"));
+        assert!(tool_calls_json.contains(r#""name":"read_file""#));
+        assert_eq!(cache_event, None);
+        assert_eq!(tool_call_rows, 1);
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn codex_persistence_leaves_anthropic_fallback_request_mapping_unchanged() {
+        let path = unique_test_db_path("codex-persist-anthropic-fallback");
+
+        run_db_writer_commands(
+            &path,
+            vec![
+                DbCommand::InsertSession {
+                    session_id: "session-anthropic-legacy".to_string(),
+                    started_at: "2026-04-30T12:00:07Z".to_string(),
+                    model: "claude-sonnet-fixture".to_string(),
+                    initial_prompt: Some("legacy fallback prompt".to_string()),
+                },
+                DbCommand::RecordRequest {
+                    request_id: "req-anthropic-legacy".to_string(),
+                    session_id: "session-anthropic-legacy".to_string(),
+                    timestamp: "2026-04-30T12:00:08Z".to_string(),
+                    model: "claude-sonnet-fixture".to_string(),
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_read_tokens: 7,
+                    cache_creation_tokens: 9,
+                    cost_dollars: 0.01,
+                    cost_source: ESTIMATED_COST_SOURCE.to_string(),
+                    trusted_for_budget_enforcement: false,
+                    duration_ms: 123,
+                    tool_calls_json: r#"["Read"]"#.to_string(),
+                    tool_calls_list: vec![("Read".to_string(), "2026-04-30T12:00:08Z".to_string())],
+                    cache_event: "hit".to_string(),
+                },
+            ],
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let (cache_read_tokens, cache_creation_tokens, provider, codex_cached_input_tokens): (
+            i64,
+            i64,
+            Option<String>,
+            i64,
+        ) = conn
+            .query_row(
+                "SELECT cache_read_tokens, cache_creation_tokens, provider,
+                        codex_cached_input_tokens
+                 FROM requests WHERE request_id = 'req-anthropic-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("load fallback request");
+        let (session_cache_read, session_request_count): (i64, i64) = conn
+            .query_row(
+                "SELECT total_cache_read_tokens, request_count
+                 FROM sessions WHERE session_id = 'session-anthropic-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load fallback session totals");
+
+        assert_eq!(cache_read_tokens, 7);
+        assert_eq!(cache_creation_tokens, 9);
+        assert_eq!(provider, None);
+        assert_eq!(codex_cached_input_tokens, 0);
+        assert_eq!(session_cache_read, 7);
+        assert_eq!(session_request_count, 1);
+
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn upstream_adjustment_strips_1m_model_alias_and_adds_beta_header() {
         let body = br#"{
           "model": "claude-opus-4-7[1m]",
@@ -7260,6 +8313,17 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(format!("{path}-wal"));
         let _ = fs::remove_file(format!("{path}-shm"));
+    }
+
+    fn run_db_writer_commands(path: &str, commands: Vec<DbCommand>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer_path = path.to_string();
+        let handle = std::thread::spawn(move || db_writer_loop(&writer_path, rx));
+        for command in commands {
+            tx.send(command).expect("queue db command");
+        }
+        drop(tx);
+        handle.join().expect("join db writer");
     }
 
     fn insert_session(
