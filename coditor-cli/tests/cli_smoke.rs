@@ -100,9 +100,9 @@ fn top_level_help_exposes_user_workflows() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains(
-        "Coditor observability proxy. UNPORTED: copied baseline, Codex support not implemented yet."
-    ));
+    assert!(
+        out.contains("Coditor observability proxy. Codex runtime wiring is not implemented yet.")
+    );
     assert!(out.contains("doctor"));
     assert!(out.contains("up"));
     assert!(out.contains("run"));
@@ -110,6 +110,7 @@ fn top_level_help_exposes_user_workflows() {
     assert!(out.contains("sessions"));
     assert!(out.contains("recall"));
     assert!(out.contains("reconcile"));
+    assert!(out.contains("config"));
 }
 
 #[test]
@@ -118,10 +119,25 @@ fn run_help_documents_watch_and_trailing_child_command() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Run a command through the local Coditor proxy"));
-    assert!(out.contains("Codex support not implemented yet"));
+    assert!(out.contains("Run a command through the copied proxy path"));
+    assert!(out.contains("ANTHROPIC_BASE_URL"));
     assert!(out.contains("--watch"));
     assert!(out.contains("Command and arguments to run"));
+}
+
+#[test]
+fn config_codex_prints_read_only_future_override() {
+    let output = coditor(&["config", "codex"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Coditor Codex config preview (read-only)"));
+    assert!(out.contains("real Codex runtime wiring is not implemented yet"));
+    assert!(out.contains("docker compose -f docker-compose.yml -f docker-compose.openai.yml up -d"));
+    assert!(out.contains("[model_providers.coditor-openai-responses]"));
+    assert!(out.contains(r#"base_url = "http://127.0.0.1:10000/v1""#));
+    assert!(out.contains(r#"env_key = "OPENAI_API_KEY""#));
+    assert!(out.contains("ChatGPT-auth Codex backend routing is not supported or verified"));
 }
 
 #[test]

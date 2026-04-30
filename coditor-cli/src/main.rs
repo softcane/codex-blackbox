@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "coditor",
     version,
-    about = "Coditor observability proxy. UNPORTED: copied baseline, Codex support not implemented yet."
+    about = "Coditor observability proxy. Codex runtime wiring is not implemented yet."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,14 +29,14 @@ enum Commands {
     /// Check local developer prerequisites and stack health
     Doctor,
 
-    /// Start the local Coditor stack. UNPORTED: copied baseline, Codex support not implemented yet.
+    /// Start the local Coditor stack. Default Envoy is still the unported baseline.
     Up {
         /// Start without Grafana once compose profiles support it
         #[arg(long)]
         no_grafana: bool,
     },
 
-    /// Run a command through the local Coditor proxy. UNPORTED: copied baseline, Codex support not implemented yet.
+    /// Run a command through the copied proxy path. UNPORTED: still uses ANTHROPIC_BASE_URL.
     Run {
         /// Start coditor watch alongside the child command
         #[arg(long)]
@@ -47,7 +47,7 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// Live stream copied Claude Code activity. UNPORTED: Codex support not implemented yet.
+    /// Live stream Coditor watch events
     Watch {
         /// Base URL of coditor-core
         #[arg(long, default_value = "http://localhost:9091")]
@@ -130,6 +130,18 @@ enum Commands {
         #[arg(long)]
         imported_at: Option<String>,
     },
+
+    /// Print read-only configuration previews
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommands {
+    /// Print the intended future Codex proxy configuration without applying it
+    Codex,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,6 +304,7 @@ const GRAFANA_DASHBOARD_URL: &str = "http://127.0.0.1:3000/d/coditor-main";
 const DEFAULT_CORE_IMAGE: &str =
     concat!("ghcr.io/softcane/coditor-core:v", env!("CARGO_PKG_VERSION"));
 const BUNDLED_ENVOY_YAML: &str = include_str!("../../envoy/envoy.yaml");
+const BUNDLED_OPENAI_ENVOY_YAML: &str = include_str!("../../envoy/envoy.openai.yaml");
 const BUNDLED_PROMETHEUS_YAML: &str = include_str!("../../prometheus/prometheus.yml");
 const BUNDLED_GRAFANA_DASHBOARD_PROVIDER_YAML: &str =
     include_str!("../../grafana/provisioning/dashboards/coditor.yml");
@@ -399,6 +412,19 @@ fn run_quiet(program: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn docker_daemon_running() -> bool {
     command_exists("docker") && run_quiet("docker", &["info"])
 }
@@ -427,7 +453,7 @@ fn is_coditor_repo_root(path: &Path) -> bool {
     path.join("coditor-core").is_dir() && path.join("envoy").is_dir()
 }
 
-fn find_repo_compose_file() -> Option<PathBuf> {
+fn find_repo_root() -> Option<PathBuf> {
     let mut starts = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
         starts.push(cwd);
@@ -441,23 +467,28 @@ fn find_repo_compose_file() -> Option<PathBuf> {
 
     for start in starts {
         for ancestor in start.ancestors() {
-            if !is_coditor_repo_root(ancestor) {
-                continue;
-            }
-            for name in [
-                "docker-compose.yml",
-                "docker-compose.yaml",
-                "compose.yaml",
-                "compose.yml",
-            ] {
-                let candidate = ancestor.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
+            if is_coditor_repo_root(ancestor) {
+                return Some(ancestor.to_path_buf());
             }
         }
     }
 
+    None
+}
+
+fn find_repo_compose_file() -> Option<PathBuf> {
+    let root = find_repo_root()?;
+    for name in [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yaml",
+        "compose.yml",
+    ] {
+        let candidate = root.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     None
 }
 
@@ -700,6 +731,32 @@ fn port_state(port: u16) -> PortState {
     }
 }
 
+fn repo_file_available(relative: &str) -> Option<bool> {
+    find_repo_root().map(|root| root.join(relative).is_file())
+}
+
+fn openai_config_available() -> Option<bool> {
+    repo_file_available("docker-compose.openai.yml")
+        .zip(repo_file_available("envoy/envoy.openai.yaml"))
+        .map(|(compose, envoy)| {
+            compose && envoy && BUNDLED_OPENAI_ENVOY_YAML.contains("api.openai.com")
+        })
+}
+
+fn fake_openai_e2e_available() -> Option<bool> {
+    [
+        "test/e2e-openai-responses.sh",
+        "test/fake-openai.py",
+        "test/docker-compose.openai-responses.yml",
+        "test/envoy.openai-responses.e2e.yaml",
+    ]
+    .into_iter()
+    .map(repo_file_available)
+    .try_fold(true, |acc, available| {
+        available.map(|available| acc && available)
+    })
+}
+
 async fn health_check(url: &str) -> bool {
     let Ok(client) = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -740,13 +797,33 @@ fn push_unique(lines: &mut Vec<String>, line: impl Into<String>) {
 
 async fn run_doctor() -> i32 {
     println!("Coditor doctor");
-    println!("UNPORTED: copied baseline, Codex support not implemented yet.");
+    println!("Status: real Codex runtime wiring is not implemented yet.");
+    println!("Default stack: UNPORTED copied Anthropic-shaped Envoy baseline.");
     println!();
 
     let mut failed = false;
     let mut fixes = Vec::new();
 
     print_check("✓", format!("coditor {}", env!("CARGO_PKG_VERSION")));
+
+    match command_path("codex") {
+        Some(path) => {
+            let version = command_stdout(path.to_string_lossy().as_ref(), &["--version"])
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| "version unknown".to_string());
+            print_check(
+                "✓",
+                format!("codex CLI found at {} ({version})", path.display()),
+            );
+        }
+        None => {
+            print_check("⚠", "codex CLI not found in PATH");
+            push_unique(
+                &mut fixes,
+                "Install Codex CLI before future `coditor run -- codex ...` wiring is used.",
+            );
+        }
+    }
 
     let docker_found = command_exists("docker");
     if docker_found {
@@ -785,15 +862,42 @@ async fn run_doctor() -> i32 {
         );
     }
 
-    if command_exists("claude") {
-        print_check("✓", "claude found (copied baseline check)");
-    } else {
-        failed = true;
-        print_check("✗", "claude not found in PATH (copied baseline check)");
-        push_unique(
-            &mut fixes,
-            "UNPORTED: copied baseline still checks Claude Code; Codex support is not implemented yet.",
-        );
+    match fake_openai_e2e_available() {
+        Some(true) => {
+            print_check("✓", "fake OpenAI Responses e2e available");
+        }
+        Some(false) => {
+            print_check("⚠", "fake OpenAI Responses e2e files missing");
+            push_unique(
+                &mut fixes,
+                "Run from the Coditor repository if you need `./test/e2e-openai-responses.sh`.",
+            );
+        }
+        None => {
+            print_check(
+                "⚠",
+                "fake OpenAI Responses e2e availability unknown outside repo",
+            );
+        }
+    }
+
+    match openai_config_available() {
+        Some(true) => {
+            print_check("✓", "manual OpenAI API-key Envoy config present");
+        }
+        Some(false) => {
+            print_check("⚠", "manual OpenAI API-key Envoy config files missing");
+            push_unique(
+                &mut fixes,
+                "Run from the Coditor repository if you need docker-compose.openai.yml.",
+            );
+        }
+        None => {
+            print_check(
+                "⚠",
+                "manual OpenAI API-key config availability unknown outside repo",
+            );
+        }
     }
 
     if command_exists("tmux") {
@@ -823,18 +927,19 @@ async fn run_doctor() -> i32 {
 
     let core_healthy = health_check(CODITOR_CORE_HEALTH_URL).await;
     if core_healthy {
-        print_check("✓", "coditor-core healthy");
+        print_check("✓", "Coditor stack: coditor-core healthy");
     } else {
-        failed = true;
-        print_check("✗", "coditor-core not healthy");
+        print_check(
+            "⚠",
+            "Coditor stack: coditor-core not healthy or not running",
+        );
         push_unique(&mut fixes, "Run: coditor up");
     }
 
     if health_check(GRAFANA_URL).await {
-        print_check("✓", "Grafana reachable");
+        print_check("✓", "Coditor stack: Grafana reachable");
     } else {
-        failed = true;
-        print_check("✗", "Grafana not reachable");
+        print_check("⚠", "Coditor stack: Grafana not reachable or not running");
         push_unique(&mut fixes, "Run: coditor up");
     }
 
@@ -863,6 +968,16 @@ async fn run_doctor() -> i32 {
             );
         }
     }
+
+    println!();
+    print_check(
+        "⚠",
+        "real `coditor run -- codex ...` wiring is still not implemented",
+    );
+    print_check(
+        "⚠",
+        "ChatGPT-auth Codex backend routing is not supported or verified",
+    );
 
     if !fixes.is_empty() {
         println!();
@@ -1118,6 +1233,36 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+fn codex_proxy_base_url() -> String {
+    format!("{}/v1", envoy_proxy_url().trim_end_matches('/'))
+}
+
+fn render_codex_config_preview() -> String {
+    let proxy_base_url = codex_proxy_base_url();
+    format!(
+        r#"Coditor Codex config preview (read-only)
+Status: real Codex runtime wiring is not implemented yet.
+
+Manual stack for future API-key experiments:
+  docker compose -f docker-compose.yml -f docker-compose.openai.yml up -d
+
+Intended future Codex config sketch; verify Codex's config schema before use:
+[model_providers.coditor-openai-responses]
+name = "Coditor OpenAI Responses proxy"
+base_url = "{proxy_base_url}"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+
+# Not applied by Coditor yet.
+# ChatGPT-auth Codex backend routing is not supported or verified.
+"#
+    )
+}
+
+fn print_codex_config_preview() {
+    print!("{}", render_codex_config_preview());
 }
 
 fn parse_local_datetime(iso: &str) -> Option<DateTime<Local>> {
@@ -2035,6 +2180,11 @@ async fn main() {
                 }
             }
         }
+        Commands::Config { command } => match command {
+            ConfigCommands::Codex => {
+                print_codex_config_preview();
+            }
+        },
     }
 }
 
@@ -2304,8 +2454,9 @@ async fn connect_and_stream(
 mod tests {
     use super::{
         compact_datetime_from_iso, event_session_id, extract_run_watch, format_duration_coarse,
-        format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique, shell_join,
-        shell_quote, truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands, WatchEvent,
+        format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique,
+        render_codex_config_preview, shell_join, shell_quote, truncate_for_box, yaml_quote,
+        ActiveSessions, Cli, Commands, ConfigCommands, WatchEvent,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -2574,6 +2725,24 @@ mod tests {
         assert_eq!(limit, 5);
         assert_eq!(days, 30);
         assert_eq!(query, vec!["auth"]);
+
+        let cli = Cli::try_parse_from(["coditor", "config", "codex"]).expect("config parses");
+        let Commands::Config { command } = cli.command else {
+            panic!("expected config command");
+        };
+        assert!(matches!(command, ConfigCommands::Codex));
+    }
+
+    #[test]
+    fn codex_config_preview_is_read_only_and_mentions_manual_openai_override() {
+        let preview = render_codex_config_preview();
+
+        assert!(preview.contains("read-only"));
+        assert!(preview.contains("real Codex runtime wiring is not implemented yet"));
+        assert!(preview.contains("docker-compose.openai.yml"));
+        assert!(preview.contains("[model_providers.coditor-openai-responses]"));
+        assert!(preview.contains("OPENAI_API_KEY"));
+        assert!(preview.contains("Not applied by Coditor yet."));
     }
 
     #[test]
