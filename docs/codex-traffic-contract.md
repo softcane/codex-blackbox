@@ -361,6 +361,54 @@ Limitations:
 - `coditor config codex` prints the suggested hook endpoint read-only. Coditor
   does not modify `~/.codex/config.toml`.
 
+## Phase 8A Codex Diagnostics
+
+Phase 8A teaches diagnosis to read Codex-native signals from fixture Responses
+turns, persisted Codex turn rows, and fake hook/MCP telemetry. It does not add
+real rate-limit parsing and does not broaden the dogfood harness.
+
+Codex diagnostic causes currently emitted:
+
+- `codex_response_failed`: a persisted or in-memory Codex turn ended with
+  `failed` status.
+- `codex_response_incomplete`: a Codex turn ended with `incomplete` status.
+- `codex_model_mismatch`: requested and served model strings differed.
+- `codex_high_context_fill`: Codex input filled at least 80% of the configured
+  context window.
+- `codex_high_reasoning_share`: reasoning output was at least half of output
+  tokens and at least 64 tokens.
+- `codex_repeated_tool_failures`: three or more Codex tool failures were
+  observed for the session.
+- `codex_mcp_tool_failures`: two or more failed or denied MCP tool events were
+  observed for the session.
+- `codex_accounting_anomaly`: the Codex accounting adapter recorded one or more
+  accounting anomalies.
+- `codex_low_cached_input_reuse`: at least three Codex turns had less than 10%
+  aggregate cached-input reuse.
+
+Diagnosis behavior:
+
+- Codex turns stored in `turn_snapshots` carry explicit `provider`,
+  `codex_status`, cached-input, reasoning-output, and accounting-anomaly fields.
+- `/api/diagnosis/<session_id>` can compute a Codex diagnosis from persisted
+  turn snapshots when no stored `session_diagnoses` row exists yet.
+- Fake hook `ToolResult` failures and fake MCP failure events can enrich Codex
+  diagnosis when they correlate to a proxy session id.
+- Non-heuristic Codex causes can emit watch `Diagnosis` events from the hot
+  path without blocking on SQLite.
+- Prometheus uses the existing bounded cause label path; no session-id labels
+  are added.
+
+Limitations:
+
+- Cause thresholds are fixture-driven and conservative. They should be
+  revisited after real Codex captures.
+- Rate-limit headers are still unverified and intentionally not parsed.
+- Hook tool failure correlation is best-effort and in-memory for live watch
+  diagnosis; persisted diagnosis augments from `tool_outcomes` and `mcp_events`.
+- Codex cached-input reuse is treated as a diagnosis signal only after at least
+  three turns; OpenAI cache-affinity behavior still needs real validation.
+
 ## Headers To Verify Later
 
 The fake contract records these headers as candidates to verify in real Codex

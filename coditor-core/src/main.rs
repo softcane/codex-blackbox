@@ -2897,13 +2897,20 @@ fn finalize_response(
             let snapshot = diagnosis::TurnSnapshot {
                 turn_number: n,
                 timestamp: *started_at,
+                provider: None,
                 input_tokens: acc.input_tokens as u32,
                 cache_read_tokens: acc.cache_read_tokens as u32,
                 cache_creation_tokens: acc.cache_creation_tokens as u32,
                 output_tokens: acc.output_tokens as u32,
+                codex_status: None,
+                codex_cached_input_tokens: 0,
+                codex_uncached_input_tokens: 0,
+                codex_reasoning_output_tokens: 0,
+                codex_accounting_anomaly_count: 0,
                 ttft_ms: duration_ms,
                 tool_calls: acc.tool_calls.clone(),
                 tool_results_failed: tool_failures,
+                mcp_tool_failures: 0,
                 gap_from_prev_secs: gap,
                 context_utilization: context_fill_ratio(
                     acc.input_tokens,
@@ -3153,6 +3160,7 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
     let newly_started = upsert_codex_session(&outcome.accounting);
     record_codex_runtime_counters(&outcome.accounting);
     persist_codex_finalization_outcome(outcome);
+    remember_codex_turn_and_emit_diagnosis(outcome);
 
     let metric_model = outcome
         .accounting
@@ -3364,6 +3372,83 @@ fn codex_accounting_anomalies_json(accounting: &codex_accounting::CodexTurnAccou
     serde_json::to_string(&anomalies).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn saturating_u64_to_u32(value: u64) -> u32 {
+    value.min(u64::from(u32::MAX)) as u32
+}
+
+fn count_codex_accounting_anomalies_json(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw else {
+        return 0;
+    };
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.as_array().map(|items| items.len() as u32))
+        .unwrap_or(0)
+}
+
+fn codex_turn_snapshot_from_outcome(
+    outcome: &CodexFinalizationOutcome,
+    turn_number: u32,
+) -> diagnosis::TurnSnapshot {
+    let accounting = &outcome.accounting;
+    diagnosis::TurnSnapshot {
+        turn_number,
+        timestamp: Instant::now(),
+        provider: Some("codex_responses".to_string()),
+        input_tokens: saturating_u64_to_u32(accounting.input_tokens),
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
+        output_tokens: saturating_u64_to_u32(accounting.output_tokens),
+        codex_status: Some(codex_status_label(&accounting.status).to_string()),
+        codex_cached_input_tokens: saturating_u64_to_u32(accounting.cached_input_tokens),
+        codex_uncached_input_tokens: saturating_u64_to_u32(accounting.uncached_input_tokens),
+        codex_reasoning_output_tokens: saturating_u64_to_u32(accounting.reasoning_output_tokens),
+        codex_accounting_anomaly_count: accounting.anomalies.len() as u32,
+        ttft_ms: outcome.duration_ms,
+        tool_calls: accounting.tool_calls.iter().map(codex_tool_name).collect(),
+        tool_results_failed: 0,
+        mcp_tool_failures: 0,
+        gap_from_prev_secs: 0.0,
+        context_utilization: outcome.context_fill_percent / 100.0,
+        context_window_tokens: outcome.context_window_tokens,
+        frustration_signals: 0,
+        requested_model: Some(accounting.requested_model.clone()),
+        actual_model: accounting.served_model.clone(),
+        response_summary: None,
+    }
+}
+
+fn remember_codex_turn_and_emit_diagnosis(outcome: &CodexFinalizationOutcome) {
+    let session_id = &outcome.accounting.identity.session_id;
+    if session_id.is_empty() {
+        return;
+    }
+
+    let (report, latest_turn) = {
+        let mut turns = diagnosis::SESSION_TURNS
+            .entry(session_id.clone())
+            .or_default();
+        let turn_number = turns.len() as u32 + 1;
+        let snapshot = codex_turn_snapshot_from_outcome(outcome, turn_number);
+        turns.push(snapshot);
+        (
+            diagnosis::analyze_session(session_id, turns.as_slice()),
+            turn_number,
+        )
+    };
+
+    let new_non_heuristic_cause = report
+        .causes
+        .iter()
+        .any(|cause| !cause.is_heuristic && cause.turn_first_noticed == latest_turn);
+    if new_non_heuristic_cause {
+        watch::BROADCASTER.broadcast(watch::WatchEvent::Diagnosis {
+            session_id: session_id.clone(),
+            report,
+        });
+    }
+}
+
 fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: String) -> DbCommand {
     let accounting = &outcome.accounting;
     DbCommand::RecordCodexTurn {
@@ -3506,11 +3591,13 @@ fn load_turn_snapshots_from_db(
     let mut stmt = conn.prepare(
         "SELECT turn_number, input_tokens, cache_read_tokens, cache_creation_tokens, \
          output_tokens, ttft_ms, tool_calls, tool_failures, gap_from_prev_secs, \
-         context_utilization, context_window_tokens, frustration_signals, requested_model, actual_model, response_summary \
+         context_utilization, context_window_tokens, frustration_signals, requested_model, \
+         actual_model, response_summary, provider, codex_status, codex_cached_input_tokens, \
+         codex_uncached_input_tokens, codex_reasoning_output_tokens, codex_accounting_anomalies \
          FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number ASC",
     )?;
 
-    let turns = stmt
+    let mut turns = stmt
         .query_map(rusqlite::params![session_id], |row| {
             let tool_calls_raw = row.get::<_, String>(6)?;
             let input_tokens = row.get::<_, i64>(1)?.max(0) as u32;
@@ -3535,13 +3622,22 @@ fn load_turn_snapshots_from_db(
             Ok(diagnosis::TurnSnapshot {
                 turn_number: row.get::<_, i64>(0)?.max(0) as u32,
                 timestamp: Instant::now(),
+                provider: row.get::<_, Option<String>>(15)?,
                 input_tokens,
                 cache_read_tokens,
                 cache_creation_tokens,
                 output_tokens: row.get::<_, i64>(4)?.max(0) as u32,
+                codex_status: row.get::<_, Option<String>>(16)?,
+                codex_cached_input_tokens: row.get::<_, i64>(17)?.max(0) as u32,
+                codex_uncached_input_tokens: row.get::<_, i64>(18)?.max(0) as u32,
+                codex_reasoning_output_tokens: row.get::<_, i64>(19)?.max(0) as u32,
+                codex_accounting_anomaly_count: count_codex_accounting_anomalies_json(
+                    row.get::<_, Option<String>>(20)?.as_deref(),
+                ),
                 ttft_ms: row.get::<_, i64>(5)?.max(0) as u64,
                 tool_calls: parse_tool_calls_json(&tool_calls_raw),
                 tool_results_failed: row.get::<_, i64>(7)?.max(0) as u32,
+                mcp_tool_failures: 0,
                 gap_from_prev_secs: row.get::<_, f64>(8)?.max(0.0),
                 context_utilization: context_fill_ratio(
                     input_tokens as u64,
@@ -3559,7 +3655,54 @@ fn load_turn_snapshots_from_db(
         .filter_map(|row| row.ok())
         .collect::<Vec<_>>();
 
+    augment_codex_telemetry_failures_from_db(conn, session_id, &mut turns)?;
+
     Ok(turns)
+}
+
+fn failed_tool_outcome_count_from_db(conn: &Connection, session_id: &str) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM tool_outcomes \
+         WHERE session_id = ?1 \
+           AND (lower(COALESCE(outcome, '')) LIKE '%fail%' \
+                OR lower(COALESCE(outcome, '')) LIKE '%denied%' \
+                OR lower(COALESCE(outcome, '')) = 'error')",
+        rusqlite::params![session_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as u32)
+}
+
+fn failed_mcp_event_count_from_db(conn: &Connection, session_id: &str) -> rusqlite::Result<u32> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM mcp_events \
+         WHERE session_id = ?1 AND event_type IN ('failed', 'denied')",
+        rusqlite::params![session_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as u32)
+}
+
+fn augment_codex_telemetry_failures_from_db(
+    conn: &Connection,
+    session_id: &str,
+    turns: &mut [diagnosis::TurnSnapshot],
+) -> rusqlite::Result<()> {
+    if !turns.iter().any(diagnosis::TurnSnapshot::is_codex) {
+        return Ok(());
+    }
+
+    let tool_failures = failed_tool_outcome_count_from_db(conn, session_id)?;
+    let mcp_failures = failed_mcp_event_count_from_db(conn, session_id)?;
+    if tool_failures == 0 && mcp_failures == 0 {
+        return Ok(());
+    }
+
+    if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.is_codex()) {
+        turn.tool_results_failed = turn.tool_results_failed.saturating_add(tool_failures);
+        turn.mcp_tool_failures = turn.mcp_tool_failures.saturating_add(mcp_failures);
+    }
+    Ok(())
 }
 
 fn stored_tool_recall_context(
@@ -3634,6 +3777,7 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
     let _ = ensure_turn_snapshot_model_columns(conn);
     let _ = ensure_session_columns(conn);
     let _ = ensure_request_cost_columns(conn);
+    let _ = ensure_codex_persistence_columns(conn);
     let _ = repair_turn_snapshot_context_windows(conn);
     let _ = repair_session_diagnosis_degradation_turns(conn);
     let cutoff = epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs()));
@@ -5286,6 +5430,18 @@ fn codex_watch_event_is_duplicate_or_remember(event: &watch::WatchEvent) -> bool
     false
 }
 
+fn note_codex_tool_failure_for_active_turn(session_id: &str, mcp_failure: bool) {
+    if let Some(mut turns) = diagnosis::SESSION_TURNS.get_mut(session_id) {
+        if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.is_codex()) {
+            if mcp_failure {
+                turn.mcp_tool_failures = turn.mcp_tool_failures.saturating_add(1);
+            } else {
+                turn.tool_results_failed = turn.tool_results_failed.saturating_add(1);
+            }
+        }
+    }
+}
+
 fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookProcessResult {
     let built = build_codex_hook_watch_events(payload, timestamp);
     let mut result = CodexHookProcessResult {
@@ -5345,10 +5501,19 @@ fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookPr
                 result.events_emitted += 1;
             }
             event @ watch::WatchEvent::ToolResult { .. } => {
-                let (tool_name, outcome) = match &event {
+                let (session_id, tool_name, outcome, duration_ms) = match &event {
                     watch::WatchEvent::ToolResult {
-                        tool_name, outcome, ..
-                    } => (tool_name.clone(), outcome.clone()),
+                        session_id,
+                        tool_name,
+                        outcome,
+                        duration_ms,
+                        ..
+                    } => (
+                        session_id.clone(),
+                        tool_name.clone(),
+                        outcome.clone(),
+                        *duration_ms,
+                    ),
                     _ => unreachable!(),
                 };
                 if codex_watch_event_is_duplicate_or_remember(&event) {
@@ -5358,6 +5523,16 @@ fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookPr
                 let outcome_lower = outcome.to_ascii_lowercase();
                 if outcome_lower.contains("fail") || outcome_lower.contains("denied") {
                     metrics::record_tool_failures(&tool_name, 1);
+                    note_codex_tool_failure_for_active_turn(&session_id, false);
+                    let _ = DB_TX.send(DbCommand::WriteToolOutcome {
+                        session_id,
+                        turn_number: 0,
+                        timestamp: now_iso8601(),
+                        tool_name: tool_name.clone(),
+                        input_summary: String::new(),
+                        outcome: outcome.clone(),
+                        duration_ms,
+                    });
                 }
                 watch::BROADCASTER.broadcast(event);
                 result.events_emitted += 1;
@@ -5394,6 +5569,9 @@ fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookPr
                     detail,
                 } = event
                 {
+                    if matches!(event_type.as_str(), "failed" | "denied") {
+                        note_codex_tool_failure_for_active_turn(&session_id, true);
+                    }
                     emit_mcp_event(McpTelemetryEvent {
                         session_id,
                         timestamp,
@@ -6494,28 +6672,57 @@ async fn handle_diagnosis(
              FROM session_diagnoses WHERE session_id = ?1",
             )
             .ok()?;
-        stmt.query_row(rusqlite::params![session_id], |row| {
-            let causes_str: String = row.get(7)?;
-            let advice_str: String = row.get(8)?;
-            Ok(build_diagnosis_response_json(
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                estimated.estimated_cost_dollars,
-                estimated.cost_source.clone(),
-                estimated.trusted_for_budget_enforcement,
-                billing.as_ref().map(|record| record.billed_cost_dollars),
-                billing.as_ref().map(|record| record.source.clone()),
-                billing.as_ref().map(|record| record.imported_at.clone()),
-                row.get::<_, f64>(4)?,
-                row.get::<_, i32>(5)? != 0,
-                row.get::<_, Option<i64>>(6)?,
-                serde_json::from_str::<Value>(&causes_str).unwrap_or(Value::Array(vec![])),
-                serde_json::from_str::<Value>(&advice_str).unwrap_or(Value::Array(vec![])),
-            ))
-        })
-        .ok()
+        let stored = stmt
+            .query_row(rusqlite::params![&session_id], |row| {
+                let causes_str: String = row.get(7)?;
+                let advice_str: String = row.get(8)?;
+                Ok(build_diagnosis_response_json(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    estimated.estimated_cost_dollars,
+                    estimated.cost_source.clone(),
+                    estimated.trusted_for_budget_enforcement,
+                    billing.as_ref().map(|record| record.billed_cost_dollars),
+                    billing.as_ref().map(|record| record.source.clone()),
+                    billing.as_ref().map(|record| record.imported_at.clone()),
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i32>(5)? != 0,
+                    row.get::<_, Option<i64>>(6)?,
+                    serde_json::from_str::<Value>(&causes_str).unwrap_or(Value::Array(vec![])),
+                    serde_json::from_str::<Value>(&advice_str).unwrap_or(Value::Array(vec![])),
+                ))
+            })
+            .optional()
+            .ok()?;
+
+        if let Some(stored) = stored {
+            return Some(stored);
+        }
+
+        let turns = load_turn_snapshots_from_db(&conn, &session_id).ok()?;
+        if turns.is_empty() {
+            return None;
+        }
+        let report = diagnosis::analyze_session(&session_id, &turns);
+        Some(build_diagnosis_response_json(
+            session_id,
+            now_iso8601(),
+            report.outcome,
+            report.total_turns as i64,
+            estimated.estimated_cost_dollars,
+            estimated.cost_source,
+            estimated.trusted_for_budget_enforcement,
+            billing.as_ref().map(|record| record.billed_cost_dollars),
+            billing.as_ref().map(|record| record.source.clone()),
+            billing.as_ref().map(|record| record.imported_at.clone()),
+            report.cache_hit_ratio,
+            report.degraded,
+            report.degradation_turn.map(i64::from),
+            serde_json::to_value(&report.causes).unwrap_or(Value::Array(vec![])),
+            serde_json::to_value(&report.advice).unwrap_or(Value::Array(vec![])),
+        ))
     })
     .await
     .ok()
@@ -7646,9 +7853,9 @@ mod tests {
         context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
         ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601,
         extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        infer_context_window_tokens, load_degradation_view_from_db, looks_like_machine_recall_line,
-        metrics, model_requests_1m_context, normalize_search_text, now_epoch_secs,
-        parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
+        infer_context_window_tokens, load_degradation_view_from_db, load_turn_snapshots_from_db,
+        looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
+        now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
         persist_billing_reconciliation, pricing, query_historical_metrics, query_summary,
         record_codex_turn_command, repair_persisted_session_artifacts,
         repair_turn_snapshot_context_windows, request_uses_1m_context,
@@ -9288,6 +9495,125 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                     && summary == "Cargo.toml"
             )
         }));
+    }
+
+    fn insert_codex_turn_snapshot(
+        conn: &Connection,
+        session_id: &str,
+        status: &str,
+        turn_number: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO turn_snapshots (
+                session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                gap_from_prev_secs, context_utilization, context_window_tokens,
+                frustration_signals, requested_model, actual_model, response_summary,
+                request_id, provider, codex_status, codex_input_tokens,
+                codex_cached_input_tokens, codex_uncached_input_tokens,
+                codex_output_tokens, codex_reasoning_output_tokens, codex_total_tokens,
+                codex_accounting_anomalies
+            ) VALUES (
+                ?1, ?2, '2026-04-30T12:00:00Z', 1000, 0, 0, 100, 10,
+                '[]', 0, 0.0, 0.10, 128000, 0, 'gpt-codex-fixture',
+                'gpt-codex-fixture', NULL, ?3, 'codex_responses', ?4, 1000,
+                500, 500, 100, 20, 1100, '[]'
+            )",
+            rusqlite::params![
+                session_id,
+                turn_number,
+                format!("req-{turn_number}"),
+                status
+            ],
+        )
+        .expect("insert codex turn snapshot");
+    }
+
+    #[test]
+    fn codex_diagnosis_persisted_failed_turn_reports_on_demand() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        ensure_codex_persistence_columns(&conn).expect("ensure codex columns");
+        insert_session(
+            &conn,
+            "codex-db-failed",
+            "2026-04-30T12:00:00Z",
+            None,
+            "gpt-codex-fixture",
+            Some("fixture prompt"),
+        );
+        insert_codex_turn_snapshot(&conn, "codex-db-failed", "failed", 1);
+
+        let turns =
+            load_turn_snapshots_from_db(&conn, "codex-db-failed").expect("load persisted turns");
+        let report = diagnosis::analyze_session("codex-db-failed", &turns);
+
+        assert!(report.degraded);
+        assert!(report
+            .causes
+            .iter()
+            .any(|cause| cause.cause_type == "codex_response_failed"));
+    }
+
+    #[test]
+    fn codex_diagnosis_loads_hook_tool_and_mcp_failures_from_db() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        ensure_codex_persistence_columns(&conn).expect("ensure codex columns");
+        insert_session(
+            &conn,
+            "codex-db-hooks",
+            "2026-04-30T12:00:00Z",
+            None,
+            "gpt-codex-fixture",
+            Some("fixture prompt"),
+        );
+        for turn in 1..=3 {
+            insert_codex_turn_snapshot(&conn, "codex-db-hooks", "completed", turn);
+        }
+        for idx in 1..=3 {
+            conn.execute(
+                "INSERT INTO tool_outcomes (
+                    session_id, turn_number, timestamp, tool_name, input_summary, outcome, duration_ms
+                ) VALUES (?1, 0, ?2, 'shell', '', 'failed', 1)",
+                rusqlite::params!["codex-db-hooks", format!("2026-04-30T12:00:0{idx}Z")],
+            )
+            .expect("insert hook tool failure");
+        }
+        for idx in 1..=2 {
+            conn.execute(
+                "INSERT INTO mcp_events (
+                    session_id, timestamp, server, tool, event_type, source, detail
+                ) VALUES (?1, ?2, 'github', 'get_issue', 'failed', 'hook', 'fixture')",
+                rusqlite::params!["codex-db-hooks", format!("2026-04-30T12:01:0{idx}Z")],
+            )
+            .expect("insert mcp failure");
+        }
+
+        let turns =
+            load_turn_snapshots_from_db(&conn, "codex-db-hooks").expect("load persisted turns");
+        let report = diagnosis::analyze_session("codex-db-hooks", &turns);
+        let causes = report
+            .causes
+            .iter()
+            .map(|cause| cause.cause_type.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(report.degraded);
+        assert!(causes.contains(&"codex_repeated_tool_failures"));
+        assert!(causes.contains(&"codex_mcp_tool_failures"));
+    }
+
+    #[test]
+    fn codex_diagnosis_metrics_do_not_expose_session_id_labels() {
+        let _guard = METRICS_TEST_LOCK.lock().unwrap();
+        metrics::init();
+        metrics::record_degraded_cause("codex_response_failed");
+        let (_, body) = metrics::render().expect("render metrics");
+
+        assert!(!body.contains("session_id="));
+        assert!(!body.contains("session=\""));
+        assert!(body.contains("cause_type=\"codex_response_failed\""));
     }
 
     #[test]

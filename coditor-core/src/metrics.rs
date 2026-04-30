@@ -17,7 +17,7 @@ const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
 const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
 const LIVE_MCP_EVENT_SOURCES: [&str; 2] = ["hook", "proxy"];
 pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
-pub const HISTORY_CAUSE_TYPES: [&str; 8] = [
+pub const HISTORY_CAUSE_TYPES: [&str; 17] = [
     "cache_miss_ttl",
     "context_bloat",
     "model_fallback",
@@ -26,6 +26,15 @@ pub const HISTORY_CAUSE_TYPES: [&str; 8] = [
     "cache_miss_thrash",
     "tool_failure_streak",
     "compaction_suspected",
+    "codex_response_failed",
+    "codex_response_incomplete",
+    "codex_model_mismatch",
+    "codex_high_context_fill",
+    "codex_high_reasoning_share",
+    "codex_repeated_tool_failures",
+    "codex_mcp_tool_failures",
+    "codex_accounting_anomaly",
+    "codex_low_cached_input_reuse",
 ];
 
 #[derive(Clone, Debug, Default)]
