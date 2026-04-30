@@ -99,6 +99,7 @@ fetch_watch_for_session() {
         output=$(curl -sS --max-time 4 -H "Accept: text/event-stream" \
             "$CORE_URL/watch?session=$SESSION_ID" 2>/dev/null || true)
         if grep -q '"type":"session_start"' <<<"$output" \
+            && grep -q '"type":"codex_turn_summary"' <<<"$output" \
             && grep -q '"type":"context_status"' <<<"$output"; then
             printf "%s" "$output"
             return 0
@@ -138,9 +139,12 @@ assert_contains "$response" "Workspace packages: coditor-core and coditor-cli." 
 pass "Envoy streamed fake OpenAI Responses SSE"
 
 info "Checking Coditor watch events for Codex finalization..."
-watch_output=$(fetch_watch_for_session) || fail "/watch did not expose SessionStart and ContextStatus for $SESSION_ID; output: $watch_output"
+watch_output=$(fetch_watch_for_session) || fail "/watch did not expose Codex SessionStart, turn summary, and ContextStatus for $SESSION_ID; output: $watch_output"
 assert_contains "$watch_output" '"type":"session_start"' "/watch exposes Codex SessionStart"
+assert_contains "$watch_output" '"type":"codex_turn_summary"' "/watch exposes Codex turn summary"
 assert_contains "$watch_output" '"type":"context_status"' "/watch exposes Codex ContextStatus"
+assert_contains "$watch_output" '"cached_input_tokens"' "/watch exposes Codex cached input accounting"
+assert_contains "$watch_output" '"reasoning_output_tokens"' "/watch exposes Codex reasoning output accounting"
 assert_contains "$watch_output" "$SESSION_ID" "/watch is scoped to the fixture session"
 assert_not_contains "$watch_output" '"type":"cache_event"' "/watch does not emit Anthropic CacheEvent for Codex"
 assert_not_contains "$watch_output" "cache_expires_at_epoch" "/watch has no Anthropic cache TTL for Codex"

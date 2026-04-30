@@ -45,9 +45,11 @@ It is still not proof that real Codex/OpenAI traffic works.
 
 Finish user-facing watch behavior:
 
-- remove stale Claude/Anthropic labels from active Coditor UI
-- render cached input and reasoning token language correctly
-- keep no-TTL cached input behavior clear
+- remove stale Claude/Anthropic labels from active Codex UI
+- render Codex cached input, reasoning output, model change, and status
+  language correctly
+- keep no-TTL cached input behavior clear by using `CodexTurnSummary` instead
+  of Anthropic-shaped `CacheEvent`
 - ensure `watch --tmux` still self-bootstraps and renders Codex sessions
 
 Done when inline watch and tmux views make sense for Codex fake sessions.

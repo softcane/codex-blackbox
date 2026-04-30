@@ -149,10 +149,24 @@ struct ManagedPane {
     estimated_rebuild_cost_dollars: Option<f64>,
     /// Latest context-fill snapshot — drives the compaction runway hint.
     fill_percent: Option<f64>,
+    context_window_tokens: Option<u64>,
     turns_to_compact: Option<u32>,
-    /// If Anthropic routed to a different model than requested.
+    /// If the served model differed from the requested model.
     model_fallback: Option<(String, String)>,
+    /// Latest Codex-native turn accounting summary. Kept separate from
+    /// CacheEvent because cached input has no Anthropic TTL/rebuild semantics.
+    codex_turn: Option<CodexPaneTurnSummary>,
     applied_activity: Option<Activity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CodexPaneTurnSummary {
+    status: String,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
 }
 
 /// Activity level derived from `last_activity` elapsed time.
@@ -181,6 +195,87 @@ fn format_observed_tool_calls(n: u32) -> String {
         1 => "1 tool call seen".to_string(),
         _ => format!("{n} tool calls seen"),
     }
+}
+
+fn is_codex_model_name(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("codex")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+}
+
+fn is_anthropic_model_name(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("claude-")
+}
+
+fn pane_model_label(model: &str) -> String {
+    if is_codex_model_name(model) {
+        format!("CODEX \u{00b7} {model}")
+    } else if is_anthropic_model_name(model) {
+        format!("UNPORTED ANTHROPIC \u{00b7} {model}")
+    } else {
+        model.to_string()
+    }
+}
+
+fn model_change_hint_label(requested: &str, actual: &str) -> &'static str {
+    if is_anthropic_model_name(requested) || is_anthropic_model_name(actual) {
+        "unported fallback"
+    } else {
+        "model change"
+    }
+}
+
+fn context_window_label(context_window_tokens: Option<u64>) -> String {
+    context_window_tokens
+        .map(|tokens| format!(" of {} window", format_count(tokens)))
+        .unwrap_or_default()
+}
+
+fn context_hint_text(
+    indent: &str,
+    fill_percent: f64,
+    context_window_tokens: Option<u64>,
+    turns_to_compact: Option<u32>,
+) -> Option<String> {
+    if fill_percent < 60.0 {
+        return None;
+    }
+    let tail = match turns_to_compact {
+        Some(0) => "at compaction threshold".to_string(),
+        Some(n) => format!("~{} turns to compaction", n),
+        None => "trajectory unknown".to_string(),
+    };
+    Some(format!(
+        "{}context {:.0}%{} \u{00b7} {}",
+        indent,
+        fill_percent,
+        context_window_label(context_window_tokens),
+        tail
+    ))
+}
+
+fn codex_turn_hint_text(indent: &str, summary: &CodexPaneTurnSummary) -> String {
+    let reasoning_part = if summary.reasoning_output_tokens > 0 {
+        format!(
+            " \u{00b7} reasoning {}",
+            format_count(summary.reasoning_output_tokens)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{}codex {} \u{00b7} cached input {} \u{00b7} uncached input {} \u{00b7} output {}{} \u{00b7} total {}",
+        indent,
+        summary.status,
+        format_count(summary.cached_input_tokens),
+        format_count(summary.uncached_input_tokens),
+        format_count(summary.output_tokens),
+        reasoning_part,
+        format_count(summary.total_tokens)
+    )
 }
 
 /// Coarse human duration: "45s" / "12m" / "3h 20m" / "5d 14h".
@@ -276,7 +371,7 @@ impl ManagedPane {
 // TmuxOrchestrator
 // ---------------------------------------------------------------------------
 
-/// Last known Anthropic rate-limit snapshot, rendered in the top strip.
+/// Last known quota/rate-limit snapshot, rendered in the top strip.
 struct RateLimitSummary {
     seconds_to_reset: Option<u64>,
     tokens_used_this_week: Option<u64>,
@@ -416,8 +511,10 @@ impl TmuxOrchestrator {
                 cache_expires_at_epoch: None,
                 estimated_rebuild_cost_dollars: None,
                 fill_percent: None,
+                context_window_tokens: None,
                 turns_to_compact: None,
                 model_fallback: None,
+                codex_turn: None,
                 applied_activity: None,
             },
         );
@@ -592,7 +689,7 @@ impl TmuxOrchestrator {
             let max_model = self
                 .panes
                 .values()
-                .map(|p| p.model.len())
+                .map(|p| pane_model_label(&p.model).len())
                 .max()
                 .unwrap_or(0)
                 .max(5);
@@ -610,7 +707,15 @@ impl TmuxOrchestrator {
                     Activity::Ended => "\u{25cf}".dimmed(),
                 };
                 let status = match activity {
-                    Activity::Ended => "ended".dimmed().to_string(),
+                    Activity::Ended => {
+                        if let Some(summary) = &pane.codex_turn {
+                            format!("ended \u{00b7} codex {}", summary.status)
+                                .dimmed()
+                                .to_string()
+                        } else {
+                            "ended".dimmed().to_string()
+                        }
+                    }
                     Activity::Active => format!(
                         "{} · active",
                         format_observed_tool_calls(pane.observed_tool_calls)
@@ -637,12 +742,13 @@ impl TmuxOrchestrator {
                 // Pad raw display name so columns align even after color codes;
                 // colored::ColoredString doesn't count width for us.
                 let name_padding = max_name.saturating_sub(pane.display_name.len());
+                let model_label = pane_model_label(&pane.model);
                 println!(
                     "  {} {}{}  {:<width_m$}  {}",
                     dot,
                     name_colored,
                     " ".repeat(name_padding),
-                    pane.model,
+                    model_label,
                     status,
                     width_m = max_model,
                 );
@@ -678,20 +784,31 @@ impl TmuxOrchestrator {
                         println!("{}", colored);
                     }
                 }
-                if let (Some(fill), _) = (pane.fill_percent, pane.turns_to_compact) {
-                    if fill >= 60.0 && !pane.ended {
-                        let tail = match pane.turns_to_compact {
-                            Some(0) => "AT THRESHOLD".to_string(),
-                            Some(n) => format!("~{} turns to auto-compact", n),
-                            None => "trajectory unknown".to_string(),
-                        };
-                        let msg = format!("{}context {:.0}% full · {}", name_indent, fill, tail);
-                        let colored = if fill >= 80.0 {
-                            msg.red().bold().to_string()
-                        } else {
-                            msg.yellow().to_string()
-                        };
-                        println!("{}", colored);
+                if let Some(summary) = &pane.codex_turn {
+                    let msg = codex_turn_hint_text(&name_indent, summary);
+                    let colored = match summary.status.as_str() {
+                        "completed" => msg.green().dimmed().to_string(),
+                        "failed" => msg.red().bold().to_string(),
+                        "incomplete" => msg.yellow().bold().to_string(),
+                        _ => msg.yellow().to_string(),
+                    };
+                    println!("{}", colored);
+                }
+                if let Some(fill) = pane.fill_percent {
+                    if let Some(msg) = context_hint_text(
+                        &name_indent,
+                        fill,
+                        pane.context_window_tokens,
+                        pane.turns_to_compact,
+                    ) {
+                        if !pane.ended {
+                            let colored = if fill >= 80.0 {
+                                msg.red().bold().to_string()
+                            } else {
+                                msg.yellow().to_string()
+                            };
+                            println!("{}", colored);
+                        }
                     }
                 }
                 if let Some((req, actual)) = &pane.model_fallback {
@@ -699,8 +816,11 @@ impl TmuxOrchestrator {
                         println!(
                             "{}",
                             format!(
-                                "{}\u{26a0}  fallback: requested {}, got {}",
-                                name_indent, req, actual
+                                "{}\u{26a0}  {}: requested {}, served {}",
+                                name_indent,
+                                model_change_hint_label(req, actual),
+                                req,
+                                actual
                             )
                             .yellow()
                             .bold()
@@ -778,6 +898,10 @@ impl TmuxOrchestrator {
                     let pane_id = pane.pane_id.clone();
                     pane.display_name = display_name.clone();
                     pane.model = model.clone();
+                    if is_codex_model_name(model) {
+                        pane.cache_expires_at_epoch = None;
+                        pane.estimated_rebuild_cost_dollars = None;
+                    }
                     let _ = Command::new("tmux")
                         .args(["select-pane", "-t", &pane_id, "-T", display_name])
                         .output();
@@ -846,12 +970,13 @@ impl TmuxOrchestrator {
             WatchEvent::ContextStatus {
                 session_id,
                 fill_percent,
-                context_window_tokens: _,
+                context_window_tokens,
                 turns_to_compact,
             } => {
                 self.ensure_pane_exists(session_id, cleanup_pane_ids);
                 if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
                     pane.fill_percent = Some(*fill_percent);
+                    pane.context_window_tokens = *context_window_tokens;
                     pane.turns_to_compact = *turns_to_compact;
                 }
                 self.render_status();
@@ -865,6 +990,41 @@ impl TmuxOrchestrator {
                 self.ensure_pane_exists(session_id, cleanup_pane_ids);
                 if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
                     pane.model_fallback = Some((requested.clone(), actual.clone()));
+                }
+                self.render_status();
+            }
+
+            WatchEvent::CodexTurnSummary {
+                session_id,
+                status,
+                requested_model,
+                served_model,
+                cached_input_tokens,
+                uncached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                total_tokens,
+                ..
+            } => {
+                self.ensure_pane_exists(session_id, cleanup_pane_ids);
+                if let Some(pane) = self.panes.get_mut(session_id.as_str()) {
+                    pane.model = served_model.as_ref().unwrap_or(requested_model).to_string();
+                    if served_model
+                        .as_ref()
+                        .is_some_and(|served| served != requested_model)
+                    {
+                        pane.model_fallback = Some((requested_model.clone(), pane.model.clone()));
+                    }
+                    pane.cache_expires_at_epoch = None;
+                    pane.estimated_rebuild_cost_dollars = None;
+                    pane.codex_turn = Some(CodexPaneTurnSummary {
+                        status: status.clone(),
+                        cached_input_tokens: *cached_input_tokens,
+                        uncached_input_tokens: *uncached_input_tokens,
+                        output_tokens: *output_tokens,
+                        reasoning_output_tokens: *reasoning_output_tokens,
+                        total_tokens: *total_tokens,
+                    });
                 }
                 self.render_status();
             }
@@ -1009,7 +1169,11 @@ impl TmuxOrchestrator {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_count, format_duration, format_observed_tool_calls, Activity, ManagedPane};
+    use super::{
+        codex_turn_hint_text, context_hint_text, format_count, format_duration,
+        format_observed_tool_calls, model_change_hint_label, pane_model_label, Activity,
+        CodexPaneTurnSummary, ManagedPane,
+    };
     use crate::WatchEvent;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -1027,8 +1191,10 @@ mod tests {
             cache_expires_at_epoch: None,
             estimated_rebuild_cost_dollars: None,
             fill_percent: None,
+            context_window_tokens: None,
             turns_to_compact: None,
             model_fallback: None,
+            codex_turn: None,
             applied_activity: None,
         }
     }
@@ -1071,6 +1237,46 @@ mod tests {
         assert_eq!(format_observed_tool_calls(0), "no tool calls seen");
         assert_eq!(format_observed_tool_calls(1), "1 tool call seen");
         assert_eq!(format_observed_tool_calls(2), "2 tool calls seen");
+    }
+
+    #[test]
+    fn codex_pane_labels_do_not_use_anthropic_cache_language() {
+        assert_eq!(
+            pane_model_label("gpt-codex-fixture"),
+            "CODEX \u{00b7} gpt-codex-fixture"
+        );
+        assert_eq!(
+            pane_model_label("claude-sonnet-fixture"),
+            "UNPORTED ANTHROPIC \u{00b7} claude-sonnet-fixture"
+        );
+        assert_eq!(
+            model_change_hint_label("gpt-codex-fixture", "gpt-codex-served"),
+            "model change"
+        );
+
+        let context =
+            context_hint_text("    ", 75.0, Some(200_000), None).expect("context hint visible");
+        assert_eq!(
+            context,
+            "    context 75% of 200K window \u{00b7} trajectory unknown"
+        );
+
+        let turn = codex_turn_hint_text(
+            "    ",
+            &CodexPaneTurnSummary {
+                status: "completed".to_string(),
+                cached_input_tokens: 512,
+                uncached_input_tokens: 768,
+                output_tokens: 96,
+                reasoning_output_tokens: 32,
+                total_tokens: 1_376,
+            },
+        );
+        assert!(turn.contains("codex completed"));
+        assert!(turn.contains("cached input 512"));
+        assert!(turn.contains("reasoning 32"));
+        assert!(!turn.contains("expires"));
+        assert!(!turn.contains("rebuild"));
     }
 
     #[test]
@@ -1211,6 +1417,7 @@ mod tests {
         );
         let pane = orchestrator.panes.get("session_a").expect("pane");
         assert_eq!(pane.fill_percent, Some(82.0));
+        assert_eq!(pane.context_window_tokens, Some(200_000));
         assert_eq!(pane.turns_to_compact, Some(1));
 
         orchestrator.handle_event(
@@ -1228,6 +1435,44 @@ mod tests {
                 .expect("pane")
                 .model_fallback,
             Some(("opus".to_string(), "sonnet".to_string()))
+        );
+
+        orchestrator.handle_event(
+            &WatchEvent::CodexTurnSummary {
+                session_id: "session_a".to_string(),
+                status: "incomplete".to_string(),
+                requested_model: "gpt-codex-fixture".to_string(),
+                served_model: Some("gpt-codex-served".to_string()),
+                input_tokens: 1_280,
+                cached_input_tokens: 512,
+                uncached_input_tokens: 768,
+                output_tokens: 96,
+                reasoning_output_tokens: 32,
+                total_tokens: 1_376,
+            },
+            &cleanup,
+        );
+        let pane = orchestrator.panes.get("session_a").expect("pane");
+        assert_eq!(pane.model, "gpt-codex-served");
+        assert_eq!(
+            pane.model_fallback,
+            Some((
+                "gpt-codex-fixture".to_string(),
+                "gpt-codex-served".to_string()
+            ))
+        );
+        assert_eq!(pane.cache_expires_at_epoch, None);
+        assert_eq!(pane.estimated_rebuild_cost_dollars, None);
+        assert_eq!(
+            pane.codex_turn,
+            Some(CodexPaneTurnSummary {
+                status: "incomplete".to_string(),
+                cached_input_tokens: 512,
+                uncached_input_tokens: 768,
+                output_tokens: 96,
+                reasoning_output_tokens: 32,
+                total_tokens: 1_376,
+            })
         );
 
         orchestrator

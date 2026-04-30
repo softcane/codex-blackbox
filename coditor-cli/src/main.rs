@@ -227,6 +227,19 @@ pub(crate) enum WatchEvent {
         requested: String,
         actual: String,
     },
+    CodexTurnSummary {
+        session_id: String,
+        status: String,
+        requested_model: String,
+        #[serde(default)]
+        served_model: Option<String>,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        uncached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_output_tokens: u64,
+        total_tokens: u64,
+    },
     ContextStatus {
         session_id: String,
         fill_percent: f64,
@@ -1525,6 +1538,7 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::Diagnosis { session_id, .. }
         | WatchEvent::CacheWarning { session_id, .. }
         | WatchEvent::ModelFallback { session_id, .. }
+        | WatchEvent::CodexTurnSummary { session_id, .. }
         | WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
         WatchEvent::Lagged { .. } | WatchEvent::RateLimitStatus { .. } => None,
     }
@@ -1581,6 +1595,111 @@ fn print_tagged(tag: &str, line: &str) {
     }
 }
 
+fn is_codex_model_name(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("codex")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+}
+
+fn is_anthropic_model_name(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("claude-")
+}
+
+fn watch_model_label(model: &str) -> String {
+    if is_codex_model_name(model) {
+        format!("CODEX \u{00b7} {model}")
+    } else if is_anthropic_model_name(model) {
+        format!("UNPORTED ANTHROPIC \u{00b7} {model}")
+    } else {
+        model.to_string()
+    }
+}
+
+fn model_change_label(requested: &str, actual: &str) -> &'static str {
+    if is_anthropic_model_name(requested) || is_anthropic_model_name(actual) {
+        "UNPORTED MODEL FALLBACK"
+    } else {
+        "MODEL CHANGE"
+    }
+}
+
+fn model_change_line(time: &str, requested: &str, actual: &str) -> String {
+    format!(
+        "{}  \u{26a0}  {}  requested {}, served {}",
+        time,
+        model_change_label(requested, actual),
+        requested,
+        actual
+    )
+}
+
+fn context_window_label(context_window_tokens: Option<u64>) -> String {
+    context_window_tokens
+        .map(|tokens| format!(" of {} window", format_tokens(tokens)))
+        .unwrap_or_default()
+}
+
+fn context_status_line(
+    time: &str,
+    fill_percent: f64,
+    context_window_tokens: Option<u64>,
+    turns_to_compact: Option<u32>,
+) -> String {
+    let label = match turns_to_compact {
+        Some(0) => "at compaction threshold".to_string(),
+        Some(n) => format!("~{} turns to compaction", n),
+        None => "trajectory unknown".to_string(),
+    };
+    format!(
+        "{}  CONTEXT  {:.0}%{} \u{00b7} {}",
+        time,
+        fill_percent,
+        context_window_label(context_window_tokens),
+        label
+    )
+}
+
+fn codex_turn_summary_line(
+    time: &str,
+    status: &str,
+    requested_model: &str,
+    served_model: Option<&str>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+) -> String {
+    let model_part = match served_model {
+        Some(served) if served != requested_model => {
+            format!("requested {}, served {}", requested_model, served)
+        }
+        Some(served) => format!("served {}", served),
+        None => format!("requested {}", requested_model),
+    };
+    let reasoning_part = if reasoning_output_tokens > 0 {
+        format!(" + {} reasoning", format_tokens(reasoning_output_tokens))
+    } else {
+        String::new()
+    };
+    format!(
+        "{}  CODEX   {} \u{00b7} {} \u{00b7} input {} ({} cached, {} uncached) \u{00b7} output {}{} \u{00b7} total {}",
+        time,
+        status,
+        model_part,
+        format_tokens(input_tokens),
+        format_tokens(cached_input_tokens),
+        format_tokens(uncached_input_tokens),
+        format_tokens(output_tokens),
+        reasoning_part,
+        format_tokens(total_tokens)
+    )
+}
+
 fn parse_mcp_tool_name(tool_name: &str) -> Option<(&str, &str)> {
     let rest = tool_name.trim().strip_prefix("mcp__")?;
     let (server, tool) = rest.split_once("__")?;
@@ -1635,9 +1754,10 @@ fn render_event(
             initial_prompt,
         } => {
             let time = now_hms();
+            let model_label = watch_model_label(model);
             let header_inner = format!(
                 "  {}  \u{00b7}  {}  \u{00b7}  {}  ",
-                display_name, model, time
+                display_name, model_label, time
             );
             // Second line carries the user's prompt, if we captured one.
             let prompt_inner = initial_prompt
@@ -1908,20 +2028,51 @@ fn render_event(
             let time = now_hms();
             print_tagged(
                 &tag,
-                &format!(
-                    "{}  \u{26a0}  MODEL FALLBACK  requested {}, got {}",
-                    time, requested, actual
-                )
-                .yellow()
-                .bold()
-                .to_string(),
+                &model_change_line(&time, requested, actual)
+                    .yellow()
+                    .bold()
+                    .to_string(),
             );
+        }
+
+        WatchEvent::CodexTurnSummary {
+            session_id: _,
+            status,
+            requested_model,
+            served_model,
+            input_tokens,
+            cached_input_tokens,
+            uncached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+        } => {
+            let time = now_hms();
+            let line = codex_turn_summary_line(
+                &time,
+                status,
+                requested_model,
+                served_model.as_deref(),
+                *input_tokens,
+                *cached_input_tokens,
+                *uncached_input_tokens,
+                *output_tokens,
+                *reasoning_output_tokens,
+                *total_tokens,
+            );
+            let colored = match status.as_str() {
+                "completed" => line.green().to_string(),
+                "failed" => line.red().bold().to_string(),
+                "incomplete" => line.yellow().bold().to_string(),
+                _ => line.yellow().to_string(),
+            };
+            print_tagged(&tag, &colored);
         }
 
         WatchEvent::ContextStatus {
             session_id: _,
             fill_percent,
-            context_window_tokens: _,
+            context_window_tokens,
             turns_to_compact,
         } => {
             // Only show context status when it actually matters — avoid
@@ -1930,14 +2081,11 @@ fn render_event(
                 return;
             }
             let time = now_hms();
-            let label = match turns_to_compact {
-                Some(n) if *n == 0 => "AT COMPACTION THRESHOLD".to_string(),
-                Some(n) => format!("~{} turns to auto-compact", n),
-                None => "trajectory unknown".to_string(),
-            };
-            let line = format!(
-                "{}  CONTEXT  {:.0}% full \u{00b7} {}",
-                time, fill_percent, label
+            let line = context_status_line(
+                &time,
+                *fill_percent,
+                *context_window_tokens,
+                *turns_to_compact,
             );
             let colored = if *fill_percent >= 80.0 {
                 line.red().bold().to_string()
@@ -2631,11 +2779,11 @@ async fn connect_and_stream(
 mod tests {
     use super::{
         build_child_run_plan, codex_config_overrides, codex_proxy_base_url,
-        compact_datetime_from_iso, event_session_id, extract_run_watch, format_duration_coarse,
-        format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique,
-        render_child_run_plan, render_codex_config_preview, shell_join, shell_quote,
-        truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands, ConfigCommands, RunMode,
-        WatchEvent,
+        codex_turn_summary_line, compact_datetime_from_iso, context_status_line, event_session_id,
+        extract_run_watch, format_duration_coarse, format_tokens, local_time_from_iso,
+        model_change_line, parse_mcp_tool_name, push_unique, render_child_run_plan,
+        render_codex_config_preview, shell_join, shell_quote, truncate_for_box, watch_model_label,
+        yaml_quote, ActiveSessions, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -2760,6 +2908,53 @@ mod tests {
             "coditor 'hello world'"
         );
         assert_eq!(yaml_quote(r#"a\b"c"#), r#""a\\b\"c""#);
+    }
+
+    #[test]
+    fn watch_labels_codex_models_without_anthropic_branding() {
+        assert_eq!(
+            watch_model_label("gpt-codex-fixture"),
+            "CODEX \u{00b7} gpt-codex-fixture"
+        );
+        assert_eq!(
+            watch_model_label("claude-sonnet-fixture"),
+            "UNPORTED ANTHROPIC \u{00b7} claude-sonnet-fixture"
+        );
+
+        let line = model_change_line("12:00:00", "gpt-codex", "gpt-codex-served");
+        assert!(line.contains("MODEL CHANGE"));
+        assert!(line.contains("served gpt-codex-served"));
+        assert!(!line.contains("Anthropic"));
+        assert!(!line.contains("fallback"));
+    }
+
+    #[test]
+    fn watch_context_and_codex_turn_lines_use_codex_token_language() {
+        let context = context_status_line("12:00:00", 75.0, Some(200_000), None);
+        assert_eq!(
+            context,
+            "12:00:00  CONTEXT  75% of 200K window \u{00b7} trajectory unknown"
+        );
+        assert!(!context.contains("cache"));
+
+        let summary = codex_turn_summary_line(
+            "12:00:00",
+            "completed",
+            "gpt-codex-fixture",
+            Some("gpt-codex-served"),
+            1_280,
+            512,
+            768,
+            96,
+            32,
+            1_376,
+        );
+        assert!(summary.contains("CODEX   completed"));
+        assert!(summary.contains("input 1K (512 cached, 768 uncached)"));
+        assert!(summary.contains("output 96 + 32 reasoning"));
+        assert!(summary.contains("total 1K"));
+        assert!(!summary.contains("expires"));
+        assert!(!summary.contains("rebuild"));
     }
 
     #[test]
@@ -3119,6 +3314,21 @@ mod tests {
             summary: "src/main.rs".to_string(),
         };
         assert_eq!(event_session_id(&event), Some("session_a"));
+        assert_eq!(
+            event_session_id(&WatchEvent::CodexTurnSummary {
+                session_id: "session_codex".to_string(),
+                status: "completed".to_string(),
+                requested_model: "gpt-codex-fixture".to_string(),
+                served_model: None,
+                input_tokens: 10,
+                cached_input_tokens: 4,
+                uncached_input_tokens: 6,
+                output_tokens: 2,
+                reasoning_output_tokens: 1,
+                total_tokens: 12,
+            }),
+            Some("session_codex")
+        );
 
         assert_eq!(
             event_session_id(&WatchEvent::RateLimitStatus {

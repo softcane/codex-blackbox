@@ -142,6 +142,9 @@ Codex watch events are limited to:
 - `ContextStatus` using `input_tokens / context_window_tokens`; cached input is
   not added again.
 - `ModelFallback` when requested and served models differ.
+- `CodexTurnSummary` with Codex-native status, requested/served model, cached
+  input, uncached input, output, reasoning output, and total token fields. This
+  does not imply Anthropic cache TTL/rebuild behavior.
 
 Codex metrics record request count, input tokens, output tokens, duration,
 context status, and model fallback labels where applicable. Unknown/untrusted

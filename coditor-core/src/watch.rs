@@ -90,13 +90,28 @@ pub enum WatchEvent {
         idle_secs: u64,
         ttl_secs: u64,
     },
-    /// Anthropic routed the request to a different model than the user asked
-    /// for — typically a silent Opus→Sonnet quota fallback. Emitted once per
-    /// turn when a mismatch is detected.
+    /// The served model differed from the user-requested model. Anthropic
+    /// fallback and Codex requested-vs-served changes both use this event.
     ModelFallback {
         session_id: String,
         requested: String,
         actual: String,
+    },
+    /// Codex-native per-turn accounting summary. This is intentionally separate
+    /// from `CacheEvent`: Codex cached input has no Anthropic TTL/rebuild
+    /// semantics.
+    CodexTurnSummary {
+        session_id: String,
+        status: String,
+        requested_model: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        uncached_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_output_tokens: u64,
+        total_tokens: u64,
     },
     /// Per-turn context-window status. `fill_percent` follows the active
     /// provider finalization rule: copied Anthropic fallback includes cache
@@ -324,5 +339,37 @@ mod tests {
             &history[0],
             WatchEvent::ToolUse { session_id, .. } if session_id == "session_1"
         ));
+    }
+
+    #[test]
+    fn codex_turn_summary_serializes_native_token_fields_without_cache_ttl() {
+        let json = serde_json::to_value(WatchEvent::CodexTurnSummary {
+            session_id: "session_codex".to_string(),
+            status: "completed".to_string(),
+            requested_model: "gpt-codex-fixture".to_string(),
+            served_model: Some("gpt-codex-served".to_string()),
+            input_tokens: 1280,
+            cached_input_tokens: 512,
+            uncached_input_tokens: 768,
+            output_tokens: 96,
+            reasoning_output_tokens: 32,
+            total_tokens: 1376,
+        })
+        .expect("serialize codex turn summary");
+
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("codex_turn_summary")
+        );
+        assert_eq!(
+            json.get("cached_input_tokens").and_then(|v| v.as_u64()),
+            Some(512)
+        );
+        assert_eq!(
+            json.get("reasoning_output_tokens").and_then(|v| v.as_u64()),
+            Some(32)
+        );
+        assert!(json.get("cache_expires_at_epoch").is_none());
+        assert!(json.get("estimated_rebuild_cost_dollars").is_none());
     }
 }

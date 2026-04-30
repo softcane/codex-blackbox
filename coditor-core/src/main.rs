@@ -3089,6 +3089,19 @@ fn build_codex_finalization_outcome(
             }
         }
 
+        watch_events.push(watch::WatchEvent::CodexTurnSummary {
+            session_id: accounting.identity.session_id.clone(),
+            status: codex_status_label(&accounting.status).to_string(),
+            requested_model: accounting.requested_model.clone(),
+            served_model: accounting.served_model.clone(),
+            input_tokens: accounting.input_tokens,
+            cached_input_tokens: accounting.cached_input_tokens,
+            uncached_input_tokens: accounting.uncached_input_tokens,
+            output_tokens: accounting.output_tokens,
+            reasoning_output_tokens: accounting.reasoning_output_tokens,
+            total_tokens: accounting.total_tokens,
+        });
+
         watch_events.push(watch::WatchEvent::ContextStatus {
             session_id: accounting.identity.session_id.clone(),
             fill_percent: context_fill_percent,
@@ -5681,6 +5694,7 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::Diagnosis { session_id, .. }
         | watch::WatchEvent::CacheWarning { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
+        | watch::WatchEvent::CodexTurnSummary { session_id, .. }
         | watch::WatchEvent::ContextStatus { session_id, .. } => session_id == want,
         watch::WatchEvent::RateLimitStatus { .. } => true,
     }
@@ -7320,6 +7334,25 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             |event| matches!(event, super::watch::WatchEvent::ContextStatus { session_id, .. }
                 if session_id == "phase-4b-session-001")
         ));
+        assert!(outcome.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::CodexTurnSummary {
+                    session_id,
+                    status,
+                    requested_model,
+                    served_model: Some(served_model),
+                    cached_input_tokens,
+                    reasoning_output_tokens,
+                    ..
+                } if session_id == "phase-4b-session-001"
+                    && status == "completed"
+                    && requested_model == "gpt-codex-fixture"
+                    && served_model == "gpt-codex-fixture"
+                    && *cached_input_tokens == 512
+                    && *reasoning_output_tokens == 32
+            )
+        }));
         assert!(!outcome
             .watch_events
             .iter()
@@ -7415,6 +7448,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             incomplete_outcome.accounting.status,
             super::codex_accounting::CodexTurnStatus::Incomplete
         );
+        assert!(failed_outcome.watch_events.iter().any(|event| {
+            matches!(event, super::watch::WatchEvent::CodexTurnSummary { status, .. }
+                if status == "failed")
+        }));
+        assert!(incomplete_outcome.watch_events.iter().any(|event| {
+            matches!(event, super::watch::WatchEvent::CodexTurnSummary { status, .. }
+                if status == "incomplete")
+        }));
     }
 
     #[test]
