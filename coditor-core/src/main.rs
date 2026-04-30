@@ -3177,6 +3177,7 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
         outcome.accounting.output_tokens,
         outcome.accounting.reasoning_output_tokens,
         outcome.accounting.total_tokens,
+        outcome.accounting.pricing.cost_dollars.unwrap_or(0.0),
         duration.as_secs_f64(),
     );
     metrics::record_context_fill_percent(

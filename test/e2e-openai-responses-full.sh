@@ -630,6 +630,7 @@ if dashboard.get("uid") != "coditor-main":
     fail("Grafana dashboard uid mismatch")
 panel_titles = {panel.get("title") for panel in dashboard.get("panels", [])}
 required_panel_titles = {
+    "Estimated Codex cost last 7d",
     "Codex/OpenAI requests since start",
     "Codex/OpenAI tokens by kind",
     "Codex context fill p95",
@@ -638,6 +639,23 @@ required_panel_titles = {
 for title in required_panel_titles:
     if title not in panel_titles:
         fail(f"Grafana dashboard missing panel {title!r}")
+
+cost_panel = next(
+    panel
+    for panel in dashboard.get("panels", [])
+    if panel.get("title") == "Estimated Codex cost last 7d"
+)
+cost_targets = cost_panel.get("targets") or []
+if len(cost_targets) != 1:
+    fail("Grafana Codex cost panel should have exactly one target")
+cost_target = cost_targets[0]
+cost_expr = cost_target.get("expr", "")
+if "coditor_history_estimated_spend_dollars_by_model" not in cost_expr:
+    fail("Grafana Codex cost panel must use per-model Codex spend gauges")
+if "gpt-5" not in cost_expr or "claude" in cost_expr.lower():
+    fail(f"Grafana Codex cost panel has non-Codex model filter: {cost_expr}")
+if cost_target.get("instant") is not True or cost_target.get("range") is not False:
+    fail("Grafana Codex cost panel must use an instant query")
 
 metric_names = {
     item["metric"]["__name__"]

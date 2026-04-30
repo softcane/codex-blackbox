@@ -517,6 +517,7 @@ pub fn record_codex_turn(
     output_tokens: u64,
     reasoning_output_tokens: u64,
     total_tokens: u64,
+    estimated_cost_dollars: f64,
     duration_seconds: f64,
 ) {
     let model = normalize_model(model);
@@ -549,6 +550,10 @@ pub fn record_codex_turn(
         .tokens_total
         .with_label_values(&[provider, model, "total"])
         .inc_by(total_tokens);
+    METRICS
+        .estimated_cost_dollars_total
+        .with_label_values(&[model])
+        .inc_by(estimated_cost_dollars.max(0.0));
     METRICS
         .turn_duration_seconds
         .with_label_values(&[model])
@@ -1096,7 +1101,8 @@ pub fn mcp_tool_labels(tool_name: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        init, mcp_tool_labels, record_context_fill_percent, record_degraded_cause, render,
+        init, mcp_tool_labels, record_codex_turn, record_context_fill_percent,
+        record_degraded_cause, render,
     };
 
     #[test]
@@ -1128,11 +1134,19 @@ mod tests {
         init();
         record_context_fill_percent("codex_responses", "gpt-codex-fixture", 42.0);
         record_degraded_cause("session-id-like-cause-phase-8b");
+        record_codex_turn("gpt-5.5", 1_280, 512, 768, 96, 32, 1_376, 0.006976, 1.5);
 
         let (_, body) = render().expect("render metrics");
         assert!(body.contains(
             "coditor_context_fill_percent_count{model=\"gpt-codex\",provider=\"codex_responses\"}"
         ));
+        assert!(
+            body.lines().any(|line| {
+                line.starts_with("coditor_estimated_cost_dollars_total{model=\"gpt-5.5\"}")
+                    && !line.ends_with(" 0")
+            }),
+            "Codex estimated cost counter should track nonzero known-model estimates"
+        );
         assert!(
             body.contains("coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}")
         );

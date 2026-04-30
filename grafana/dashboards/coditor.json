@@ -94,13 +94,15 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_estimated_spend_dollars{window=\"7d\"}",
+          "expr": "sum(coditor_history_estimated_spend_dollars_by_model{window=\"7d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"})",
+          "instant": true,
           "legendFormat": "",
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Estimated cost last 7d",
-      "description": "Rolling 7-day estimated spend from persisted historical gauges.",
+      "title": "Estimated Codex cost last 7d",
+      "description": "Rolling 7-day estimated Codex spend from persisted per-model historical gauges.",
       "type": "stat"
     },
     {

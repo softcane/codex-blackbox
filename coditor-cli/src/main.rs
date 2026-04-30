@@ -74,7 +74,7 @@ enum Commands {
         tmux: bool,
 
         /// Max tmux panes before refusing new sessions
-        #[arg(long, default_value = "4")]
+        #[arg(long, default_value = "8")]
         tmux_max_panes: usize,
     },
 
@@ -3468,7 +3468,7 @@ mod tests {
         assert!(!no_signals);
         assert_eq!(session, None);
         assert!(!tmux);
-        assert_eq!(tmux_max_panes, 4);
+        assert_eq!(tmux_max_panes, 8);
 
         let cli = Cli::try_parse_from(["coditor", "sessions"]).expect("sessions parses");
         let Commands::Sessions { url, limit, days } = cli.command else {
