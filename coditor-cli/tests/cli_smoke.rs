@@ -1,12 +1,14 @@
 // UNPORTED/DEFERRED: copied baseline from Phase 0A for workspace shape only.
 // This still validates Anthropic-shaped behavior and is not Coditor validation.
 
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn coditor(args: &[&str]) -> Output {
     coditor_with_env(args, &[])
@@ -94,15 +96,26 @@ fn captured_request(rx: mpsc::Receiver<String>) -> String {
         .expect("captured HTTP request")
 }
 
+fn unique_test_dir(label: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "coditor-cli-smoke-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&path).expect("create test dir");
+    path
+}
+
 #[test]
 fn top_level_help_exposes_user_workflows() {
     let output = coditor(&["--help"]);
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(
-        out.contains("Coditor observability proxy. Codex runtime wiring is not implemented yet.")
-    );
+    assert!(out.contains("Coditor observability proxy. Codex API-key wrapper is experimental."));
     assert!(out.contains("doctor"));
     assert!(out.contains("up"));
     assert!(out.contains("run"));
@@ -119,9 +132,10 @@ fn run_help_documents_watch_and_trailing_child_command() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Run a command through the copied proxy path"));
-    assert!(out.contains("ANTHROPIC_BASE_URL"));
+    assert!(out.contains("Run a command through Coditor"));
+    assert!(out.contains("experimental API-key proxy overrides"));
     assert!(out.contains("--watch"));
+    assert!(out.contains("--dry-run"));
     assert!(out.contains("Command and arguments to run"));
 }
 
@@ -132,11 +146,17 @@ fn config_codex_prints_read_only_future_override() {
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
     assert!(out.contains("Coditor Codex config preview (read-only)"));
-    assert!(out.contains("real Codex runtime wiring is not implemented yet"));
+    assert!(out.contains("experimental manual OpenAI API-key wrapper"));
     assert!(out.contains("docker compose -f docker-compose.yml -f docker-compose.openai.yml up -d"));
-    assert!(out.contains("[model_providers.coditor-openai-responses]"));
-    assert!(out.contains(r#"base_url = "http://127.0.0.1:10000/v1""#));
-    assert!(out.contains(r#"env_key = "OPENAI_API_KEY""#));
+    assert!(out.contains("~/.codex/config.toml is not modified"));
+    assert!(out.contains(r#"-c 'model_provider="coditor-openai-responses"'"#));
+    assert!(out.contains(
+        r#"-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'"#
+    ));
+    assert!(
+        out.contains(r#"-c 'model_providers.coditor-openai-responses.env_key="OPENAI_API_KEY"'"#)
+    );
+    assert!(out.contains("-c features.enable_request_compression=false"));
     assert!(out.contains("ChatGPT-auth Codex backend routing is not supported or verified"));
 }
 
@@ -146,6 +166,57 @@ fn run_command_requires_child_command() {
 
     assert!(!output.status.success());
     assert!(stderr(&output).contains("required"));
+}
+
+#[test]
+fn codex_dry_run_prints_overrides_and_preserves_user_args() {
+    let output = coditor(&["run", "--dry-run", "codex", "exec", "hello", "--json"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Mode: experimental Codex API-key proxy"));
+    assert!(out.contains("Config files: not modified"));
+    assert!(out.contains("Environment overrides:\n  (none)"));
+    assert!(out.contains(r#"codex -c 'model_provider="coditor-openai-responses"'"#));
+    assert!(out.contains(
+        r#"-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'"#
+    ));
+    assert!(out.contains(r#"-c 'model_providers.coditor-openai-responses.wire_api="responses"'"#));
+    assert!(out.contains("-c features.enable_request_compression=false"));
+    assert!(out.contains("exec hello --json"));
+}
+
+#[test]
+fn non_codex_dry_run_keeps_unported_anthropic_fallback() {
+    let output = coditor(&["run", "--dry-run", "/bin/sh", "-c", "echo ok"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Mode: UNPORTED copied Anthropic fallback"));
+    assert!(out.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:10000"));
+    assert!(!out.contains("coditor-openai-responses"));
+    assert!(!out.contains("features.enable_request_compression=false"));
+}
+
+#[test]
+fn codex_dry_run_does_not_mutate_codex_home_config() {
+    let dir = unique_test_dir("codex-home");
+    let config_path = dir.join("config.toml");
+    let original = "model = \"gpt-5\"\n";
+    fs::write(&config_path, original).expect("write codex config");
+
+    let output = coditor_with_env(
+        &["run", "--dry-run", "codex", "exec", "hello"],
+        &[("CODEX_HOME", dir.to_str().expect("utf8 temp dir"))],
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read codex config"),
+        original
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

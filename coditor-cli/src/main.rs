@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 #[command(
     name = "coditor",
     version,
-    about = "Coditor observability proxy. Codex runtime wiring is not implemented yet."
+    about = "Coditor observability proxy. Codex API-key wrapper is experimental."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,11 +36,15 @@ enum Commands {
         no_grafana: bool,
     },
 
-    /// Run a command through the copied proxy path. UNPORTED: still uses ANTHROPIC_BASE_URL.
+    /// Run a command through Coditor. Codex uses experimental API-key proxy overrides.
     Run {
         /// Start coditor watch alongside the child command
         #[arg(long)]
         watch: bool,
+
+        /// Print the constructed child command without running it
+        #[arg(long)]
+        dry_run: bool,
 
         /// Command and arguments to run
         #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
@@ -140,7 +144,7 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommands {
-    /// Print the intended future Codex proxy configuration without applying it
+    /// Print the Codex proxy configuration used by the run wrapper without applying it
     Codex,
 }
 
@@ -301,6 +305,10 @@ const CODITOR_CORE_URL: &str = "http://127.0.0.1:9091";
 const CODITOR_CORE_HEALTH_URL: &str = "http://127.0.0.1:9091/health";
 const GRAFANA_URL: &str = "http://127.0.0.1:3000";
 const GRAFANA_DASHBOARD_URL: &str = "http://127.0.0.1:3000/d/coditor-main";
+const CODEX_PROVIDER_ID: &str = "coditor-openai-responses";
+const CODEX_PROVIDER_NAME: &str = "Coditor OpenAI Responses proxy";
+const CODEX_API_KEY_ENV: &str = "OPENAI_API_KEY";
+const CODEX_REQUEST_COMPRESSION_FEATURE: &str = "enable_request_compression";
 const DEFAULT_CORE_IMAGE: &str =
     concat!("ghcr.io/softcane/coditor-core:v", env!("CARGO_PKG_VERSION"));
 const BUNDLED_ENVOY_YAML: &str = include_str!("../../envoy/envoy.yaml");
@@ -797,7 +805,7 @@ fn push_unique(lines: &mut Vec<String>, line: impl Into<String>) {
 
 async fn run_doctor() -> i32 {
     println!("Coditor doctor");
-    println!("Status: real Codex runtime wiring is not implemented yet.");
+    println!("Status: experimental manual Codex API-key wrapper is available.");
     println!("Default stack: UNPORTED copied Anthropic-shaped Envoy baseline.");
     println!();
 
@@ -820,7 +828,7 @@ async fn run_doctor() -> i32 {
             print_check("⚠", "codex CLI not found in PATH");
             push_unique(
                 &mut fixes,
-                "Install Codex CLI before future `coditor run -- codex ...` wiring is used.",
+                "Install Codex CLI before using `coditor run -- codex ...`.",
             );
         }
     }
@@ -972,7 +980,7 @@ async fn run_doctor() -> i32 {
     println!();
     print_check(
         "⚠",
-        "real `coditor run -- codex ...` wiring is still not implemented",
+        "`coditor run -- codex ...` uses manual OpenAI API-key proxy overrides",
     );
     print_check(
         "⚠",
@@ -1053,7 +1061,7 @@ async fn run_up(no_grafana: bool) -> i32 {
         Ok(()) => {
             println!();
             println!("Coditor is up.");
-            println!("  UNPORTED: copied baseline, Codex support not implemented yet.");
+            println!("  UNPORTED: default stack is still the copied Anthropic-shaped baseline.");
             println!("  Envoy proxy:    {ENVOY_PROXY_URL}");
             println!("  Coditor core: {CODITOR_CORE_URL}");
             println!("  Grafana:        {GRAFANA_DASHBOARD_URL}");
@@ -1164,10 +1172,169 @@ fn exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RunMode {
+    CodexApiKeyProxy,
+    TemporaryUnportedAnthropicFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChildRunPlan {
+    command: String,
+    args: Vec<String>,
+    envs: Vec<(String, String)>,
+    mode: RunMode,
+}
+
+fn is_codex_command(command: &str) -> bool {
+    let path = Path::new(command);
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let file_stem = file_name.strip_suffix(".exe").unwrap_or(file_name);
+    file_stem == "codex"
+}
+
+fn toml_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn codex_config_overrides(proxy_base_url: &str) -> Vec<String> {
+    vec![
+        format!("model_provider={}", toml_string_literal(CODEX_PROVIDER_ID)),
+        format!(
+            "model_providers.{CODEX_PROVIDER_ID}.name={}",
+            toml_string_literal(CODEX_PROVIDER_NAME)
+        ),
+        format!(
+            "model_providers.{CODEX_PROVIDER_ID}.base_url={}",
+            toml_string_literal(proxy_base_url)
+        ),
+        format!(
+            "model_providers.{CODEX_PROVIDER_ID}.env_key={}",
+            toml_string_literal(CODEX_API_KEY_ENV)
+        ),
+        format!(
+            "model_providers.{CODEX_PROVIDER_ID}.wire_api={}",
+            toml_string_literal("responses")
+        ),
+        "forced_login_method=\"api\"".to_string(),
+        format!("features.{CODEX_REQUEST_COMPRESSION_FEATURE}=false"),
+    ]
+}
+
+fn codex_config_args(proxy_base_url: &str) -> Vec<String> {
+    codex_config_overrides(proxy_base_url)
+        .into_iter()
+        .flat_map(|override_arg| ["-c".to_string(), override_arg])
+        .collect()
+}
+
+fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String> {
+    let Some(command) = child_command.first() else {
+        return Err("missing command after `coditor run`".to_string());
+    };
+    let command_args = &child_command[1..];
+
+    if is_codex_command(command) {
+        let mut args = codex_config_args(&codex_proxy_base_url());
+        args.extend(command_args.iter().cloned());
+        return Ok(ChildRunPlan {
+            command: command.clone(),
+            args,
+            envs: Vec::new(),
+            mode: RunMode::CodexApiKeyProxy,
+        });
+    }
+
+    Ok(ChildRunPlan {
+        command: command.clone(),
+        args: command_args.to_vec(),
+        envs: vec![("ANTHROPIC_BASE_URL".to_string(), envoy_proxy_url())],
+        mode: RunMode::TemporaryUnportedAnthropicFallback,
+    })
+}
+
+fn render_child_run_plan(plan: &ChildRunPlan) -> String {
+    let mut lines = Vec::new();
+    lines.push("Coditor run preview".to_string());
+    match plan.mode {
+        RunMode::CodexApiKeyProxy => {
+            lines.push("Mode: experimental Codex API-key proxy".to_string());
+            lines.push(format!("Proxy base URL: {}", codex_proxy_base_url()));
+            lines.push("Config files: not modified".to_string());
+            lines.push(format!(
+                "Request compression: disabled with features.{CODEX_REQUEST_COMPRESSION_FEATURE}=false"
+            ));
+            lines.push("ChatGPT-auth Codex backend: unsupported/unverified".to_string());
+        }
+        RunMode::TemporaryUnportedAnthropicFallback => {
+            lines.push("Mode: UNPORTED copied Anthropic fallback".to_string());
+            lines.push("Config files: not modified".to_string());
+        }
+    }
+
+    lines.push("Command:".to_string());
+    let mut command = Vec::with_capacity(plan.args.len() + 1);
+    command.push(plan.command.clone());
+    command.extend(plan.args.iter().cloned());
+    lines.push(format!("  {}", shell_join(&command)));
+
+    lines.push("Environment overrides:".to_string());
+    if plan.envs.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (key, value) in &plan.envs {
+            lines.push(format!("  {key}={value}"));
+        }
+    }
+
+    lines.join("\n") + "\n"
+}
+
+fn print_child_run_status(plan: &ChildRunPlan) {
+    match plan.mode {
+        RunMode::CodexApiKeyProxy => {
+            eprintln!(
+                "Coditor: launching Codex with experimental manual OpenAI API-key proxy settings."
+            );
+            eprintln!("Coditor: proxy base URL {}", codex_proxy_base_url());
+            eprintln!("Coditor: command-line config overrides only; ~/.codex/config.toml is not modified.");
+            eprintln!(
+                "Coditor: request compression disabled via features.{CODEX_REQUEST_COMPRESSION_FEATURE}=false."
+            );
+            eprintln!("Coditor: ChatGPT-auth Codex backend routing is not supported or verified.");
+            if std::env::var_os(CODEX_API_KEY_ENV).is_none() {
+                eprintln!(
+                    "Coditor: warning: {CODEX_API_KEY_ENV} is unset; API-key mode may fail before reaching the proxy."
+                );
+            }
+        }
+        RunMode::TemporaryUnportedAnthropicFallback => {
+            eprintln!(
+                "UNPORTED: non-Codex child commands still use copied ANTHROPIC_BASE_URL fallback."
+            );
+        }
+    }
+}
+
 fn run_command_with_env(
     command: &str,
     args: &[String],
-    envs: &[(&str, &str)],
+    envs: &[(String, String)],
 ) -> Result<i32, String> {
     let mut child = Command::new(command);
     child.args(args);
@@ -1186,11 +1353,24 @@ fn run_command_with_env(
     Ok(exit_code(status))
 }
 
-async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
+async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>) -> i32 {
     let (watch, child_command) = extract_run_watch(watch_flag, command);
     if child_command.is_empty() {
         eprintln!("Error: missing command after `coditor run`");
         return 1;
+    }
+
+    let plan = match build_child_run_plan(&child_command) {
+        Ok(plan) => plan,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return 1;
+        }
+    };
+
+    if dry_run {
+        print!("{}", render_child_run_plan(&plan));
+        return 0;
     }
 
     if let Err(err) = ensure_stack_running().await {
@@ -1210,17 +1390,8 @@ async fn run_child_command(watch_flag: bool, command: Vec<String>) -> i32 {
         None
     };
 
-    let command_name = &child_command[0];
-    let command_args = &child_command[1..];
-    let proxy_url = envoy_proxy_url();
-    eprintln!(
-        "UNPORTED: copied baseline uses ANTHROPIC_BASE_URL; Codex support not implemented yet."
-    );
-    let result = run_command_with_env(
-        command_name,
-        command_args,
-        &[("ANTHROPIC_BASE_URL", proxy_url.as_str())],
-    );
+    print_child_run_status(&plan);
+    let result = run_command_with_env(&plan.command, &plan.args, &plan.envs);
 
     if let Some(handle) = watcher.as_mut() {
         handle.stop();
@@ -1240,22 +1411,24 @@ fn codex_proxy_base_url() -> String {
 }
 
 fn render_codex_config_preview() -> String {
-    let proxy_base_url = codex_proxy_base_url();
+    let overrides = codex_config_overrides(&codex_proxy_base_url())
+        .into_iter()
+        .map(|override_arg| format!("  -c {}", shell_quote(&override_arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+
     format!(
         r#"Coditor Codex config preview (read-only)
-Status: real Codex runtime wiring is not implemented yet.
+Status: experimental manual OpenAI API-key wrapper is available via:
+  coditor run -- codex ...
 
-Manual stack for future API-key experiments:
+Manual stack for API-key experiments:
   docker compose -f docker-compose.yml -f docker-compose.openai.yml up -d
 
-Intended future Codex config sketch; verify Codex's config schema before use:
-[model_providers.coditor-openai-responses]
-name = "Coditor OpenAI Responses proxy"
-base_url = "{proxy_base_url}"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"
+Coditor passes these command-line overrides; ~/.codex/config.toml is not modified:
+{overrides}
 
-# Not applied by Coditor yet.
+# API-key mode requires OPENAI_API_KEY in the environment.
 # ChatGPT-auth Codex backend routing is not supported or verified.
 "#
     )
@@ -2049,8 +2222,12 @@ async fn main() {
         Commands::Up { no_grafana } => {
             std::process::exit(run_up(no_grafana).await);
         }
-        Commands::Run { watch, command } => {
-            std::process::exit(run_child_command(watch, command).await);
+        Commands::Run {
+            watch,
+            dry_run,
+            command,
+        } => {
+            std::process::exit(run_child_command(watch, dry_run, command).await);
         }
         Commands::Watch {
             url,
@@ -2453,10 +2630,12 @@ async fn connect_and_stream(
 #[cfg(test)]
 mod tests {
     use super::{
+        build_child_run_plan, codex_config_overrides, codex_proxy_base_url,
         compact_datetime_from_iso, event_session_id, extract_run_watch, format_duration_coarse,
         format_tokens, local_time_from_iso, parse_mcp_tool_name, push_unique,
-        render_codex_config_preview, shell_join, shell_quote, truncate_for_box, yaml_quote,
-        ActiveSessions, Cli, Commands, ConfigCommands, WatchEvent,
+        render_child_run_plan, render_codex_config_preview, shell_join, shell_quote,
+        truncate_for_box, yaml_quote, ActiveSessions, Cli, Commands, ConfigCommands, RunMode,
+        WatchEvent,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -2635,9 +2814,15 @@ mod tests {
     fn run_watch_after_child_command_is_coditor_flag() {
         let cli = Cli::try_parse_from(["coditor", "run", "claude", "--watch"])
             .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            dry_run,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!dry_run);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
         assert_eq!(command, vec!["claude"]);
@@ -2647,9 +2832,15 @@ mod tests {
     fn run_watch_before_child_command_is_coditor_flag() {
         let cli = Cli::try_parse_from(["coditor", "run", "--watch", "claude"])
             .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            dry_run,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!dry_run);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
         assert_eq!(command, vec!["claude"]);
@@ -2666,9 +2857,15 @@ mod tests {
             "opus",
         ])
         .expect("run command parses");
-        let Commands::Run { watch, command } = cli.command else {
+        let Commands::Run {
+            watch,
+            dry_run,
+            command,
+        } = cli.command
+        else {
             panic!("expected run command");
         };
+        assert!(!dry_run);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(!watch);
         assert_eq!(
@@ -2680,6 +2877,95 @@ mod tests {
                 "opus"
             ]
         );
+    }
+
+    fn has_config_override(args: &[String], override_arg: &str) -> bool {
+        args.windows(2)
+            .any(|window| window[0] == "-c" && window[1] == override_arg)
+    }
+
+    #[test]
+    fn codex_run_plan_uses_api_key_proxy_config_overrides() {
+        let child_command = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "hello".to_string(),
+            "--json".to_string(),
+        ];
+        let plan = build_child_run_plan(&child_command).expect("codex run plan");
+        let overrides = codex_config_overrides(&codex_proxy_base_url());
+        let override_arg_count = overrides.len() * 2;
+
+        assert_eq!(plan.mode, RunMode::CodexApiKeyProxy);
+        assert_eq!(plan.command, "codex");
+        assert!(plan.envs.is_empty());
+        for override_arg in &overrides {
+            assert!(
+                has_config_override(&plan.args, override_arg),
+                "missing override {override_arg:?} in {:?}",
+                plan.args
+            );
+        }
+        assert!(has_config_override(
+            &plan.args,
+            "features.enable_request_compression=false"
+        ));
+        assert_eq!(
+            plan.args[override_arg_count..],
+            [
+                "exec".to_string(),
+                "hello".to_string(),
+                "--json".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_run_plan_handles_explicit_codex_path() {
+        let child_command = vec!["/opt/homebrew/bin/codex".to_string(), "--help".to_string()];
+        let plan = build_child_run_plan(&child_command).expect("codex path run plan");
+
+        assert_eq!(plan.mode, RunMode::CodexApiKeyProxy);
+        assert_eq!(plan.command, "/opt/homebrew/bin/codex");
+        assert!(plan.envs.is_empty());
+        assert!(plan.args.ends_with(&["--help".to_string()]));
+    }
+
+    #[test]
+    fn non_codex_run_plan_keeps_unported_anthropic_fallback() {
+        let child_command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf ok".to_string(),
+        ];
+        let plan = build_child_run_plan(&child_command).expect("fallback run plan");
+
+        assert_eq!(plan.mode, RunMode::TemporaryUnportedAnthropicFallback);
+        assert_eq!(plan.command, "/bin/sh");
+        assert_eq!(plan.args, ["-c".to_string(), "printf ok".to_string()]);
+        assert_eq!(
+            plan.envs,
+            vec![("ANTHROPIC_BASE_URL".to_string(), super::envoy_proxy_url())]
+        );
+        assert!(!plan
+            .args
+            .iter()
+            .any(|arg| arg.contains("coditor-openai-responses")));
+    }
+
+    #[test]
+    fn run_plan_preview_is_read_only_for_codex() {
+        let child_command = vec!["codex".to_string(), "exec".to_string(), "hello".to_string()];
+        let plan = build_child_run_plan(&child_command).expect("codex run plan");
+        let preview = render_child_run_plan(&plan);
+
+        assert!(preview.contains("Coditor run preview"));
+        assert!(preview.contains("experimental Codex API-key proxy"));
+        assert!(preview.contains("Config files: not modified"));
+        assert!(preview.contains("Environment overrides:\n  (none)"));
+        assert!(preview.contains("features.enable_request_compression=false"));
+        assert!(preview.contains("codex -c"));
+        assert!(preview.contains("exec hello"));
     }
 
     #[test]
@@ -2738,11 +3024,20 @@ mod tests {
         let preview = render_codex_config_preview();
 
         assert!(preview.contains("read-only"));
-        assert!(preview.contains("real Codex runtime wiring is not implemented yet"));
+        assert!(preview.contains("experimental manual OpenAI API-key wrapper"));
         assert!(preview.contains("docker-compose.openai.yml"));
-        assert!(preview.contains("[model_providers.coditor-openai-responses]"));
+        assert!(preview.contains("~/.codex/config.toml is not modified"));
+        assert!(preview.contains(r#"-c 'model_provider="coditor-openai-responses"'"#));
+        assert!(preview.contains(
+            r#"-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'"#
+        ));
+        assert!(preview
+            .contains(r#"-c 'model_providers.coditor-openai-responses.env_key="OPENAI_API_KEY"'"#));
+        assert!(preview
+            .contains(r#"-c 'model_providers.coditor-openai-responses.wire_api="responses"'"#));
+        assert!(preview.contains("-c features.enable_request_compression=false"));
         assert!(preview.contains("OPENAI_API_KEY"));
-        assert!(preview.contains("Not applied by Coditor yet."));
+        assert!(preview.contains("ChatGPT-auth Codex backend routing is not supported or verified"));
     }
 
     #[test]

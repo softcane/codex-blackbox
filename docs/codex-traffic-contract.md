@@ -1,9 +1,9 @@
 # Codex/OpenAI Traffic Contract
 
-Status: fixture contract only. Coditor does not support real Codex/OpenAI
-traffic yet. This document defines the fake Responses traffic shape used to
-drive Phase 1 fixtures and pending tests until a real Codex capture verifies or
-replaces it.
+Status: fixture/manual proxy contract only. Coditor has an experimental manual
+OpenAI API-key wrapper path, but real Codex/OpenAI traffic is not validated yet.
+This document defines the fake Responses traffic shape used to drive fixtures
+and tests until a real Codex capture verifies or replaces it.
 
 References:
 
@@ -23,8 +23,8 @@ POST /v1/responses
 ```
 
 The copied Phase 0 baseline still routes Anthropic-shaped traffic by default.
-OpenAI routing must remain opt-in until CLI/runtime wiring is deliberately
-changed and validated.
+OpenAI routing remains opt-in through the manual OpenAI Compose override and
+the experimental `coditor run -- codex ...` wrapper.
 
 ## Request Fields Coditor Needs
 
@@ -261,11 +261,33 @@ Example static validation:
 ./test/validate-openai-config.sh
 ```
 
-Manual OpenAI mode is not the default stack and is not wired into the Coditor
-CLI. Running it against real OpenAI would require the caller to provide an
-`Authorization: Bearer ...` header; this phase does not require credentials and
-does not validate real OpenAI/Codex traffic. ChatGPT-auth Codex backend routing
-is still unsupported and unverified.
+Manual OpenAI mode is not the default stack. Phase 6B can point Codex at this
+path with API-key config overrides, but real OpenAI/Codex traffic is still not
+validated. ChatGPT-auth Codex backend routing is still unsupported and
+unverified.
+
+## Phase 6B CLI Wrapper
+
+Phase 6B adds a conservative `coditor run -- codex ...` wrapper for manual
+OpenAI API-key experiments. It does not edit `~/.codex/config.toml`; instead it
+prepends command-line Codex config overrides:
+
+```text
+-c 'model_provider="coditor-openai-responses"'
+-c 'model_providers.coditor-openai-responses.name="Coditor OpenAI Responses proxy"'
+-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'
+-c 'model_providers.coditor-openai-responses.env_key="OPENAI_API_KEY"'
+-c 'model_providers.coditor-openai-responses.wire_api="responses"'
+-c 'forced_login_method="api"'
+-c features.enable_request_compression=false
+```
+
+The wrapper preserves user-provided Codex arguments after these overrides and
+prints that ChatGPT-auth backend routing is unsupported/unverified. Non-Codex
+child commands still use the temporary unported `ANTHROPIC_BASE_URL` fallback.
+
+Use `coditor run --dry-run -- codex ...` or `coditor config codex` to inspect
+the generated config without launching Codex.
 
 ## Headers To Verify Later
 
@@ -284,11 +306,15 @@ when available, then response payload metadata if headers are absent.
 
 ## Current Unknowns
 
-Blocking decisions before Phase 2:
+Resolved MVP decisions:
 
-- API-key mode vs ChatGPT-auth routing for the MVP.
-- Whether Codex request compression is enabled by default and whether Coditor
-  should disable it or decompress request bodies.
+- API-key mode is the first manual wrapper path; ChatGPT-auth routing remains
+  unsupported/unverified.
+- Codex request compression is disabled for the wrapper with
+  `features.enable_request_compression=false`.
+
+Still unknown until a real capture:
+
 - Codex hook schema and whether hooks are authoritative for sessions, only
   enrich proxy sessions, or only provide tool telemetry.
 - Source of cwd/working directory: request metadata, Codex hook payload, config,

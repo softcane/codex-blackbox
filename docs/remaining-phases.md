@@ -25,21 +25,21 @@ Completed:
 
 ## Remaining Work
 
-The remaining work spans Phase 6B/6C and Phase 7 through Phase 10.
+The remaining work spans Phase 6C and Phase 7 through Phase 10.
 
 For execution, split them into these smaller gates:
 
 ### Phase 6B: Safe `coditor run -- codex ...` Wiring
 
-Add a conservative wrapper path for Codex:
+Completed as an experimental/manual wrapper path for Codex:
 
-- point Codex at the local Coditor proxy
-- disable Codex request compression for MVP
-- preserve the user environment
-- print proxy/watch URLs
-- avoid editing `~/.codex/config.toml` unless explicitly requested
+- points Codex at the local Coditor proxy with command-line `-c` overrides
+- disables Codex request compression for MVP
+- preserves user-provided Codex arguments
+- prints proxy/config status and unsupported ChatGPT-auth warnings
+- avoids editing `~/.codex/config.toml`
 
-Done when `coditor run -- codex ...` can be tested against the fake/manual path without pretending ChatGPT-auth routing works.
+It is still not proof that real Codex/OpenAI traffic works.
 
 ### Phase 6C: Watch And Tmux Codex Polish
 
@@ -147,7 +147,7 @@ Current test level:
 Next testing milestones:
 
 1. Completed after Phase 6A: CLI doctor/config output testing.
-2. After Phase 6B: first wrapper-level Codex command testing against the local proxy path.
+2. Completed after Phase 6B: wrapper-level Codex command construction testing.
 3. Completed after Phase 4C: SQLite assertions for Codex sessions and turns.
 4. After Phase 6C: watch and tmux UX testing with fake Codex sessions.
 5. After Phase 7: fake Codex hook/tool/MCP testing.
@@ -161,15 +161,13 @@ automated feedback report for multiple real Codex sessions.
 
 ## Short Answer
 
-Left before the first small real Codex smoke test: about three execution gates.
+Left before the first small real Codex smoke test: about two execution gates.
 
-- Phase 6B
 - Phase 6C
 - Phase 9A minimum fake e2e expansion
 
 Left before the automated 3-4 session dogfood test the user described:
 
-- Phase 6B
 - Phase 6C
 - Phase 7
 - Phase 8
