@@ -40,6 +40,27 @@ This validation does not require OpenAI credentials and does not launch real
 Codex sessions. Rate-limit header names remain unverified; the candidate file
 under `test/fixtures/` is fixture-only documentation, not parser input.
 
+## Phase 9A Full Fake OpenAI Responses E2E
+
+`test/e2e-openai-responses-full.sh` is the broader fake regression gate before
+any real Codex smoke test. It starts the fake OpenAI stack with Prometheus and
+Grafana, sends parallel fixture `/v1/responses` requests with distinct prompts
+and mixed cwd metadata, covers completed/failed/incomplete streams, exercises
+split SSE chunking through Envoy, verifies late `/watch` replay, checks SQLite
+Codex persistence and token accounting, checks Prometheus/Grafana, runs the
+CLI `coditor run --dry-run -- codex ...` smoke, and finally stops
+`coditor-core` to verify Envoy failure-open behavior.
+
+Run it from the repository root:
+
+```sh
+./test/e2e-openai-responses-full.sh
+```
+
+The script writes failure artifacts and Compose logs under `/tmp` by default
+and prints that path on failure. It does not require OpenAI credentials, does
+not launch Codex, and is not a real Codex compatibility claim.
+
 ## Phase 5B Manual OpenAI API-Key Config
 
 `docker-compose.openai.yml` is an opt-in Compose override that mounts

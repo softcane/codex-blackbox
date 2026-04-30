@@ -115,6 +115,19 @@ provisioned dashboard's Phase 8B panels reference metrics Prometheus has
 scraped. It is not the Phase 9C dogfood harness and does not launch real Codex
 sessions.
 
+Phase 9A adds the broader fake regression gate:
+
+```sh
+./test/e2e-openai-responses-full.sh
+```
+
+That script still uses only the fake OpenAI Responses upstream. It covers
+parallel fake sessions with mixed cwd metadata, completed/failed/incomplete
+Responses streams, split SSE chunking through Envoy, late `/watch` replay,
+SQLite Codex persistence, Prometheus/Grafana provisioning, CLI Codex dry-run
+output, and Envoy failure-open behavior after `coditor-core` is stopped. It is
+the fake prerequisite for Phase 9B, not a real Codex dogfood harness.
+
 ### Tool And MCP Assertions
 
 Tool telemetry should verify:
@@ -165,7 +178,9 @@ Start real multi-session dogfood testing only after these are true:
 
 - Phase 4C: Codex SQLite persistence/schema mapping exists.
 - Phase 6B: `coditor run -- codex ...` can intentionally route Codex through Coditor.
-- Phase 9A: fake e2e has expanded enough to cover parallel sessions and failure-open behavior.
+- Phase 9A: fake e2e has expanded enough to cover parallel sessions,
+  failed/incomplete streams, watch replay, persistence, observability, CLI
+  dry-run, and failure-open behavior.
 
 For the full version that checks tools, MCP, diagnosis, Prometheus, and Grafana, also complete:
 

@@ -23,6 +23,8 @@ STREAM_FIXTURES = {
     "incomplete": "openai_responses_incomplete_stream.sse",
 }
 
+SPLIT_STREAM_CHUNK_SIZE = 7
+
 
 def _scenario_from_request(headers, body: dict) -> str:
     explicit = headers.get("x-coditor-fixture")
@@ -103,12 +105,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("connection", "close")
         self.end_headers()
 
-        for event in stream.split(b"\n\n"):
-            if not event.strip():
-                continue
-            self.wfile.write(event + b"\n\n")
-            self.wfile.flush()
-            time.sleep(0.02)
+        if self.headers.get("x-coditor-split-sse") == "1":
+            for offset in range(0, len(stream), SPLIT_STREAM_CHUNK_SIZE):
+                self.wfile.write(stream[offset : offset + SPLIT_STREAM_CHUNK_SIZE])
+                self.wfile.flush()
+                time.sleep(0.005)
+        else:
+            for event in stream.split(b"\n\n"):
+                if not event.strip():
+                    continue
+                self.wfile.write(event + b"\n\n")
+                self.wfile.flush()
+                time.sleep(0.02)
         self.close_connection = True
 
     def _send_plain(self, status: int, body: str) -> None:
