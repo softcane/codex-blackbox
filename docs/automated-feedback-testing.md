@@ -128,6 +128,21 @@ SQLite Codex persistence, Prometheus/Grafana provisioning, CLI Codex dry-run
 output, and Envoy failure-open behavior after `coditor-core` is stopped. It is
 the fake prerequisite for Phase 9B, not a real Codex dogfood harness.
 
+Phase 9B-pre adds a no-credential real-Codex-through-fake-proxy smoke:
+
+```sh
+./test/smoke-codex-through-fake-proxy.sh
+```
+
+That script launches the actual `codex` CLI through `coditor run`, but the
+Envoy route is the local fake OpenAI Responses upstream. It uses a dummy
+`OPENAI_API_KEY`, a temporary `CODEX_HOME`, disables Codex plugins and general
+analytics, and writes artifacts under `reports/smoke/<timestamp>/`. It checks
+watch, session, diagnosis, SQLite, Prometheus, and Grafana evidence for the
+single observed Codex session, and asserts the final attempt artifacts do not
+reference `api.openai.com` or `chatgpt.com`. It is not a real Phase 9B smoke
+and does not validate real OpenAI traffic.
+
 ### Tool And MCP Assertions
 
 Tool telemetry should verify:

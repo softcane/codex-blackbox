@@ -15,6 +15,7 @@ target/
 coditor_data/
 prometheus_data/
 grafana_data/
+reports/
 *.db
 *.db-journal
 *.db-wal

@@ -61,6 +61,33 @@ The script writes failure artifacts and Compose logs under `/tmp` by default
 and prints that path on failure. It does not require OpenAI credentials, does
 not launch Codex, and is not a real Codex compatibility claim.
 
+## Phase 9B-pre Codex Through Fake Proxy Smoke
+
+`test/smoke-codex-through-fake-proxy.sh` launches the actual `codex` CLI while
+routing model traffic through the local fake OpenAI Responses upstream. It uses
+a dummy `OPENAI_API_KEY`, a temporary `CODEX_HOME`, disables Codex plugins and
+general analytics, and runs `coditor run -- codex exec ...` against the fake
+Envoy stack.
+
+Run it from the repository root:
+
+```sh
+./test/smoke-codex-through-fake-proxy.sh
+```
+
+The script writes artifacts under `reports/smoke/<timestamp>/`, which is
+ignored by git. It asserts `/watch`, `/api/sessions`, `/api/diagnosis`,
+SQLite, Prometheus, and Grafana evidence for the observed Codex session. It
+also asserts the final attempt artifacts do not reference `api.openai.com` or
+`chatgpt.com`. This is still fake-only validation and must not be treated as
+real OpenAI or production Codex support.
+
+To leave the fake stack running after the script:
+
+```sh
+CODITOR_FAKE_CODEX_SMOKE_KEEP_STACK=1 ./test/smoke-codex-through-fake-proxy.sh
+```
+
 ## Phase 5B Manual OpenAI API-Key Config
 
 `docker-compose.openai.yml` is an opt-in Compose override that mounts
