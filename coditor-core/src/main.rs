@@ -3170,7 +3170,11 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
     metrics::record_codex_turn(
         metric_model,
         outcome.accounting.input_tokens,
+        outcome.accounting.cached_input_tokens,
+        outcome.accounting.uncached_input_tokens,
         outcome.accounting.output_tokens,
+        outcome.accounting.reasoning_output_tokens,
+        outcome.accounting.total_tokens,
         duration.as_secs_f64(),
     );
     metrics::record_context_fill_percent(
@@ -3293,7 +3297,7 @@ fn codex_status_label(status: &codex_accounting::CodexTurnStatus) -> &'static st
 fn codex_cost_source(accounting: &codex_accounting::CodexTurnAccounting) -> String {
     match &accounting.pricing.status {
         codex_accounting::CodexPricingStatus::UnknownModel { model } => {
-            format!("codex_unpriced:unknown_model:{model}")
+            pricing::unpriced_unknown_model_cost_source(model)
         }
     }
 }
@@ -3775,7 +3779,80 @@ fn diagnosis_outcome_needs_refresh(outcome: Option<&str>) -> bool {
     matches!(
         outcome,
         Some("Completed" | "PartiallyCompleted" | "Abandoned")
+    ) || outcome
+        .map(|value| {
+            matches!(
+                value,
+                "Likely Completed" | "Likely Partially Completed" | "Likely Abandoned"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn session_completed_at_from_db(conn: &Connection, session_id: &str) -> String {
+    conn.query_row(
+        "SELECT COALESCE(ended_at, started_at) FROM sessions WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |row| row.get::<_, Option<String>>(0),
     )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+    .unwrap_or_else(now_iso8601)
+}
+
+fn apply_persisted_costs_to_report(
+    report: &mut diagnosis::DiagnosisReport,
+    estimated: &EstimatedAggregate,
+) {
+    report.estimated_total_cost_dollars = estimated.estimated_cost_dollars;
+    report.cost_source = estimated.cost_source.clone();
+    report.trusted_for_budget_enforcement = estimated.trusted_for_budget_enforcement;
+}
+
+fn persist_session_diagnosis_report(
+    conn: &Connection,
+    session_id: &str,
+    completed_at: &str,
+    report: &diagnosis::DiagnosisReport,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO session_diagnoses (session_id, completed_at, \
+         outcome, total_turns, total_cost, cache_hit_ratio, degraded, degradation_turn, \
+         causes_json, advice_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![
+            session_id,
+            completed_at,
+            report.outcome,
+            report.total_turns,
+            report.estimated_total_cost_dollars,
+            report.cache_hit_ratio,
+            report.degraded as i32,
+            report.degradation_turn,
+            serde_json::to_string(&report.causes).unwrap_or_default(),
+            serde_json::to_string(&report.advice).unwrap_or_default(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn build_fresh_diagnosis_report(
+    conn: &Connection,
+    session_id: &str,
+    estimated: &EstimatedAggregate,
+) -> rusqlite::Result<Option<(String, diagnosis::DiagnosisReport)>> {
+    let turns = load_turn_snapshots_from_db(conn, session_id)?;
+    if turns.is_empty() {
+        return Ok(None);
+    }
+
+    let completed_at = session_completed_at_from_db(conn, session_id);
+    let mut report = diagnosis::analyze_session(session_id, &turns);
+    apply_persisted_costs_to_report(&mut report, estimated);
+    persist_session_diagnosis_report(conn, session_id, &completed_at, &report)?;
+
+    Ok(Some((completed_at, report)))
 }
 
 fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()> {
@@ -3837,25 +3914,14 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
         }
 
         if stored_outcome.is_none() || diagnosis_outcome_needs_refresh(stored_outcome.as_deref()) {
-            let report = diagnosis::analyze_session(&session_id, &turns);
+            let mut report = diagnosis::analyze_session(&session_id, &turns);
+            let estimated =
+                compute_estimated_costs_for_sessions(conn, std::slice::from_ref(&session_id))?
+                    .remove(&session_id)
+                    .unwrap_or_else(|| CostAccumulator::new().finish());
+            apply_persisted_costs_to_report(&mut report, &estimated);
             let completed_at = ended_at.clone().unwrap_or_else(now_iso8601);
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO session_diagnoses (session_id, completed_at, \
-                 outcome, total_turns, total_cost, cache_hit_ratio, degraded, degradation_turn, \
-                 causes_json, advice_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                rusqlite::params![
-                    &session_id,
-                    completed_at,
-                    report.outcome,
-                    report.total_turns,
-                    report.estimated_total_cost_dollars,
-                    report.cache_hit_ratio,
-                    report.degraded as i32,
-                    report.degradation_turn,
-                    serde_json::to_string(&report.causes).unwrap_or_default(),
-                    serde_json::to_string(&report.advice).unwrap_or_default(),
-                ],
-            );
+            let _ = persist_session_diagnosis_report(conn, &session_id, &completed_at, &report);
         }
 
         if !recall_exists {
@@ -6670,6 +6736,28 @@ async fn handle_diagnosis(
         let billing = load_latest_billing_reconciliations(&conn, std::slice::from_ref(&session_id))
             .ok()?
             .remove(&session_id);
+        if let Some((completed_at, report)) =
+            build_fresh_diagnosis_report(&conn, &session_id, &estimated).ok()?
+        {
+            return Some(build_diagnosis_response_json(
+                session_id,
+                completed_at,
+                report.outcome,
+                report.total_turns as i64,
+                estimated.estimated_cost_dollars,
+                estimated.cost_source,
+                estimated.trusted_for_budget_enforcement,
+                billing.as_ref().map(|record| record.billed_cost_dollars),
+                billing.as_ref().map(|record| record.source.clone()),
+                billing.as_ref().map(|record| record.imported_at.clone()),
+                report.cache_hit_ratio,
+                report.degraded,
+                report.degradation_turn.map(i64::from),
+                serde_json::to_value(&report.causes).unwrap_or(Value::Array(vec![])),
+                serde_json::to_value(&report.advice).unwrap_or(Value::Array(vec![])),
+            ));
+        }
+
         let mut stmt = conn
             .prepare(
                 "SELECT session_id, completed_at, outcome, total_turns, \
@@ -6677,57 +6765,29 @@ async fn handle_diagnosis(
              FROM session_diagnoses WHERE session_id = ?1",
             )
             .ok()?;
-        let stored = stmt
-            .query_row(rusqlite::params![&session_id], |row| {
-                let causes_str: String = row.get(7)?;
-                let advice_str: String = row.get(8)?;
-                Ok(build_diagnosis_response_json(
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    estimated.estimated_cost_dollars,
-                    estimated.cost_source.clone(),
-                    estimated.trusted_for_budget_enforcement,
-                    billing.as_ref().map(|record| record.billed_cost_dollars),
-                    billing.as_ref().map(|record| record.source.clone()),
-                    billing.as_ref().map(|record| record.imported_at.clone()),
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, i32>(5)? != 0,
-                    row.get::<_, Option<i64>>(6)?,
-                    serde_json::from_str::<Value>(&causes_str).unwrap_or(Value::Array(vec![])),
-                    serde_json::from_str::<Value>(&advice_str).unwrap_or(Value::Array(vec![])),
-                ))
-            })
-            .optional()
-            .ok()?;
-
-        if let Some(stored) = stored {
-            return Some(stored);
-        }
-
-        let turns = load_turn_snapshots_from_db(&conn, &session_id).ok()?;
-        if turns.is_empty() {
-            return None;
-        }
-        let report = diagnosis::analyze_session(&session_id, &turns);
-        Some(build_diagnosis_response_json(
-            session_id,
-            now_iso8601(),
-            report.outcome,
-            report.total_turns as i64,
-            estimated.estimated_cost_dollars,
-            estimated.cost_source,
-            estimated.trusted_for_budget_enforcement,
-            billing.as_ref().map(|record| record.billed_cost_dollars),
-            billing.as_ref().map(|record| record.source.clone()),
-            billing.as_ref().map(|record| record.imported_at.clone()),
-            report.cache_hit_ratio,
-            report.degraded,
-            report.degradation_turn.map(i64::from),
-            serde_json::to_value(&report.causes).unwrap_or(Value::Array(vec![])),
-            serde_json::to_value(&report.advice).unwrap_or(Value::Array(vec![])),
-        ))
+        stmt.query_row(rusqlite::params![&session_id], |row| {
+            let causes_str: String = row.get(7)?;
+            let advice_str: String = row.get(8)?;
+            Ok(build_diagnosis_response_json(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                estimated.estimated_cost_dollars,
+                estimated.cost_source.clone(),
+                estimated.trusted_for_budget_enforcement,
+                billing.as_ref().map(|record| record.billed_cost_dollars),
+                billing.as_ref().map(|record| record.source.clone()),
+                billing.as_ref().map(|record| record.imported_at.clone()),
+                row.get::<_, f64>(4)?,
+                row.get::<_, i32>(5)? != 0,
+                row.get::<_, Option<i64>>(6)?,
+                serde_json::from_str::<Value>(&causes_str).unwrap_or(Value::Array(vec![])),
+                serde_json::from_str::<Value>(&advice_str).unwrap_or(Value::Array(vec![])),
+            ))
+        })
+        .optional()
+        .ok()?
     })
     .await
     .ok()
@@ -6761,37 +6821,37 @@ async fn handle_sessions(
 
         let mut stmt = conn
             .prepare(
-                "SELECT d.session_id, s.started_at, d.outcome, d.degraded, d.total_turns, \
-             d.causes_json, d.cache_hit_ratio, s.model \
-             FROM session_diagnoses d \
-             LEFT JOIN sessions s ON d.session_id = s.session_id \
-             WHERE d.completed_at >= ?1 \
-             ORDER BY d.completed_at DESC LIMIT ?2",
+                "SELECT s.session_id, s.started_at, s.model, d.outcome, d.degraded, \
+                        d.total_turns, d.causes_json, d.cache_hit_ratio \
+                 FROM sessions s \
+                 LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
+                 WHERE COALESCE(s.ended_at, s.started_at) >= ?1 \
+                 ORDER BY COALESCE(s.ended_at, s.started_at) DESC LIMIT ?2",
             )
             .ok()?;
 
-        type RecentDiagnosisRow = (
+        type RecentSessionRow = (
             String,
             Option<String>,
-            String,
-            bool,
-            i64,
-            String,
-            f64,
             Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<i64>,
+            Option<String>,
+            Option<f64>,
         );
 
-        let session_rows: Vec<RecentDiagnosisRow> = stmt
+        let session_rows: Vec<RecentSessionRow> = stmt
             .query_map(rusqlite::params![since, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, Option<String>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i32>(3)? != 0,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, f64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i32>>(4)?.map(|value| value != 0),
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
                 ))
             })
             .ok()?
@@ -6811,24 +6871,63 @@ async fn handle_sessions(
                 |(
                     session_id,
                     started_at,
-                    outcome,
-                    degraded,
-                    total_turns,
-                    causes_str,
-                    cache_hit_ratio,
                     model,
+                    stored_outcome,
+                    stored_degraded,
+                    stored_total_turns,
+                    stored_causes_str,
+                    stored_cache_hit_ratio,
                 )| {
-                    let causes: Vec<Value> = serde_json::from_str(&causes_str).unwrap_or_default();
-                    let primary_cause = causes
-                        .first()
-                        .and_then(|c| c.get("cause_type"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
                     let estimated = estimated_costs
                         .get(&session_id)
                         .cloned()
                         .unwrap_or_else(|| CostAccumulator::new().finish());
+                    let refreshed = if stored_outcome.is_none()
+                        || diagnosis_outcome_needs_refresh(stored_outcome.as_deref())
+                    {
+                        build_fresh_diagnosis_report(&conn, &session_id, &estimated)
+                            .ok()
+                            .flatten()
+                            .map(|(_, report)| report)
+                    } else {
+                        None
+                    };
+
+                    let (outcome, degraded, total_turns, causes_json, cache_hit_ratio) =
+                        if let Some(report) = refreshed {
+                            (
+                                report.outcome,
+                                report.degraded,
+                                report.total_turns as i64,
+                                serde_json::to_value(&report.causes)
+                                    .unwrap_or(Value::Array(vec![])),
+                                report.cache_hit_ratio,
+                            )
+                        } else {
+                            let causes_json = stored_causes_str
+                                .as_deref()
+                                .and_then(|causes| serde_json::from_str::<Value>(causes).ok())
+                                .unwrap_or(Value::Array(vec![]));
+                            (
+                                stored_outcome.unwrap_or_else(|| "Unknown".to_string()),
+                                stored_degraded.unwrap_or(false),
+                                stored_total_turns.unwrap_or(0),
+                                causes_json,
+                                stored_cache_hit_ratio.unwrap_or(0.0),
+                            )
+                        };
+
+                    let primary_cause = if degraded {
+                        causes_json
+                            .as_array()
+                            .and_then(|causes| causes.first())
+                            .and_then(|cause| cause.get("cause_type"))
+                            .and_then(|cause_type| cause_type.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
                     let billed = billing.get(&session_id);
                     build_session_summary_json(
                         session_id,
@@ -10031,7 +10130,9 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             pricing::estimate_cost_dollars("claude-haiku", 1_000_000, 0, 40, 10).total_cost_dollars;
         assert!((seven_day.estimated_spend_dollars - expected).abs() < 1e-9);
         assert_eq!(
-            seven_day.estimated_spend_dollars_by_model.get("haiku"),
+            seven_day
+                .estimated_spend_dollars_by_model
+                .get("legacy_claude"),
             Some(&expected)
         );
         assert_eq!(seven_day.degraded_causes.get("context_bloat"), Some(&1));
@@ -10137,23 +10238,15 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         let haiku_expected =
             pricing::estimate_cost_dollars("claude-haiku", 625_000, 0, 0, 30).total_cost_dollars;
         assert_eq!(
-            one_day.estimated_spend_dollars_by_model.get("sonnet"),
-            Some(&sonnet_expected)
-        );
-        assert_eq!(
-            one_day.estimated_spend_dollars_by_model.get("haiku"),
-            Some(&haiku_expected)
+            one_day
+                .estimated_spend_dollars_by_model
+                .get("legacy_claude"),
+            Some(&(sonnet_expected + haiku_expected))
         );
         assert_eq!(
             one_day
                 .avg_estimated_session_cost_dollars_by_model
-                .get("sonnet"),
-            Some(&1.0)
-        );
-        assert_eq!(
-            one_day
-                .avg_estimated_session_cost_dollars_by_model
-                .get("haiku"),
+                .get("legacy_claude"),
             Some(&1.0)
         );
         assert!((one_day.cache_hit_ratio - 0.375).abs() < 1e-9);
@@ -10175,20 +10268,20 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 sessions: 5,
                 estimated_spend_dollars: 12.5,
                 estimated_spend_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 12.5,
+                    "gpt-5.5", 12.5,
                 )]),
                 avg_estimated_session_cost_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 2.5,
+                    "gpt-5.5", 2.5,
                 )]),
                 estimated_cache_waste_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 0.75,
+                    "gpt-5.5", 0.75,
                 )]),
                 cache_hit_ratio: 0.42,
                 cache_events: std::collections::BTreeMap::from([("miss_thrash", 2)]),
                 degraded_sessions: 2,
                 degraded_session_ratio: 0.4,
                 degraded_causes: causes,
-                model_fallbacks: std::collections::BTreeMap::from([(("opus", "sonnet"), 1)]),
+                model_fallbacks: std::collections::BTreeMap::from([(("gpt-5.4", "gpt-5.5"), 1)]),
                 tool_failures_by_tool: std::collections::BTreeMap::from([("bash".to_string(), 4)]),
             }],
             1_776_700_000,
@@ -10211,15 +10304,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert!(body.contains("window=\"7d\""));
         assert!(body.contains("cause_type=\"context_bloat\""));
         assert!(body.contains("event_type=\"miss_thrash\""));
-        assert!(body.contains("requested=\"opus\""));
-        assert!(body.contains("actual=\"sonnet\""));
+        assert!(body.contains("requested=\"gpt-5.4\""));
+        assert!(body.contains("actual=\"gpt-5.5\""));
         assert!(body.contains("tool=\"bash\""));
         assert!(body
-            .contains("coditor_cache_events_total{event_type=\"miss_thrash\",model=\"sonnet\"}"));
-        assert!(body.contains("coditor_estimated_cache_waste_dollars_total{model=\"sonnet\"}"));
-        assert!(
-            body.contains("coditor_model_fallback_total{actual=\"sonnet\",requested=\"opus\"} 0")
-        );
+            .contains("coditor_cache_events_total{event_type=\"miss_thrash\",model=\"gpt-5.5\"}"));
+        assert!(body.contains("coditor_estimated_cache_waste_dollars_total{model=\"gpt-5.5\"}"));
+        assert!(body
+            .contains("coditor_model_fallback_total{actual=\"gpt-5.5\",requested=\"gpt-5.4\"} 0"));
         assert!(body.contains("coditor_tool_failures_total{tool=\"unknown\"} 0"));
         assert!(
             body.contains("coditor_mcp_tool_calls_total{server=\"unknown\",tool=\"unknown\"} 0")
@@ -10417,20 +10509,20 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 sessions: 2,
                 estimated_spend_dollars: 1.0,
                 estimated_spend_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 1.0,
+                    "gpt-5.5", 1.0,
                 )]),
                 avg_estimated_session_cost_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 0.5,
+                    "gpt-5.5", 0.5,
                 )]),
                 estimated_cache_waste_dollars_by_model: std::collections::BTreeMap::from([(
-                    "sonnet", 0.25,
+                    "gpt-5.5", 0.25,
                 )]),
                 cache_hit_ratio: 0.25,
                 cache_events: std::collections::BTreeMap::from([("miss_thrash", 2)]),
                 degraded_sessions: 1,
                 degraded_session_ratio: 0.5,
                 degraded_causes: causes,
-                model_fallbacks: std::collections::BTreeMap::from([(("opus", "sonnet"), 1)]),
+                model_fallbacks: std::collections::BTreeMap::from([(("gpt-5.4", "gpt-5.5"), 1)]),
                 tool_failures_by_tool: std::collections::BTreeMap::from([("bash".to_string(), 2)]),
             }],
             1_776_700_000,
@@ -10470,7 +10562,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .find(|line| {
                 line.starts_with("coditor_history_avg_estimated_session_cost_dollars{")
                     && line.contains("window=\"7d\"")
-                    && line.contains("model=\"sonnet\"")
+                    && line.contains("model=\"gpt-5.5\"")
             })
             .expect("stale avg line");
         assert!(stale_avg_line.ends_with(" 0"));
@@ -10479,7 +10571,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .find(|line| {
                 line.starts_with("coditor_history_estimated_spend_dollars_by_model{")
                     && line.contains("window=\"7d\"")
-                    && line.contains("model=\"sonnet\"")
+                    && line.contains("model=\"gpt-5.5\"")
             })
             .expect("stale spend line");
         assert!(stale_spend_line.ends_with(" 0"));

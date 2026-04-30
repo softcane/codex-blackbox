@@ -27,8 +27,8 @@ Add a script such as:
 
 Suggested options:
 
-- `--mode fake`: use fake OpenAI Responses upstream.
-- `--mode real`: run real Codex through the manual OpenAI API-key path.
+- `--mode fixture`: use fake OpenAI Responses fixtures without launching Codex.
+- `--mode real`: run real Codex through the ChatGPT/Codex subscription proxy path.
 - `--sessions N`: number of Codex sessions to launch.
 - `--repos same|mixed`: run all sessions in one repo or across multiple repos.
 - `--include-mcp`: include MCP-oriented prompts when MCP is configured.
@@ -61,7 +61,7 @@ The captured `/watch` stream should show:
 
 - one `SessionStart` per Codex session
 - one `ContextStatus` per completed turn
-- no Anthropic TTL/rebuild `CacheEvent` for Codex cached input
+- no TTL/rebuild `CacheEvent` for Codex cached input
 - `ModelFallback` only when requested and served model differ
 - tool events when tool calls are observed
 - MCP events when MCP was exercised and telemetry is available
@@ -82,8 +82,8 @@ If persistence is not implemented yet, the harness should report `missing: codex
 
 Prometheus should expose:
 
-- Coditor request counters
-- input and output token counters
+- Coditor request counters with `provider="codex_responses"`
+- input, cached-input, uncached-input, output, reasoning-output, and total token counters
 - duration histograms or summaries
 - context-status metrics
 - model fallback counters when applicable
@@ -124,24 +124,24 @@ Phase 9A adds the broader fake regression gate:
 That script still uses only the fake OpenAI Responses upstream. It covers
 parallel fake sessions with mixed cwd metadata, completed/failed/incomplete
 Responses streams, split SSE chunking through Envoy, late `/watch` replay,
-SQLite Codex persistence, Prometheus/Grafana provisioning, CLI Codex dry-run
-output, and Envoy failure-open behavior after `coditor-core` is stopped. It is
-the fake prerequisite for Phase 9B, not a real Codex dogfood harness.
+SQLite Codex persistence, Prometheus/Grafana provisioning, subscription-mode
+CLI dry-run output, and Envoy failure-open behavior after `coditor-core` is
+stopped. It is the fake prerequisite for Phase 9B, not a real Codex dogfood
+harness.
 
-Phase 9B-pre adds a no-credential real-Codex-through-fake-proxy smoke:
+The live Phase 9B direction is ChatGPT/Codex subscription auth. Use the default
+`docker-compose.yml`, `envoy/envoy.yaml`, and the manual preflight:
 
 ```sh
-./test/smoke-codex-through-fake-proxy.sh
+cargo run -q -p coditor-cli -- preflight codex-subscription -- codex exec \
+  --cd /Users/pradeepsingh/code/coditor \
+  --sandbox read-only \
+  --json \
+  "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
 ```
 
-That script launches the actual `codex` CLI through `coditor run`, but the
-Envoy route is the local fake OpenAI Responses upstream. It uses a dummy
-`OPENAI_API_KEY`, a temporary `CODEX_HOME`, disables Codex plugins and general
-analytics, and writes artifacts under `reports/smoke/<timestamp>/`. It checks
-watch, session, diagnosis, SQLite, Prometheus, and Grafana evidence for the
-single observed Codex session, and asserts the final attempt artifacts do not
-reference `api.openai.com` or `chatgpt.com`. It is not a real Phase 9B smoke
-and does not validate real OpenAI traffic.
+The preflight starts the subscription-mode stack and prints the live command,
+but it must stop before the first real Codex call until explicitly approved.
 
 ### Tool And MCP Assertions
 

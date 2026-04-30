@@ -8,6 +8,12 @@ use tracing::{info, warn};
 pub const BUILTIN_COST_SOURCE: &str = "builtin_model_family_pricing";
 pub const MIXED_COST_SOURCE: &str = "mixed_pricing_sources";
 const PRICING_FILE_ENV: &str = "CODITOR_PRICING_FILE";
+const ZERO_PRICING: ModelPricing = ModelPricing {
+    input: 0.0,
+    output: 0.0,
+    cache_read: 0.0,
+    cache_create: 0.0,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 pub struct ModelPricing {
@@ -177,9 +183,17 @@ impl PricingCatalog {
             }
         }
 
+        if family_for_model(model).is_some() {
+            return ResolvedPricing {
+                pricing: builtin_pricing(model),
+                cost_source: BUILTIN_COST_SOURCE.to_string(),
+                trusted_for_budget_enforcement: false,
+            };
+        }
+
         ResolvedPricing {
-            pricing: builtin_pricing(model),
-            cost_source: BUILTIN_COST_SOURCE.to_string(),
+            pricing: ZERO_PRICING,
+            cost_source: unpriced_unknown_model_cost_source(model),
             trusted_for_budget_enforcement: false,
         }
     }
@@ -207,6 +221,10 @@ pub fn summarize_cost_sources(sources: &std::collections::HashSet<String>) -> St
 
 pub fn resolve_pricing(model: &str) -> ResolvedPricing {
     PRICING_CATALOG.resolve(model)
+}
+
+pub fn unpriced_unknown_model_cost_source(model: &str) -> String {
+    format!("codex_unpriced:unknown_model:{model}")
 }
 
 pub fn token_cost(tokens: u64, price_per_mtok: f64) -> f64 {
@@ -274,13 +292,15 @@ fn builtin_pricing(model: &str) -> ModelPricing {
             cache_read: 0.08,
             cache_create: 1.00,
         }
-    } else {
+    } else if model.contains("sonnet") {
         ModelPricing {
             input: 3.0,
             output: 15.0,
             cache_read: 0.30,
             cache_create: 3.75,
         }
+    } else {
+        ZERO_PRICING
     }
 }
 

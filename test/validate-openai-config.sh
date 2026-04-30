@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Static validation for the Phase 5B manual OpenAI API-key Envoy path.
+# Static validation for the default ChatGPT/Codex subscription Envoy path.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -14,13 +14,14 @@ require_cmd() {
 require_cmd docker
 require_cmd rg
 
-docker compose -f docker-compose.yml -f docker-compose.openai.yml config >/tmp/coditor-openai-compose-config.txt
+docker compose -f docker-compose.yml config >/tmp/coditor-codex-compose-config.txt
 
-rg -n 'failure_mode_allow:\s*true' envoy/envoy.openai.yaml >/dev/null
-rg -n 'request_body_mode:\s*BUFFERED' envoy/envoy.openai.yaml >/dev/null
-rg -n 'response_body_mode:\s*STREAMED' envoy/envoy.openai.yaml >/dev/null
-rg -n 'host_rewrite_literal:\s*api\.openai\.com' envoy/envoy.openai.yaml >/dev/null
-rg -n 'address:\s*api\.openai\.com' envoy/envoy.openai.yaml >/dev/null
-rg -n 'sni:\s*api\.openai\.com' envoy/envoy.openai.yaml >/dev/null
+rg -n 'failure_mode_allow:\s*true' envoy/envoy.yaml >/dev/null
+rg -n 'request_body_mode:\s*BUFFERED' envoy/envoy.yaml >/dev/null
+rg -n 'response_body_mode:\s*STREAMED' envoy/envoy.yaml >/dev/null
+rg -n 'prefix:\s*"/backend-api"' envoy/envoy.yaml >/dev/null
+rg -n 'host_rewrite_literal:\s*chatgpt\.com' envoy/envoy.yaml >/dev/null
+rg -n 'address:\s*chatgpt\.com' envoy/envoy.yaml >/dev/null
+rg -n 'sni:\s*chatgpt\.com' envoy/envoy.yaml >/dev/null
 
-printf "OpenAI API-key Envoy/Compose static validation passed\n"
+printf "ChatGPT/Codex Envoy/Compose static validation passed\n"

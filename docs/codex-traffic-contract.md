@@ -1,7 +1,8 @@
 # Codex/OpenAI Traffic Contract
 
-Status: fixture/manual proxy contract only. Coditor has an experimental manual
-OpenAI API-key wrapper path, but real Codex/OpenAI traffic is not validated yet.
+Status: fixture/manual proxy contract only. Coditor has an experimental
+ChatGPT/Codex subscription wrapper path, but real Codex/OpenAI traffic is not
+validated yet.
 This document defines the fake Responses traffic shape used to drive fixtures
 and tests until a real Codex capture verifies or replaces it.
 
@@ -14,17 +15,17 @@ References:
 - OpenAI Responses streaming events reference:
   <https://platform.openai.com/docs/api-reference/responses-streaming>
 
-## Expected Path
+## Fixture Path
 
-Coditor expects Codex/OpenAI model traffic to use:
+Coditor's checked-in fake Responses fixtures use:
 
 ```text
 POST /v1/responses
 ```
 
-The copied Phase 0 baseline still routes Anthropic-shaped traffic by default.
-OpenAI routing remains opt-in through the manual OpenAI Compose override and
-the experimental `coditor run -- codex ...` wrapper.
+That fixture path is not the live Codex CLI wrapper path. The live wrapper uses
+the ChatGPT/Codex subscription backend base described in Phase 9B below:
+`/backend-api` for auxiliary calls and `/backend-api/codex` for model turns.
 
 ## Request Fields Coditor Needs
 
@@ -218,7 +219,7 @@ For Codex rows, copied Anthropic cache columns remain non-authoritative:
 - `turn_snapshots.cache_read_tokens` is written as `0` for Codex.
 - `turn_snapshots.cache_creation_tokens` is written as `0` for Codex.
 - `requests.cache_event` is left `NULL` for Codex; Codex cached input does not
-  emit or imply an Anthropic TTL/rebuild cache event.
+  emit or imply a TTL/rebuild cache event.
 
 Unknown OpenAI/Codex pricing is persisted as explicit unpriced zero cost with a
 `codex_unpriced:unknown_model:<model>` cost source and
@@ -242,21 +243,18 @@ Phase 5A adds a local-only fake OpenAI Responses upstream for Envoy tests:
 This e2e path uses no OpenAI credentials and does not contact real OpenAI or
 real Codex services.
 
-## Phase 5B Manual OpenAI API-Key Mode
+## Phase 5B Default Codex Envoy Config
 
-Phase 5B adds an experimental/manual Envoy path for OpenAI API-key mode:
+Phase 5B validates the default Envoy processing shape used by the Codex CLI
+wrapper:
 
-- `envoy/envoy.openai.yaml` routes `POST /v1/responses` to
-  `api.openai.com:443`.
-- The OpenAI upstream uses TLS with SNI `api.openai.com` and host rewrite
-  `api.openai.com`.
+- `docker-compose.yml` mounts `envoy/envoy.yaml`.
+- `envoy/envoy.yaml` routes `/backend-api` to `chatgpt.com:443`.
+- The upstream uses TLS with SNI `chatgpt.com` and host rewrite `chatgpt.com`.
 - ext_proc remains enabled with `failure_mode_allow: true`.
 - request bodies remain `BUFFERED` because the current request parser expects a
   complete plaintext JSON body.
-- response bodies remain `STREAMED` so Responses SSE chunks reach the
-  accumulator.
-- `docker-compose.openai.yml` mounts the OpenAI Envoy config as an explicit
-  override.
+- response bodies remain `STREAMED` so response chunks reach the accumulator.
 
 Example static validation:
 
@@ -264,33 +262,60 @@ Example static validation:
 ./test/validate-openai-config.sh
 ```
 
-Manual OpenAI mode is not the default stack. Phase 6B can point Codex at this
-path with API-key config overrides, but real OpenAI/Codex traffic is still not
-validated. ChatGPT-auth Codex backend routing is still unsupported and
-unverified.
+This config is the default Codex CLI wrapper path. Live traffic is still not
+validated until a ChatGPT-auth Codex smoke runs through it.
 
 ## Phase 6B CLI Wrapper
 
-Phase 6B adds a conservative `coditor run -- codex ...` wrapper for manual
-OpenAI API-key experiments. It does not edit `~/.codex/config.toml`; instead it
-prepends command-line Codex config overrides:
+Phase 6B added a conservative `coditor run -- codex ...` wrapper. Phase 9B
+keeps the wrapper subscription-only without editing `~/.codex/config.toml`.
+
+The wrapper uses the installed Codex CLI's ChatGPT backend base URL shape.
+The locally inspected Codex 0.125.0 source sends ChatGPT-auth auxiliary calls
+through `chatgpt_base_url`, which defaults to
+`https://chatgpt.com/backend-api/`, while model turns need the
+`https://chatgpt.com/backend-api/codex` Responses route.
+
+Coditor uses command-line config overrides only. It points auxiliary calls at
+the local proxy and installs a custom `coditor-openai` model provider for model
+turns so WebSocket transport can be disabled while preserving ChatGPT auth:
 
 ```text
--c 'model_provider="coditor-openai-responses"'
--c 'model_providers.coditor-openai-responses.name="Coditor OpenAI Responses proxy"'
--c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'
--c 'model_providers.coditor-openai-responses.env_key="OPENAI_API_KEY"'
--c 'model_providers.coditor-openai-responses.wire_api="responses"'
--c 'forced_login_method="api"'
+-c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'
+-c 'model_provider="coditor-openai"'
+-c 'model_providers.coditor-openai.name="OpenAI"'
+-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'
+-c 'model_providers.coditor-openai.wire_api="responses"'
+-c 'model_providers.coditor-openai.requires_openai_auth=true'
+-c 'model_providers.coditor-openai.supports_websockets=false'
 -c features.enable_request_compression=false
 ```
 
-The wrapper preserves user-provided Codex arguments after these overrides and
-prints that ChatGPT-auth backend routing is unsupported/unverified. Non-Codex
-child commands still use the temporary unported `ANTHROPIC_BASE_URL` fallback.
+This path must preserve the current Codex ChatGPT login. It must not set
+`OPENAI_API_KEY`, `env_key`, or `forced_login_method`.
+
+The wrapper preserves user-provided Codex arguments after those overrides.
 
 Use `coditor run --dry-run -- codex ...` or `coditor config codex` to inspect
 the generated config without launching Codex.
+
+## Phase 9B ChatGPT/Codex Subscription Envoy
+
+`docker-compose.yml` mounts `envoy/envoy.yaml`. That Envoy config routes
+`/backend-api` to `chatgpt.com:443`, sets host rewrite `chatgpt.com`, and
+uses TLS SNI `chatgpt.com`. It leaves ext_proc enabled with buffered request
+bodies and streamed response bodies so `coditor-core` can observe the request
+and streamed response.
+
+Manual preflight:
+
+```sh
+coditor preflight codex-subscription -- codex exec ...
+```
+
+The preflight verifies local Codex ChatGPT login, starts the subscription-mode
+stack, and prints the exact command. It must stop before any real Codex call
+until the user approves the live smoke.
 
 ## Phase 7 Fake Codex Hook Contract
 
@@ -418,8 +443,8 @@ metrics without requiring OpenAI credentials.
 
 Prometheus checks currently cover:
 
-- `coditor_requests_total`
-- `coditor_tokens_total`
+- `coditor_requests_total{provider="codex_responses",model="<bounded label>"}`
+- `coditor_tokens_total{provider="codex_responses",model="<bounded label>",kind="<token kind>"}`
 - `coditor_turn_duration_seconds`
 - `coditor_context_fill_percent`
 - `coditor_sessions_degraded_total` with bounded `codex_*` cause labels
@@ -461,13 +486,15 @@ when available, then response payload metadata if headers are absent.
 
 Resolved MVP decisions:
 
-- API-key mode is the first manual wrapper path; ChatGPT-auth routing remains
-  unsupported/unverified.
-- Codex request compression is disabled for the wrapper with
+- ChatGPT subscription mode is the only Codex CLI wrapper direction and points at
+  local `/backend-api` and `/backend-api/codex`, forwarding to `chatgpt.com`.
+- Codex request compression is disabled for that wrapper path with
   `features.enable_request_compression=false`.
 
 Still unknown until a real capture:
 
+- Whether the live ChatGPT/Codex subscription response stream is byte-for-byte
+  compatible with the existing Responses SSE accumulator.
 - Codex hook schema and whether hooks are authoritative for sessions, only
   enrich proxy sessions, or only provide tool telemetry.
 - Source of cwd/working directory: request metadata, Codex hook payload, config,

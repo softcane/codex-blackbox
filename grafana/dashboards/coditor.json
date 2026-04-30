@@ -31,7 +31,7 @@
       },
       "id": 21,
       "options": {
-        "content": "### How to read this dashboard\n\nPhase 8B validates fixture-first Codex/OpenAI proxy observability only. This dashboard is not production readiness proof and still includes some copied cache-history panels until real Codex captures verify the right long-term views.\n\n**Codex/OpenAI requests and tokens** come from local fake or proxied Responses traffic observed by coditor-core.\n\n**Context fill** is a bounded histogram of context-window fill percentage; it has provider and normalized model labels only.\n\n**Codex diagnosis causes** show bounded `codex_*` degradation causes. Session ids must not appear in metric labels.\n\n**Cache reuse %** is historical token reuse. For Codex this remains fixture-driven until real cache behavior is captured.\n\n**Model fallbacks** mean the requested model was not the one that actually got used.\n\n**Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not exactly match billing.",
+        "content": "### How to read this dashboard\n\nThis dashboard is for Coditor-observed Codex traffic through the local Envoy and coditor-core path. It is still not production readiness proof.\n\n**Codex requests and tokens** come from `coditor_requests_total` and `coditor_tokens_total` with `provider=\"codex_responses\"`.\n\n**Context fill** is a bounded histogram of context-window fill percentage with provider and normalized Codex model labels.\n\n**Codex diagnosis causes** show bounded `codex_*` degradation causes. Session ids must not appear in metric labels.\n\n**Cached input** is Codex/OpenAI cached input from Responses usage details. It is reported exactly as a Responses usage detail.\n\n**Model fallbacks** mean the requested model was not the one actually served.\n\n**Estimated cost** is best-effort and unpriced Codex models stay explicit zero-cost estimates until a trusted pricing catalog is configured.",
         "mode": "markdown"
       },
       "pluginVersion": "11.1.0",
@@ -205,13 +205,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "100 * coditor_history_cache_hit_ratio{window=\"7d\"}",
+          "expr": "100 * sum(coditor_tokens_total{provider=\"codex_responses\",kind=\"cached_input\"}) / clamp_min(sum(coditor_tokens_total{provider=\"codex_responses\",kind=\"input\"}), 1)",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "Cache reuse % (7d)",
-      "description": "Token-weighted cache reuse share across finalized sessions over 7 days.",
+      "title": "Codex cached input % since start",
+      "description": "Cached input as a share of Codex Responses input tokens observed by the current coditor-core process.",
       "type": "stat"
     },
     {
@@ -288,8 +288,8 @@
       },
       "id": 5,
       "panels": [],
-      "title": "Estimated waste you didn't know about",
-      "description": "Cache rebuild waste and silent fallback panels for hidden efficiency losses.",
+      "title": "Codex model and token signals",
+      "description": "Live Codex model usage, token mix, and requested-vs-served fallback panels.",
       "type": "row"
     },
     {
@@ -302,7 +302,7 @@
           "color": {
             "mode": "palette-classic"
           },
-          "unit": "currencyUSD"
+          "unit": "short"
         },
         "overrides": []
       },
@@ -333,13 +333,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_estimated_cache_waste_dollars{window=\"1d\"}",
+          "expr": "sum by (model) (coditor_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
-      "title": "Estimated cache rebuild waste by model (24h)",
-      "description": "Current rolling 24-hour estimated dollars lost to TTL or thrash-driven cache rebuilds, split by model.",
+      "title": "Codex tokens by model since start",
+      "description": "Current-process Codex Responses token totals, grouped by normalized Codex/OpenAI model label.",
       "type": "bargauge"
     },
     {
@@ -383,13 +383,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_model_fallbacks{window=\"1d\"} > 0",
+          "expr": "coditor_history_model_fallbacks{window=\"1d\",requested!~\"opus|sonnet|haiku|legacy_claude\",actual!~\"opus|sonnet|haiku|legacy_claude\"} > 0",
           "legendFormat": "{{requested}} -> {{actual}}",
           "refId": "A"
         }
       ],
-      "title": "Model fallbacks by route (24h)",
-      "description": "Current rolling 24-hour count of requested-vs-actual model mismatches. Only non-zero fallback routes are shown.",
+      "title": "Codex model fallbacks by route (24h)",
+      "description": "Current rolling 24-hour requested-vs-served Codex/OpenAI model mismatches. Legacy copied-model labels are excluded.",
       "type": "bargauge"
     },
     {
@@ -403,7 +403,7 @@
       "id": 8,
       "panels": [],
       "title": "Trends",
-      "description": "Quota burn, spend mix, cache reuse, and degraded-session patterns over time.",
+      "description": "Quota burn, spend mix, cached-input reuse, and degraded-session patterns over time.",
       "type": "row"
     },
     {
@@ -543,13 +543,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\"}",
+          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\",model!~\"opus|sonnet|haiku|legacy_claude\"}",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
-      "title": "Estimated cost by model (24h)",
-      "description": "Current rolling 24-hour estimated spend from persisted requests, grouped by model family.",
+      "title": "Estimated Codex cost by model (24h)",
+      "description": "Current rolling 24-hour estimated spend from persisted Codex requests, grouped by normalized Codex/OpenAI model label.",
       "type": "bargauge"
     },
     {
@@ -627,13 +627,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "100 * coditor_history_cache_hit_ratio{window=\"7d\"}",
-          "legendFormat": "cache reuse ratio",
+          "expr": "sum by (model) (coditor_requests_total{provider=\"codex_responses\"})",
+          "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
-      "title": "Cache reuse ratio (current 7d window)",
-      "description": "Current 7-day historical cache reuse ratio rendered as a trend line.",
+      "title": "Codex requests by model since start",
+      "description": "Current-process Codex request counters grouped by normalized model label.",
       "type": "timeseries"
     },
     {
@@ -697,7 +697,7 @@
       "id": 13,
       "panels": [],
       "title": "Operational signals",
-      "description": "Current activity plus the last 24 hours of cache misses and tool failures.",
+      "description": "Current activity plus Codex response status and tool-failure signals.",
       "type": "row"
     },
     {
@@ -819,13 +819,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_cache_events{window=\"1d\",event_type=\"miss_ttl\"}",
+          "expr": "coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "TTL misses (24h)",
-      "description": "TTL-expiry cache misses observed over the last 24 hours.",
+      "title": "Codex failed responses since start",
+      "description": "Sessions diagnosed with at least one failed Codex Responses turn.",
       "type": "stat"
     },
     {
@@ -883,13 +883,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_cache_events{window=\"1d\",event_type=\"miss_thrash\"}",
+          "expr": "coditor_sessions_degraded_total{cause_type=\"codex_response_incomplete\"}",
           "legendFormat": "",
           "refId": "A"
         }
       ],
-      "title": "Thrash misses (24h)",
-      "description": "Thrash-style cache misses observed over the last 24 hours.",
+      "title": "Codex incomplete responses since start",
+      "description": "Sessions diagnosed with at least one incomplete Codex Responses turn.",
       "type": "stat"
     },
     {
@@ -997,19 +997,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_cache_events{window=\"1d\",event_type=\"miss_ttl\"}",
-          "legendFormat": "ttl",
+          "expr": "coditor_sessions_degraded_total{cause_type=~\"codex_.*\"} > 0",
+          "legendFormat": "{{cause_type}}",
           "refId": "A"
-        },
-        {
-          "editorMode": "code",
-          "expr": "coditor_history_cache_events{window=\"1d\",event_type=\"miss_thrash\"}",
-          "legendFormat": "thrash",
-          "refId": "B"
         }
       ],
-      "title": "Cache misses by type (24h)",
-      "description": "Current rolling 24-hour TTL and thrash cache misses.",
+      "title": "Codex diagnostic causes since start",
+      "description": "Current-process Codex diagnosis causes. Only non-zero Codex-specific causes are shown.",
       "type": "bargauge"
     },
     {
@@ -1103,13 +1097,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\"}",
+          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\",model!~\"opus|sonnet|haiku|legacy_claude\"}",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
-      "title": "Average estimated session cost by model (24h)",
-      "description": "Current rolling 24-hour average estimated cost of finalized sessions, grouped by model family.",
+      "title": "Average estimated Codex session cost by model (24h)",
+      "description": "Current rolling 24-hour average estimated session cost, grouped by normalized Codex/OpenAI model label.",
       "type": "bargauge"
     },
     {
@@ -1156,7 +1150,7 @@
         }
       ],
       "title": "Skill events since start",
-      "description": "UNPORTED: copied baseline, Codex support not implemented yet. Skill lifecycle events observed by copied Claude Code hooks or proxy inference since the current coditor-core start.",
+      "description": "Skill lifecycle events observed by Coditor hook/proxy inference since the current coditor-core start. This panel uses bounded skill/event/source labels only.",
       "type": "stat"
     },
     {
@@ -1472,8 +1466,8 @@
       },
       "id": 28,
       "panels": [],
-      "title": "Codex fixture observability",
-      "description": "Fixture-first Codex/OpenAI proxy metrics. These panels intentionally use bounded labels and do not require OpenAI credentials.",
+      "title": "Codex live observability",
+      "description": "Codex Responses metrics observed through the local Envoy and coditor-core path, bounded by provider/model labels.",
       "type": "row"
     },
     {
@@ -1514,13 +1508,15 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(coditor_requests_total) or vector(0)",
+          "expr": "sum(coditor_requests_total{provider=\"codex_responses\"})",
           "legendFormat": "",
-          "refId": "A"
+          "refId": "A",
+          "instant": true,
+          "range": false
         }
       ],
       "title": "Codex/OpenAI requests since start",
-      "description": "Completed proxy turns observed by coditor-core since the current process start.",
+      "description": "Completed Codex Responses turns observed through coditor-core since the current process start.",
       "type": "stat"
     },
     {
@@ -1564,13 +1560,15 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (kind) (coditor_tokens_total) or vector(0)",
+          "expr": "sum by (kind) (coditor_tokens_total{provider=\"codex_responses\",kind=~\"input|cached_input|uncached_input|output|reasoning_output|total\"})",
           "legendFormat": "{{kind}}",
-          "refId": "A"
+          "refId": "A",
+          "instant": true,
+          "range": false
         }
       ],
       "title": "Codex/OpenAI tokens by kind",
-      "description": "Input, output, and copied baseline cache token counters by normalized model and token kind.",
+      "description": "Codex-native token counters by kind. Cached input is reported exactly as a Responses usage detail.",
       "type": "bargauge"
     },
     {
@@ -1717,7 +1715,7 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Coditor — estimated cost & quality over time",
+  "title": "Coditor \u2014 estimated cost & quality over time",
   "uid": "coditor-main",
   "version": 4,
   "weekStart": "monday"

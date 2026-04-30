@@ -442,7 +442,11 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             .actual_model
             .as_deref()
             .or(turn.requested_model.as_deref())
-            .unwrap_or("sonnet");
+            .unwrap_or(if turn.is_codex() {
+                "codex_unknown"
+            } else {
+                "claude-sonnet"
+            });
         let breakdown = crate::pricing::estimate_cost_dollars(
             model,
             turn.input_tokens as u64,
@@ -846,6 +850,26 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
 }
 
 fn determine_outcome(turns: &[TurnSnapshot]) -> TaskOutcome {
+    if turns.iter().any(TurnSnapshot::is_codex) {
+        let last_codex_status = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.is_codex())
+            .and_then(|turn| turn.codex_status.as_deref())
+            .unwrap_or("unknown");
+        return match last_codex_status {
+            "completed" => TaskOutcome::Completed,
+            "failed" | "incomplete" => TaskOutcome::PartiallyCompleted,
+            _ if turns
+                .iter()
+                .any(|turn| turn.codex_status.as_deref() == Some("completed")) =>
+            {
+                TaskOutcome::PartiallyCompleted
+            }
+            _ => TaskOutcome::Abandoned,
+        };
+    }
+
     if turns.len() < 3 {
         return TaskOutcome::Abandoned;
     }

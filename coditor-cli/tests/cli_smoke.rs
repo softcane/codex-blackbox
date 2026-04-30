@@ -115,7 +115,9 @@ fn top_level_help_exposes_user_workflows() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Coditor observability proxy. Codex API-key wrapper is experimental."));
+    assert!(
+        out.contains("Coditor observability proxy. Codex subscription wrapper is experimental.")
+    );
     assert!(out.contains("doctor"));
     assert!(out.contains("up"));
     assert!(out.contains("run"));
@@ -133,9 +135,10 @@ fn run_help_documents_watch_and_trailing_child_command() {
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
     assert!(out.contains("Run a command through Coditor"));
-    assert!(out.contains("experimental API-key proxy overrides"));
+    assert!(out.contains("experimental subscription proxy overrides"));
     assert!(out.contains("--watch"));
     assert!(out.contains("--dry-run"));
+    assert!(!out.contains("--codex-mode"));
     assert!(out.contains("Command and arguments to run"));
 }
 
@@ -146,18 +149,17 @@ fn config_codex_prints_read_only_future_override() {
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
     assert!(out.contains("Coditor Codex config preview (read-only)"));
-    assert!(out.contains("experimental manual OpenAI API-key wrapper"));
-    assert!(out.contains("docker compose -f docker-compose.yml -f docker-compose.openai.yml up -d"));
+    assert!(out.contains("experimental ChatGPT subscription wrapper"));
+    assert!(out.contains("coditor up"));
     assert!(out.contains("~/.codex/config.toml is not modified"));
-    assert!(out.contains(r#"-c 'model_provider="coditor-openai-responses"'"#));
+    assert!(out.contains(r#"-c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#));
+    assert!(out.contains(r#"-c 'model_provider="coditor-openai"'"#));
     assert!(out.contains(
-        r#"-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'"#
+        r#"-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
     ));
-    assert!(
-        out.contains(r#"-c 'model_providers.coditor-openai-responses.env_key="OPENAI_API_KEY"'"#)
-    );
+    assert!(out.contains("-c model_providers.coditor-openai.supports_websockets=false"));
     assert!(out.contains("-c features.enable_request_compression=false"));
-    assert!(out.contains("ChatGPT-auth Codex backend routing is not supported or verified"));
+    assert!(out.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
 }
 
 #[test]
@@ -174,26 +176,33 @@ fn codex_dry_run_prints_overrides_and_preserves_user_args() {
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Mode: experimental Codex API-key proxy"));
+    assert!(out.contains("Mode: experimental Codex ChatGPT subscription proxy"));
     assert!(out.contains("Config files: not modified"));
     assert!(out.contains("Environment overrides:\n  (none)"));
-    assert!(out.contains(r#"codex -c 'model_provider="coditor-openai-responses"'"#));
+    assert!(out.contains(r#"codex -c 'chatgpt_base_url="http://127.0.0.1:10000/backend-api"'"#));
+    assert!(out.contains(r#"-c 'model_provider="coditor-openai"'"#));
     assert!(out.contains(
-        r#"-c 'model_providers.coditor-openai-responses.base_url="http://127.0.0.1:10000/v1"'"#
+        r#"-c 'model_providers.coditor-openai.base_url="http://127.0.0.1:10000/backend-api/codex"'"#
     ));
-    assert!(out.contains(r#"-c 'model_providers.coditor-openai-responses.wire_api="responses"'"#));
+    assert!(out.contains(r#"-c 'model_providers.coditor-openai.wire_api="responses"'"#));
+    assert!(out.contains("-c model_providers.coditor-openai.supports_websockets=false"));
     assert!(out.contains("-c features.enable_request_compression=false"));
-    assert!(out.contains("exec hello --json"));
+    assert!(out.contains("Codex exec rollout files: disabled with --ephemeral"));
+    assert!(out.contains("OPENAI_API_KEY is not used"));
+    assert!(!out.contains("forced_login_method"));
+    assert!(!out.contains("model_providers.coditor-openai-responses"));
+    assert!(out.contains("exec --ephemeral hello --json"));
 }
 
 #[test]
-fn non_codex_dry_run_keeps_unported_anthropic_fallback() {
+fn non_codex_dry_run_has_no_proxy_overrides() {
     let output = coditor(&["run", "--dry-run", "/bin/sh", "-c", "echo ok"]);
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let out = stdout(&output);
-    assert!(out.contains("Mode: UNPORTED copied Anthropic fallback"));
-    assert!(out.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:10000"));
+    assert!(out.contains("Mode: plain child command (not proxied)"));
+    assert!(out.contains("Environment overrides:\n  (none)"));
+    assert!(!out.contains("ANTHROPIC_BASE_URL"));
     assert!(!out.contains("coditor-openai-responses"));
     assert!(!out.contains("features.enable_request_compression=false"));
 }
@@ -220,19 +229,13 @@ fn codex_dry_run_does_not_mutate_codex_home_config() {
 }
 
 #[test]
-fn run_command_uses_proxy_env_after_core_health_check() {
-    let (url, request_rx) = serve_json_once(r#"{"ok":true}"#);
-    let health_url = format!("{url}/health");
-
-    let output = coditor_with_env(
-        &[
-            "run",
-            "/bin/sh",
-            "-c",
-            "printf '%s' \"$ANTHROPIC_BASE_URL\"; exit 7",
-        ],
-        &[("CODITOR_CORE_HEALTH_URL", &health_url)],
-    );
+fn non_codex_run_command_does_not_set_proxy_env() {
+    let output = coditor(&[
+        "run",
+        "/bin/sh",
+        "-c",
+        "[ -z \"${ANTHROPIC_BASE_URL:-}\" ] && exit 7 || exit 9",
+    ]);
 
     assert_eq!(
         output.status.code(),
@@ -240,12 +243,6 @@ fn run_command_uses_proxy_env_after_core_health_check() {
         "stderr:\n{}",
         stderr(&output)
     );
-    let request = captured_request(request_rx);
-    assert!(
-        request.starts_with("GET /health "),
-        "unexpected request:\n{request}"
-    );
-    assert_eq!(stdout(&output), "http://127.0.0.1:10000");
 }
 
 #[test]

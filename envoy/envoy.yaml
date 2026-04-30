@@ -1,6 +1,8 @@
-# Coditor Envoy proxy.
-# UNPORTED: copied baseline, Codex support not implemented yet. This still
-# routes Anthropic-shaped traffic while coditor-core observes ext_proc phases.
+# Coditor ChatGPT/Codex subscription Envoy proxy.
+# This is the default Coditor stack route for Codex CLI traffic. Codex is
+# pointed at this listener with command-line `chatgpt_base_url` and
+# `openai_base_url` overrides; the upstream remains the ChatGPT/Codex backend
+# at chatgpt.com.
 
 admin:
   address:
@@ -10,7 +12,7 @@ admin:
 
 static_resources:
   listeners:
-    - name: anthropic_listener
+    - name: chatgpt_codex_listener
       address:
         socket_address:
           address: 0.0.0.0
@@ -20,26 +22,29 @@ static_resources:
             - name: envoy.filters.network.http_connection_manager
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
-                stat_prefix: anthropic_proxy
+                stat_prefix: chatgpt_codex_proxy
                 codec_type: AUTO
-
-                # SSE streaming: don't idle-timeout the stream.
                 stream_idle_timeout: 300s
 
                 route_config:
-                  name: anthropic_route
+                  name: chatgpt_codex_route
                   virtual_hosts:
-                    - name: anthropic
+                    - name: chatgpt_codex
                       domains: ["*"]
                       routes:
                         - match:
-                            prefix: "/"
+                            prefix: "/backend-api"
                           route:
-                            cluster: anthropic_upstream
+                            cluster: chatgpt_codex_upstream
                             timeout: 300s
-                            host_rewrite_literal: api.anthropic.com
+                            host_rewrite_literal: chatgpt.com
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 404
+                            body:
+                              inline_string: "Coditor ChatGPT/Codex proxy expects /backend-api paths\n"
 
-                # Access log: every request with status, duration, upstream info.
                 access_log:
                   - name: envoy.access_loggers.stdout
                     typed_config:
@@ -58,20 +63,17 @@ static_resources:
                           response_flags: "%RESPONSE_FLAGS%"
 
                 http_filters:
-                  # ext_proc: send all phases to coditor-core for observation.
                   - name: envoy.filters.http.ext_proc
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
                       grpc_service:
                         envoy_grpc:
                           cluster_name: coditor_ext_proc
-                      # If coditor-core is down, traffic still flows.
                       failure_mode_allow: true
                       message_timeout: 10s
                       processing_mode:
                         request_header_mode: SEND
                         request_body_mode: BUFFERED
-                        # CRITICAL: STREAMED so we see SSE chunks individually.
                         response_header_mode: SEND
                         response_body_mode: STREAMED
 
@@ -80,31 +82,29 @@ static_resources:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
-    # Upstream: Anthropic API over TLS.
-    - name: anthropic_upstream
+    - name: chatgpt_codex_upstream
       type: LOGICAL_DNS
       dns_lookup_family: V4_ONLY
       connect_timeout: 10s
       load_assignment:
-        cluster_name: anthropic_upstream
+        cluster_name: chatgpt_codex_upstream
         endpoints:
           - lb_endpoints:
               - endpoint:
                   address:
                     socket_address:
-                      address: api.anthropic.com
+                      address: chatgpt.com
                       port_value: 443
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: api.anthropic.com
+          sni: chatgpt.com
           common_tls_context:
             validation_context:
               trusted_ca:
                 filename: /etc/ssl/certs/ca-certificates.crt
 
-    # ext_proc: coditor-core gRPC service (HTTP/2 required).
     - name: coditor_ext_proc
       type: STRICT_DNS
       connect_timeout: 1s

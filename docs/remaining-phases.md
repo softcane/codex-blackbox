@@ -19,7 +19,7 @@ Completed:
 - Phase 4A: Codex accounting helpers behind tests.
 - Phase 4B: minimal Codex finalization/watch/metrics path.
 - Phase 5A: fake OpenAI Responses upstream through Envoy.
-- Phase 5B: manual OpenAI API-key Envoy config.
+- Phase 5B: Responses Envoy config static validation.
 - Phase 4C: Codex SQLite persistence and schema mapping.
 - Phase 6A: CLI doctor and config groundwork.
 
@@ -36,10 +36,12 @@ Completed as an experimental/manual wrapper path for Codex:
 - points Codex at the local Coditor proxy with command-line `-c` overrides
 - disables Codex request compression for MVP
 - preserves user-provided Codex arguments
-- prints proxy/config status and unsupported ChatGPT-auth warnings
+- uses the ChatGPT/Codex subscription backend override for live smoke
+  planning
 - avoids editing `~/.codex/config.toml`
 
-It is still not proof that real Codex/OpenAI traffic works.
+It is still not proof that real Codex/OpenAI traffic works until the
+subscription path is live-validated.
 
 ### Phase 6C: Watch And Tmux Codex Polish
 
@@ -89,10 +91,10 @@ Expand fake tests beyond the current text-only Envoy path:
 - watch replay race
 - failure-open behavior after core shutdown
 - failed and incomplete Responses streams
-- CLI smoke through fake proxy
+- CLI dry-run proves the Codex wrapper uses subscription proxy overrides
 - no double-counting of cached input in e2e assertions
 
-Done when fake e2e validates the proxy, parser, finalization, watch, CLI, and failure posture without OpenAI credentials.
+Done when fake e2e validates the proxy, parser, finalization, watch, CLI dry-run shape, and failure posture without OpenAI credentials.
 
 ### Phase 9B: First Real Codex Smoke Test
 
@@ -102,7 +104,7 @@ Minimum preconditions:
 
 - CLI can point Codex at Coditor intentionally.
 - Request compression is disabled or decoded.
-- Manual OpenAI API-key mode is documented.
+- ChatGPT/Codex subscription proxy mode is documented.
 - Fake e2e still passes.
 - The smoke test has clear rollback instructions.
 
@@ -146,7 +148,7 @@ Current test level:
 
 - Unit and contract tests pass.
 - Fake OpenAI Responses Envoy e2e passes.
-- Manual OpenAI Envoy config validates statically.
+- Default ChatGPT/Codex Envoy config validates statically.
 
 Next testing milestones:
 

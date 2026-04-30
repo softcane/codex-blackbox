@@ -47,8 +47,9 @@ any real Codex smoke test. It starts the fake OpenAI stack with Prometheus and
 Grafana, sends parallel fixture `/v1/responses` requests with distinct prompts
 and mixed cwd metadata, covers completed/failed/incomplete streams, exercises
 split SSE chunking through Envoy, verifies late `/watch` replay, checks SQLite
-Codex persistence and token accounting, checks Prometheus/Grafana, runs the
-CLI `coditor run --dry-run -- codex ...` smoke, and finally stops
+Codex persistence and token accounting, checks Prometheus/Grafana, confirms the
+CLI `coditor run --dry-run -- codex ...` uses the ChatGPT subscription proxy
+override, and finally stops
 `coditor-core` to verify Envoy failure-open behavior.
 
 Run it from the repository root:
@@ -61,38 +62,10 @@ The script writes failure artifacts and Compose logs under `/tmp` by default
 and prints that path on failure. It does not require OpenAI credentials, does
 not launch Codex, and is not a real Codex compatibility claim.
 
-## Phase 9B-pre Codex Through Fake Proxy Smoke
+## Phase 5B ChatGPT/Codex Config Validation
 
-`test/smoke-codex-through-fake-proxy.sh` launches the actual `codex` CLI while
-routing model traffic through the local fake OpenAI Responses upstream. It uses
-a dummy `OPENAI_API_KEY`, a temporary `CODEX_HOME`, disables Codex plugins and
-general analytics, and runs `coditor run -- codex exec ...` against the fake
-Envoy stack.
-
-Run it from the repository root:
-
-```sh
-./test/smoke-codex-through-fake-proxy.sh
-```
-
-The script writes artifacts under `reports/smoke/<timestamp>/`, which is
-ignored by git. It asserts `/watch`, `/api/sessions`, `/api/diagnosis`,
-SQLite, Prometheus, and Grafana evidence for the observed Codex session. It
-also asserts the final attempt artifacts do not reference `api.openai.com` or
-`chatgpt.com`. This is still fake-only validation and must not be treated as
-real OpenAI or production Codex support.
-
-To leave the fake stack running after the script:
-
-```sh
-CODITOR_FAKE_CODEX_SMOKE_KEEP_STACK=1 ./test/smoke-codex-through-fake-proxy.sh
-```
-
-## Phase 5B Manual OpenAI API-Key Config
-
-`docker-compose.openai.yml` is an opt-in Compose override that mounts
-`envoy/envoy.openai.yaml`. It is for manual API-key-mode experiments only; the
-default stack and CLI still use the copied unported runtime path.
+`docker-compose.yml` mounts `envoy/envoy.yaml`, the default ChatGPT/Codex
+subscription proxy used by `coditor up` and `coditor run -- codex ...`.
 
 Static validation:
 
@@ -100,5 +73,30 @@ Static validation:
 ./test/validate-openai-config.sh
 ```
 
-This validation does not require OpenAI credentials and does not contact
-OpenAI. ChatGPT-auth Codex backend routing is not supported here.
+This validation does not require credentials and does not contact OpenAI.
+Live ChatGPT-auth Codex backend traffic is not validated here.
+
+## Phase 9B ChatGPT/Codex Subscription Preflight
+
+`docker-compose.yml` mounts `envoy/envoy.yaml`, which routes `/backend-api`
+traffic to `chatgpt.com` with host rewrite and SNI. The wrapper sets
+`chatgpt_base_url` to `/backend-api` for auxiliary backend calls and
+uses a custom `coditor-openai` model provider pointed at `/backend-api/codex`
+for model turns. The custom provider keeps ChatGPT auth, disables Codex
+WebSocket transport, does not use `OPENAI_API_KEY`, and does not include
+`fake-openai`.
+
+The manual preflight command verifies local Codex ChatGPT login, starts the
+subscription-mode Docker stack, and prints the exact live command without
+launching a Codex turn:
+
+```sh
+cargo run -q -p coditor-cli -- preflight codex-subscription -- codex exec \
+  --cd /Users/pradeepsingh/code/coditor \
+  --sandbox read-only \
+  --json \
+  "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
+```
+
+Do not run the printed live command until explicitly approved. This path is
+not validated until a real ChatGPT-auth Codex smoke observes live traffic.

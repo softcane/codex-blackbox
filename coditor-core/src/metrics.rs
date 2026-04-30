@@ -9,8 +9,29 @@ use prometheus::{
 };
 
 pub const HISTORY_WINDOWS: [(&str, u64); 3] = [("1d", 1), ("7d", 7), ("30d", 30)];
-pub const HISTORY_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
-const LIVE_MODELS: [&str; 4] = ["opus", "sonnet", "haiku", "other"];
+pub const HISTORY_MODELS: [&str; 9] = [
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.3",
+    "gpt-5",
+    "gpt-codex",
+    "o4-mini",
+    "o3",
+    "legacy_claude",
+    "other",
+];
+const LIVE_MODELS: [&str; 9] = HISTORY_MODELS;
+const LIVE_PROVIDERS: [&str; 3] = ["codex_responses", "legacy_anthropic", "unknown"];
+const LIVE_TOKEN_KINDS: [&str; 8] = [
+    "input",
+    "cached_input",
+    "uncached_input",
+    "output",
+    "reasoning_output",
+    "total",
+    "cache_read",
+    "cache_create",
+];
 const LIVE_CACHE_EVENT_TYPES: [&str; 4] = ["cold_start", "partial", "miss_ttl", "miss_thrash"];
 const LIVE_SKILL_EVENT_TYPES: [&str; 5] = ["expected", "fired", "missed", "misfired", "failed"];
 const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
@@ -111,7 +132,7 @@ impl CoditorMetrics {
                     "coditor_requests_total",
                     "Completed turns observed by coditor-core."
                 ),
-                &["model"]
+                &["provider", "model"]
             )
             .expect("register coditor_requests_total"),
             tokens_total: register_int_counter_vec!(
@@ -119,7 +140,7 @@ impl CoditorMetrics {
                     "coditor_tokens_total",
                     "Tokens observed by turn and token kind."
                 ),
-                &["model", "kind"]
+                &["provider", "model", "kind"]
             )
             .expect("register coditor_tokens_total"),
             estimated_cost_dollars_total: register_counter_vec!(
@@ -387,16 +408,17 @@ static HISTORY_TOOL_LABELS: LazyLock<Mutex<BTreeSet<String>>> =
 
 pub fn init() {
     let metrics = LazyLock::force(&METRICS);
+    for provider in LIVE_PROVIDERS {
+        for model in LIVE_MODELS {
+            metrics.requests_total.with_label_values(&[provider, model]);
+            for kind in LIVE_TOKEN_KINDS {
+                metrics
+                    .tokens_total
+                    .with_label_values(&[provider, model, kind]);
+            }
+        }
+    }
     for model in LIVE_MODELS {
-        metrics.requests_total.with_label_values(&[model]);
-        metrics.tokens_total.with_label_values(&[model, "input"]);
-        metrics.tokens_total.with_label_values(&[model, "output"]);
-        metrics
-            .tokens_total
-            .with_label_values(&[model, "cache_read"]);
-        metrics
-            .tokens_total
-            .with_label_values(&[model, "cache_create"]);
         metrics
             .estimated_cost_dollars_total
             .with_label_values(&[model]);
@@ -456,22 +478,26 @@ pub fn record_request(
     duration_seconds: f64,
 ) {
     let model = normalize_model(model);
-    METRICS.requests_total.with_label_values(&[model]).inc();
+    let provider = "legacy_anthropic";
+    METRICS
+        .requests_total
+        .with_label_values(&[provider, model])
+        .inc();
     METRICS
         .tokens_total
-        .with_label_values(&[model, "input"])
+        .with_label_values(&[provider, model, "input"])
         .inc_by(input_tokens);
     METRICS
         .tokens_total
-        .with_label_values(&[model, "output"])
+        .with_label_values(&[provider, model, "output"])
         .inc_by(output_tokens);
     METRICS
         .tokens_total
-        .with_label_values(&[model, "cache_read"])
+        .with_label_values(&[provider, model, "cache_read"])
         .inc_by(cache_read_tokens);
     METRICS
         .tokens_total
-        .with_label_values(&[model, "cache_create"])
+        .with_label_values(&[provider, model, "cache_create"])
         .inc_by(cache_create_tokens);
     METRICS
         .estimated_cost_dollars_total
@@ -486,19 +512,43 @@ pub fn record_request(
 pub fn record_codex_turn(
     model: &str,
     input_tokens: u64,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
     output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
     duration_seconds: f64,
 ) {
     let model = normalize_model(model);
-    METRICS.requests_total.with_label_values(&[model]).inc();
+    let provider = "codex_responses";
+    METRICS
+        .requests_total
+        .with_label_values(&[provider, model])
+        .inc();
     METRICS
         .tokens_total
-        .with_label_values(&[model, "input"])
+        .with_label_values(&[provider, model, "input"])
         .inc_by(input_tokens);
     METRICS
         .tokens_total
-        .with_label_values(&[model, "output"])
+        .with_label_values(&[provider, model, "cached_input"])
+        .inc_by(cached_input_tokens);
+    METRICS
+        .tokens_total
+        .with_label_values(&[provider, model, "uncached_input"])
+        .inc_by(uncached_input_tokens);
+    METRICS
+        .tokens_total
+        .with_label_values(&[provider, model, "output"])
         .inc_by(output_tokens);
+    METRICS
+        .tokens_total
+        .with_label_values(&[provider, model, "reasoning_output"])
+        .inc_by(reasoning_output_tokens);
+    METRICS
+        .tokens_total
+        .with_label_values(&[provider, model, "total"])
+        .inc_by(total_tokens);
     METRICS
         .turn_duration_seconds
         .with_label_values(&[model])
@@ -877,12 +927,26 @@ pub fn render() -> Result<(String, String), String> {
 
 fn normalize_model(model: &str) -> &'static str {
     let lower = model.to_ascii_lowercase();
-    if lower.contains("opus") {
-        "opus"
-    } else if lower.contains("sonnet") {
-        "sonnet"
-    } else if lower.contains("haiku") {
-        "haiku"
+    if lower.starts_with("gpt-5.5") {
+        "gpt-5.5"
+    } else if lower.starts_with("gpt-5.4") {
+        "gpt-5.4"
+    } else if lower.starts_with("gpt-5.3") {
+        "gpt-5.3"
+    } else if lower.starts_with("gpt-5") {
+        "gpt-5"
+    } else if lower.starts_with("gpt-codex") || lower.contains("codex") {
+        "gpt-codex"
+    } else if lower.starts_with("o4-mini") {
+        "o4-mini"
+    } else if lower.starts_with("o3") {
+        "o3"
+    } else if lower.contains("claude")
+        || lower.contains("opus")
+        || lower.contains("sonnet")
+        || lower.contains("haiku")
+    {
+        "legacy_claude"
     } else {
         "other"
     }
@@ -1067,7 +1131,7 @@ mod tests {
 
         let (_, body) = render().expect("render metrics");
         assert!(body.contains(
-            "coditor_context_fill_percent_count{model=\"other\",provider=\"codex_responses\"}"
+            "coditor_context_fill_percent_count{model=\"gpt-codex\",provider=\"codex_responses\"}"
         ));
         assert!(
             body.contains("coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}")
