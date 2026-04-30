@@ -126,9 +126,11 @@ Served model precedence is resolved before accounting: response headers
 `openai-model` then `x-openai-model` win over the payload `response.model`;
 payload model is used only when no served-model header was captured.
 
-Pricing remains explicit and untrusted in Phase 4A. Unknown OpenAI/Codex model
-ids produce an `UnknownModel`/unpriced result with no nonzero fallback cost and
-are not trusted for budget enforcement.
+Pricing remains explicit and untrusted in Phase 4A. Known Codex/OpenAI API
+models can produce an estimated API-price cost, with cached input charged as a
+subset of input rather than added on top. Unknown OpenAI/Codex model ids still
+produce an `UnknownModel`/unpriced result with no nonzero fallback cost and are
+not trusted for budget enforcement.
 
 ## Phase 4B Finalization Boundary
 
@@ -148,9 +150,10 @@ Codex watch events are limited to:
   does not imply Anthropic cache TTL/rebuild behavior.
 
 Codex metrics record request count, input tokens, output tokens, duration,
-context status, and model fallback labels where applicable. Unknown/untrusted
-Codex pricing contributes no estimated cost and is not used for session budget
-enforcement.
+context status, and model fallback labels where applicable. Known OpenAI model
+pricing is stored as an untrusted API-price estimate; unknown Codex pricing
+contributes no estimated cost and neither path is used for session budget
+enforcement unless a trusted pricing catalog or reconciliation is provided.
 
 ## Phase 4C SQLite Persistence
 
@@ -221,7 +224,9 @@ For Codex rows, copied Anthropic cache columns remain non-authoritative:
 - `requests.cache_event` is left `NULL` for Codex; Codex cached input does not
   emit or imply a TTL/rebuild cache event.
 
-Unknown OpenAI/Codex pricing is persisted as explicit unpriced zero cost with a
+Known OpenAI API pricing is persisted as an explicit untrusted estimate using
+the Codex-native cached-input fields. Unknown OpenAI/Codex pricing is persisted
+as explicit unpriced zero cost with a
 `codex_unpriced:unknown_model:<model>` cost source and
 `trusted_for_budget_enforcement = 0`. This prevents historical summary paths
 from falling back to copied Anthropic pricing for Codex models.

@@ -447,13 +447,22 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             } else {
                 "claude-sonnet"
             });
-        let breakdown = crate::pricing::estimate_cost_dollars(
-            model,
-            turn.input_tokens as u64,
-            turn.output_tokens as u64,
-            turn.cache_read_tokens as u64,
-            turn.cache_creation_tokens as u64,
-        );
+        let breakdown = if turn.is_codex() {
+            crate::pricing::estimate_codex_api_cost_dollars(
+                model,
+                turn.input_tokens as u64,
+                turn.codex_cached_input_tokens as u64,
+                turn.output_tokens as u64,
+            )
+        } else {
+            crate::pricing::estimate_cost_dollars(
+                model,
+                turn.input_tokens as u64,
+                turn.output_tokens as u64,
+                turn.cache_read_tokens as u64,
+                turn.cache_creation_tokens as u64,
+            )
+        };
         total_cost += breakdown.total_cost_dollars;
         cost_sources.insert(breakdown.cost_source);
         trusted_for_budget_enforcement &= breakdown.trusted_for_budget_enforcement;

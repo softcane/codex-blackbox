@@ -6,8 +6,10 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 pub const BUILTIN_COST_SOURCE: &str = "builtin_model_family_pricing";
+pub const BUILTIN_OPENAI_API_COST_SOURCE: &str = "builtin_openai_api_pricing_standard_under_270k";
 pub const MIXED_COST_SOURCE: &str = "mixed_pricing_sources";
 const PRICING_FILE_ENV: &str = "CODITOR_PRICING_FILE";
+const OPENAI_STANDARD_PRICING_CONTEXT_LIMIT_TOKENS: u64 = 270_000;
 const ZERO_PRICING: ModelPricing = ModelPricing {
     input: 0.0,
     output: 0.0,
@@ -183,10 +185,10 @@ impl PricingCatalog {
             }
         }
 
-        if family_for_model(model).is_some() {
+        if let Some((pricing, cost_source)) = builtin_pricing(model) {
             return ResolvedPricing {
-                pricing: builtin_pricing(model),
-                cost_source: BUILTIN_COST_SOURCE.to_string(),
+                pricing,
+                cost_source: cost_source.to_string(),
                 trusted_for_budget_enforcement: false,
             };
         }
@@ -227,6 +229,14 @@ pub fn unpriced_unknown_model_cost_source(model: &str) -> String {
     format!("codex_unpriced:unknown_model:{model}")
 }
 
+pub fn unpriced_long_context_cost_source(model: &str) -> String {
+    format!("codex_unpriced:long_context_api_pricing:{model}")
+}
+
+pub fn is_unpriced_cost_source(cost_source: &str) -> bool {
+    cost_source.starts_with("codex_unpriced:")
+}
+
 pub fn token_cost(tokens: u64, price_per_mtok: f64) -> f64 {
     (tokens as f64) * price_per_mtok / 1_000_000.0
 }
@@ -251,6 +261,35 @@ pub fn estimate_cost_dollars(
     }
 }
 
+pub fn estimate_codex_api_cost_dollars(
+    model: &str,
+    input: u64,
+    cached_input: u64,
+    output: u64,
+) -> EstimatedCostBreakdown {
+    let resolved = resolve_pricing(model);
+    if input > OPENAI_STANDARD_PRICING_CONTEXT_LIMIT_TOKENS
+        && resolved.cost_source == BUILTIN_OPENAI_API_COST_SOURCE
+    {
+        return EstimatedCostBreakdown {
+            total_cost_dollars: 0.0,
+            cost_source: unpriced_long_context_cost_source(model),
+            trusted_for_budget_enforcement: false,
+        };
+    }
+
+    let uncached_input = input.saturating_sub(cached_input);
+    let total_cost_dollars = token_cost(uncached_input, resolved.pricing.input)
+        + token_cost(cached_input, resolved.pricing.cache_read)
+        + token_cost(output, resolved.pricing.output);
+
+    EstimatedCostBreakdown {
+        total_cost_dollars,
+        cost_source: resolved.cost_source,
+        trusted_for_budget_enforcement: resolved.trusted_for_budget_enforcement,
+    }
+}
+
 pub fn estimate_cache_rebuild_waste_dollars(
     model: &str,
     cache_create: u64,
@@ -266,49 +305,96 @@ pub fn estimate_cache_rebuild_waste_dollars(
 }
 
 fn family_for_model(model: &str) -> Option<&'static str> {
-    if model.contains("opus") {
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("gpt-5.5") {
+        Some("gpt-5.5")
+    } else if lower.starts_with("gpt-5.4-mini") {
+        Some("gpt-5.4-mini")
+    } else if lower.starts_with("gpt-5.4") {
+        Some("gpt-5.4")
+    } else if lower.contains("opus") {
         Some("opus")
-    } else if model.contains("haiku") {
+    } else if lower.contains("haiku") {
         Some("haiku")
-    } else if model.contains("sonnet") {
+    } else if lower.contains("sonnet") {
         Some("sonnet")
     } else {
         None
     }
 }
 
-fn builtin_pricing(model: &str) -> ModelPricing {
-    if model.contains("opus") {
-        ModelPricing {
-            input: 15.0,
-            output: 75.0,
-            cache_read: 1.50,
-            cache_create: 18.75,
-        }
-    } else if model.contains("haiku") {
-        ModelPricing {
-            input: 0.80,
-            output: 4.0,
-            cache_read: 0.08,
-            cache_create: 1.00,
-        }
-    } else if model.contains("sonnet") {
-        ModelPricing {
-            input: 3.0,
-            output: 15.0,
-            cache_read: 0.30,
-            cache_create: 3.75,
-        }
+fn builtin_pricing(model: &str) -> Option<(ModelPricing, &'static str)> {
+    let lower = model.to_ascii_lowercase();
+    if lower.starts_with("gpt-5.5") {
+        Some((
+            ModelPricing {
+                input: 5.0,
+                output: 30.0,
+                cache_read: 0.50,
+                cache_create: 5.0,
+            },
+            BUILTIN_OPENAI_API_COST_SOURCE,
+        ))
+    } else if lower.starts_with("gpt-5.4-mini") {
+        Some((
+            ModelPricing {
+                input: 0.75,
+                output: 4.50,
+                cache_read: 0.075,
+                cache_create: 0.75,
+            },
+            BUILTIN_OPENAI_API_COST_SOURCE,
+        ))
+    } else if lower.starts_with("gpt-5.4") {
+        Some((
+            ModelPricing {
+                input: 2.50,
+                output: 15.0,
+                cache_read: 0.25,
+                cache_create: 2.50,
+            },
+            BUILTIN_OPENAI_API_COST_SOURCE,
+        ))
+    } else if lower.contains("opus") {
+        Some((
+            ModelPricing {
+                input: 15.0,
+                output: 75.0,
+                cache_read: 1.50,
+                cache_create: 18.75,
+            },
+            BUILTIN_COST_SOURCE,
+        ))
+    } else if lower.contains("haiku") {
+        Some((
+            ModelPricing {
+                input: 0.80,
+                output: 4.0,
+                cache_read: 0.08,
+                cache_create: 1.00,
+            },
+            BUILTIN_COST_SOURCE,
+        ))
+    } else if lower.contains("sonnet") {
+        Some((
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.30,
+                cache_create: 3.75,
+            },
+            BUILTIN_COST_SOURCE,
+        ))
     } else {
-        ZERO_PRICING
+        None
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        estimate_cache_rebuild_waste_dollars, estimate_cost_dollars, PricingCatalog,
-        BUILTIN_COST_SOURCE,
+        estimate_cache_rebuild_waste_dollars, estimate_codex_api_cost_dollars,
+        estimate_cost_dollars, PricingCatalog, BUILTIN_COST_SOURCE, BUILTIN_OPENAI_API_COST_SOURCE,
     };
 
     #[test]
@@ -347,6 +433,13 @@ cache_create = 2.45
         assert_eq!(builtin.cost_source, BUILTIN_COST_SOURCE);
         assert!(!builtin.trusted_for_budget_enforcement);
         assert_eq!(builtin.pricing.input, 0.80);
+
+        let gpt = catalog.resolve("gpt-5.5");
+        assert_eq!(gpt.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
+        assert!(!gpt.trusted_for_budget_enforcement);
+        assert_eq!(gpt.pricing.input, 5.0);
+        assert_eq!(gpt.pricing.cache_read, 0.50);
+        assert_eq!(gpt.pricing.output, 30.0);
     }
 
     #[test]
@@ -358,5 +451,29 @@ cache_create = 2.45
         let waste = estimate_cache_rebuild_waste_dollars("claude-sonnet-4-5", 1_000_000);
         assert_eq!(waste.cost_source, BUILTIN_COST_SOURCE);
         assert!((waste.total_cost_dollars - 3.45).abs() < 1e-9);
+    }
+
+    #[test]
+    fn codex_api_estimate_prices_cached_input_as_subset() {
+        let estimate = estimate_codex_api_cost_dollars("gpt-5.5", 1_280, 512, 96);
+
+        assert_eq!(estimate.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
+        assert!(!estimate.trusted_for_budget_enforcement);
+        assert!((estimate.total_cost_dollars - 0.006976).abs() < 1e-12);
+    }
+
+    #[test]
+    fn codex_api_estimate_stays_unpriced_for_unknown_or_long_context_models() {
+        let unknown = estimate_codex_api_cost_dollars("gpt-codex-fixture", 1_280, 512, 96);
+        assert_eq!(unknown.total_cost_dollars, 0.0);
+        assert!(unknown
+            .cost_source
+            .starts_with("codex_unpriced:unknown_model:"));
+
+        let long = estimate_codex_api_cost_dollars("gpt-5.5", 270_001, 0, 96);
+        assert_eq!(long.total_cost_dollars, 0.0);
+        assert!(long
+            .cost_source
+            .starts_with("codex_unpriced:long_context_api_pricing:"));
     }
 }

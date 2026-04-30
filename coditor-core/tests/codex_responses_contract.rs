@@ -9,6 +9,7 @@ use coditor_core::codex_response::{
     CodexResponseHeaders, CodexResponseStatus, CodexResponseSummary, CodexResponsesAccumulator,
     CodexUsage,
 };
+use coditor_core::pricing::BUILTIN_OPENAI_API_COST_SOURCE;
 use serde_json::Value;
 
 const MINIMAL_TEXT_REQUEST: &str =
@@ -573,6 +574,29 @@ fn codex_turn_accounting_keeps_unknown_model_pricing_explicit() {
         }
     );
     assert_eq!(accounting.pricing.cost_dollars, None);
+    assert!(!accounting.pricing.trusted_for_budget_enforcement);
+}
+
+#[test]
+fn codex_turn_accounting_prices_known_openai_models_without_double_counting_cached_input() {
+    let mut request = parse_minimal_request();
+    request.model = "gpt-5.5".to_string();
+    let mut response = accumulate_fixture(TEXT_STREAM);
+    response.served_model = Some("gpt-5.5".to_string());
+
+    let accounting = summarize_codex_turn(&request, &response);
+
+    assert_eq!(
+        accounting.pricing.status,
+        CodexPricingStatus::EstimatedApiPricing {
+            model: "gpt-5.5".to_string(),
+            cost_source: BUILTIN_OPENAI_API_COST_SOURCE.to_string()
+        }
+    );
+    assert_eq!(accounting.cached_input_tokens, 512);
+    assert_eq!(accounting.uncached_input_tokens, 768);
+    assert_eq!(accounting.output_tokens, 96);
+    assert!((accounting.pricing.cost_dollars.unwrap_or_default() - 0.006976).abs() < 1e-12);
     assert!(!accounting.pricing.trusted_for_budget_enforcement);
 }
 

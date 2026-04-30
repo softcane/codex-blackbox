@@ -1,5 +1,6 @@
 use crate::codex_request::{CodexSessionIdentitySource, ParsedCodexRequest};
 use crate::codex_response::{CodexResponseStatus, CodexResponseSummary, CodexToolCallSummary};
+use crate::pricing;
 
 const PROMPT_EXCERPT_MAX_CHARS: usize = 320;
 
@@ -66,6 +67,7 @@ pub struct CodexPricingEstimate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodexPricingStatus {
+    EstimatedApiPricing { model: String, cost_source: String },
     UnknownModel { model: String },
 }
 
@@ -121,20 +123,45 @@ pub fn summarize_codex_turn(
         first_user_prompt_excerpt: prompt_excerpt(request.first_user_input.as_deref()),
         tool_calls: response.tool_calls.clone(),
         anomalies,
-        pricing: CodexPricingEstimate::unknown_model(&pricing_model),
+        pricing: CodexPricingEstimate::estimate_api_pricing(
+            &pricing_model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+        ),
     }
 }
 
 pub fn estimate_codex_turn_cost(accounting: &CodexTurnAccounting) -> CodexPricingEstimate {
-    CodexPricingEstimate::unknown_model(
-        accounting
-            .served_model
-            .as_deref()
-            .unwrap_or(accounting.requested_model.as_str()),
+    let model = accounting
+        .served_model
+        .as_deref()
+        .unwrap_or(accounting.requested_model.as_str());
+    CodexPricingEstimate::estimate_api_pricing(
+        model,
+        accounting.input_tokens,
+        accounting.cached_input_tokens,
+        accounting.output_tokens,
     )
 }
 
 impl CodexPricingEstimate {
+    fn estimate_api_pricing(model: &str, input: u64, cached_input: u64, output: u64) -> Self {
+        let estimate = pricing::estimate_codex_api_cost_dollars(model, input, cached_input, output);
+        if pricing::is_unpriced_cost_source(&estimate.cost_source) {
+            return Self::unknown_model(model);
+        }
+
+        Self {
+            status: CodexPricingStatus::EstimatedApiPricing {
+                model: model.to_string(),
+                cost_source: estimate.cost_source,
+            },
+            cost_dollars: Some(estimate.total_cost_dollars),
+            trusted_for_budget_enforcement: estimate.trusted_for_budget_enforcement,
+        }
+    }
+
     fn unknown_model(model: &str) -> Self {
         Self {
             status: CodexPricingStatus::UnknownModel {

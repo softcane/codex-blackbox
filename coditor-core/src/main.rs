@@ -3298,6 +3298,9 @@ fn codex_status_label(status: &codex_accounting::CodexTurnStatus) -> &'static st
 
 fn codex_cost_source(accounting: &codex_accounting::CodexTurnAccounting) -> String {
     match &accounting.pricing.status {
+        codex_accounting::CodexPricingStatus::EstimatedApiPricing { cost_source, .. } => {
+            cost_source.clone()
+        }
         codex_accounting::CodexPricingStatus::UnknownModel { model } => {
             pricing::unpriced_unknown_model_cost_source(model)
         }
