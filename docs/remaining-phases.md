@@ -1,9 +1,8 @@
 # Remaining Phases
 
 Current checkpoint: Phase 9B has a real Codex smoke result documented in
-`docs/real-codex-smoke.md`. Phase 9C now has a real automated dogfood harness
-and its first four-session run is `partial` because real tool and MCP watch
-telemetry are still missing.
+`docs/real-codex-smoke.md`. Phase 9C has a real automated dogfood harness, and
+the broader 5-repo validation now captures real tool, MCP, and skill telemetry.
 
 Coditor already has unit, contract, and fake Envoy e2e tests. The remaining question is when to start each kind of testing.
 
@@ -27,17 +26,16 @@ Completed:
 - Phase 9A: broader fake OpenAI Responses e2e regression.
 - Phase 9B: first real ChatGPT-auth Codex smoke test for Codex 0.125.0.
 
-Implemented with remaining gaps:
+Implemented:
 
 - Phase 9C: `test/dogfood-codex-sessions.sh` can run 1-4 real Codex sessions
-  and report passed, failed, skipped, and missing capabilities. The first full
-  run passed session/watch/SQLite/Prometheus/Grafana coverage and reported
-  missing real tool/MCP watch events.
+  and report passed, failed, skipped, and missing capabilities. Subsequent live
+  validation added real Codex JSONL-derived tool/MCP/skill telemetry.
 
 ## Remaining Work
 
-The remaining work spans Phase 6C, real tool/MCP telemetry and diagnosis polish
-from Phase 7 and Phase 8, the Phase 9C missing capabilities, and Phase 10.
+The remaining work spans Phase 6C polish, real MCP success-path validation,
+diagnosis polish from Phase 8, and Phase 10.
 
 For execution, split them into these smaller gates:
 
@@ -149,8 +147,8 @@ The harness described in
 - write a report that names passed, failed, skipped, and missing capabilities
 
 Done for the harness shape when it can say exactly what is left rather than
-only pass/fail. The current report does that; the remaining work is to close
-the missing real tool/MCP telemetry it names.
+only pass/fail. The current report does that; real tool/MCP/skill telemetry is
+now captured from Codex JSONL, while MCP success-path validation remains open.
 
 ### Phase 10: Documentation And Release Readiness
 
@@ -186,8 +184,8 @@ Next testing milestones:
 6. After Phase 8: diagnosis, Prometheus, and Grafana checks become meaningful.
 7. After Phase 9A: full fake e2e regression testing.
 8. Completed after Phase 9B: first real Codex smoke test.
-9. Implemented after Phase 9C: automated 3-4 session dogfood feedback that
-   currently reports missing real tool/MCP watch telemetry.
+9. Implemented after Phase 9C: automated dogfood feedback plus broader 5-repo
+   live validation with real tool/MCP/skill telemetry.
 
 Do not treat Coditor as ready for daily dogfood until the Phase 9C report is
 clean enough for the intended use, especially real tool and MCP telemetry.
@@ -201,8 +199,9 @@ Codex 0.125.0 subscription path. It ran on 2026-04-30 UTC and is documented in
 Left before the automated 3-4 session dogfood harness the user described:
 
 - the harness exists and ran four real sessions
-- the current report is `partial`
-- real tool and MCP watch telemetry are missing
+- the latest broader validation captured real tool, MCP, and skill telemetry
+- MCP calls in the validation were cancelled by the child session, so the MCP
+  success path still needs separate validation
 
 Phase 9C is now the automated feedback boundary across same/different repos,
 read queries, tool-oriented prompts, MCP when configured, SQLite, Prometheus,

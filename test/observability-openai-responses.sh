@@ -245,10 +245,10 @@ if dashboard.get("uid") != "coditor-main":
 local_dashboard = json.loads(Path("grafana/dashboards/coditor.json").read_text())
 panels = local_dashboard.get("panels", [])
 required_panel_titles = {
-    "Codex/OpenAI requests since start",
-    "Codex/OpenAI tokens by kind",
-    "Codex context fill p95",
-    "Codex diagnosis causes",
+    "Codex Responses requests since start",
+    "Codex Responses tokens by kind",
+    "Codex context fill p95 (5m)",
+    "Codex diagnosis cause labels",
 }
 panels_by_title = {panel.get("title"): panel for panel in panels}
 missing = sorted(required_panel_titles - set(panels_by_title))

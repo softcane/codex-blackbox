@@ -45,10 +45,10 @@ Grafana, command, and Compose artifacts under `reports/dogfood/<timestamp>/`.
 a Phase 9A fake regression convenience. It is not a real dogfood substitute.
 
 First live result: on 2026-04-30 UTC / 2026-05-01 Europe/Stockholm, the harness
-ran four real Codex 0.125.0 sessions and produced a `partial` report. It passed
-session launch, same/different repo coverage, `/watch` session/turn/context
-events, SQLite, Prometheus, and Grafana checks. It reported missing real tool
-and MCP watch telemetry. The detailed log is in `docs/real-codex-smoke.md`.
+ran four real Codex 0.125.0 sessions and produced a `partial` report. A later
+5-repo validation captured real tool, MCP, and skill telemetry through Codex
+JSONL stdout. The detailed log is in `docs/real-codex-smoke.md`; the broader
+calibration report is under `reports/live-codex-validation-20260430T234815Z/`.
 
 ## What The Harness Should Do
 
@@ -269,5 +269,7 @@ and produce a report that answers:
 - Did tool and MCP events appear when expected?
 - What is still missing, skipped, or failing?
 
-The current answer is intentionally `partial`: the harness runs and reports the
-state accurately, while real tool and MCP watch telemetry remain missing.
+The current answer is no longer missing real tool/MCP/skill telemetry: Coditor
+captures Codex JSONL `command_execution`, `mcp_tool_call`, and skill-file-read
+signals. MCP calls in the latest validation were cancelled by the child session,
+so the MCP success-result path still needs separate validation.

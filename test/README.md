@@ -148,5 +148,7 @@ Each child Codex invocation redirects stdin from `/dev/null`; this protects the
 manifest loops even if a future wrapper regresses to inherited stdin.
 
 The first four-session run completed all child Codex sessions and passed
-session/watch/SQLite/Prometheus/Grafana checks. It was still `partial` because
-Coditor did not emit real `ToolUse`/`ToolResult` or `McpEvent` watch events.
+session/watch/SQLite/Prometheus/Grafana checks. Later 5-repo validation added
+real Codex JSONL-derived `ToolUse`/`ToolResult`, `McpEvent`, and `SkillEvent`
+coverage. MCP calls in that run were cancelled by the child session, so the MCP
+success-result path is still a separate validation target.

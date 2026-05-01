@@ -343,6 +343,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_waste_dollars REAL DEFAULT 0.0,
     request_count INTEGER DEFAULT 0,
     model TEXT,
+    display_name TEXT,
     initial_prompt TEXT
 );
 
@@ -503,6 +504,7 @@ enum DbCommand {
         session_id: String,
         started_at: String,
         model: String,
+        display_name: String,
         initial_prompt: Option<String>,
     },
     RecordRequest {
@@ -538,6 +540,7 @@ enum DbCommand {
         duration_ms: u64,
         context_utilization: f64,
         context_window_tokens: u64,
+        display_name: String,
         initial_prompt: Option<String>,
         response_id: Option<String>,
         tool_names_json: String,
@@ -693,6 +696,9 @@ fn ensure_session_columns(conn: &Connection) -> rusqlite::Result<()> {
 
     if !columns.contains("initial_prompt") {
         conn.execute("ALTER TABLE sessions ADD COLUMN initial_prompt TEXT", [])?;
+    }
+    if !columns.contains("display_name") {
+        conn.execute("ALTER TABLE sessions ADD COLUMN display_name TEXT", [])?;
     }
     if columns.contains("cache_hit_ratio") {
         conn.execute("ALTER TABLE sessions DROP COLUMN cache_hit_ratio", [])?;
@@ -983,11 +989,12 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 session_id,
                 started_at,
                 model,
+                display_name,
                 initial_prompt,
             } => {
                 let _ = conn.execute(
-                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, initial_prompt) VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![session_id, started_at, model, initial_prompt],
+                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, display_name, initial_prompt) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![session_id, started_at, model, display_name, initial_prompt],
                 );
             }
             DbCommand::RecordRequest {
@@ -1080,6 +1087,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 duration_ms,
                 context_utilization,
                 context_window_tokens,
+                display_name,
                 initial_prompt,
                 response_id,
                 tool_names_json,
@@ -1095,12 +1103,13 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     .unwrap_or(requested_model.as_str())
                     .to_string();
                 let _ = conn.execute(
-                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, initial_prompt) \
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO sessions (session_id, started_at, model, display_name, initial_prompt) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     rusqlite::params![
                         &session_id,
                         &timestamp,
                         &requested_model,
+                        &display_name,
                         &initial_prompt
                     ],
                 );
@@ -1230,7 +1239,8 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                      total_codex_tokens = total_codex_tokens + ?7, \
                      total_cost_dollars = total_cost_dollars + ?8, \
                      request_count = request_count + 1, \
-                     ended_at = ?9 \
+                     ended_at = ?9, \
+                     display_name = COALESCE(NULLIF(display_name, ''), ?10) \
                      WHERE session_id = ?1",
                     rusqlite::params![
                         session_id,
@@ -1242,6 +1252,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         total_tokens,
                         cost_dollars,
                         timestamp,
+                        display_name,
                     ],
                 );
             }
@@ -2700,6 +2711,7 @@ fn finalize_response(
                 session_id: session_id.clone(),
                 started_at: now_iso8601(),
                 model: model.to_string(),
+                display_name: display_name.clone(),
                 initial_prompt: if user_prompt_excerpt.is_empty() {
                     None
                 } else {
@@ -3482,6 +3494,7 @@ fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: Stri
         duration_ms: outcome.duration_ms,
         context_utilization: outcome.context_fill_percent / 100.0,
         context_window_tokens: outcome.context_window_tokens,
+        display_name: codex_display_name(accounting),
         initial_prompt: accounting.first_user_prompt_excerpt.clone(),
         response_id: accounting.identity.response_id.clone(),
         tool_names_json: codex_tool_names_json(accounting),
@@ -3809,6 +3822,7 @@ fn stored_tool_recall_context(
 struct PersistedWatchSession {
     session_id: String,
     model: Option<String>,
+    display_name: Option<String>,
     initial_prompt: Option<String>,
 }
 
@@ -3836,7 +3850,7 @@ fn load_persisted_watch_sessions(
 ) -> rusqlite::Result<Vec<PersistedWatchSession>> {
     if let Some(session_id) = session_filter {
         let mut stmt = conn.prepare(
-            "SELECT session_id, model, initial_prompt \
+            "SELECT session_id, model, display_name, initial_prompt \
              FROM sessions WHERE session_id = ?1 LIMIT 1",
         )?;
         return stmt
@@ -3844,14 +3858,15 @@ fn load_persisted_watch_sessions(
                 Ok(PersistedWatchSession {
                     session_id: row.get::<_, String>(0)?,
                     model: row.get::<_, Option<String>>(1)?,
-                    initial_prompt: row.get::<_, Option<String>>(2)?,
+                    display_name: row.get::<_, Option<String>>(2)?,
+                    initial_prompt: row.get::<_, Option<String>>(3)?,
                 })
             })?
             .collect();
     }
 
     let mut stmt = conn.prepare(
-        "SELECT session_id, model, initial_prompt \
+        "SELECT session_id, model, display_name, initial_prompt \
          FROM sessions \
          WHERE request_count > 0 \
          ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?1",
@@ -3861,7 +3876,8 @@ fn load_persisted_watch_sessions(
             Ok(PersistedWatchSession {
                 session_id: row.get::<_, String>(0)?,
                 model: row.get::<_, Option<String>>(1)?,
-                initial_prompt: row.get::<_, Option<String>>(2)?,
+                display_name: row.get::<_, Option<String>>(2)?,
+                initial_prompt: row.get::<_, Option<String>>(3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3924,11 +3940,13 @@ fn load_persisted_watch_replay_events(
     let mut events = Vec::new();
 
     for session in sessions {
-        let display_name = persisted_session_display_name(
-            &session.session_id,
-            session.model.as_deref(),
-            session.initial_prompt.as_deref(),
-        );
+        let display_name = session.display_name.clone().unwrap_or_else(|| {
+            persisted_session_display_name(
+                &session.session_id,
+                session.model.as_deref(),
+                session.initial_prompt.as_deref(),
+            )
+        });
         let model = session
             .model
             .clone()
@@ -5507,6 +5525,14 @@ fn codex_hook_mcp_parts(
     fallback_tool_name.and_then(metrics::mcp_tool_labels)
 }
 
+fn codex_hook_skill_name(payload: &Value) -> Option<String> {
+    codex_hook_first_string(
+        payload,
+        &["skill", "skill_name"],
+        &[&["skill", "name"], &["metadata", "skill_name"]],
+    )
+}
+
 fn build_codex_hook_watch_events(payload: &Value, timestamp: String) -> CodexHookBuildResult {
     let (hook_session_id, proxy_session_id, resolved_session_id) =
         resolve_codex_hook_session_ids(payload);
@@ -5653,6 +5679,29 @@ fn build_codex_hook_watch_events(payload: &Value, timestamp: String) -> CodexHoo
                 });
             } else {
                 ignored_reason = Some("missing_mcp_tool".to_string());
+            }
+        }
+        "skill_expected" | "skill_fired" | "skill_failed" | "skill_missed" | "skill_misfired" => {
+            if let Some(skill_name) = codex_hook_skill_name(payload) {
+                let event_type = event_name
+                    .strip_prefix("skill_")
+                    .unwrap_or(event_name.as_str())
+                    .to_string();
+                watch_events.push(watch::WatchEvent::SkillEvent {
+                    session_id: session_id.clone(),
+                    timestamp: timestamp.clone(),
+                    skill_name,
+                    event_type,
+                    source: "hook".to_string(),
+                    confidence: payload
+                        .get("confidence")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0)
+                        .clamp(0.0, 1.0),
+                    detail: codex_hook_detail(payload, codex_hook_outcome(payload)),
+                });
+            } else {
+                ignored_reason = Some("missing_skill_name".to_string());
             }
         }
         _ => ignored_reason = Some("unknown_event".to_string()),
@@ -5861,16 +5910,16 @@ fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookPr
                 if outcome_lower.contains("fail") || outcome_lower.contains("denied") {
                     metrics::record_tool_failures(&tool_name, 1);
                     note_codex_tool_failure_for_active_turn(&session_id, false);
-                    let _ = DB_TX.send(DbCommand::WriteToolOutcome {
-                        session_id,
-                        turn_number: 0,
-                        timestamp: now_iso8601(),
-                        tool_name: tool_name.clone(),
-                        input_summary: String::new(),
-                        outcome: outcome.clone(),
-                        duration_ms,
-                    });
                 }
+                let _ = DB_TX.send(DbCommand::WriteToolOutcome {
+                    session_id,
+                    turn_number: 0,
+                    timestamp: now_iso8601(),
+                    tool_name: tool_name.clone(),
+                    input_summary: String::new(),
+                    outcome: outcome.clone(),
+                    duration_ms,
+                });
                 watch::BROADCASTER.broadcast(event);
                 result.events_emitted += 1;
             }
@@ -5919,6 +5968,26 @@ fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookPr
                         detail,
                     });
                 }
+                result.events_emitted += 1;
+            }
+            watch::WatchEvent::SkillEvent {
+                session_id,
+                timestamp,
+                skill_name,
+                event_type,
+                source,
+                confidence,
+                detail,
+            } => {
+                emit_skill_event(SkillTelemetryEvent {
+                    session_id,
+                    timestamp,
+                    skill_name,
+                    event_type,
+                    source,
+                    confidence,
+                    detail,
+                });
                 result.events_emitted += 1;
             }
             other => {
@@ -7128,7 +7197,7 @@ async fn handle_sessions(
 
         let mut stmt = conn
             .prepare(
-                "SELECT s.session_id, s.started_at, s.model, s.initial_prompt, d.outcome, d.degraded, \
+                "SELECT s.session_id, s.started_at, s.model, s.display_name, s.initial_prompt, d.outcome, d.degraded, \
                         d.total_turns, d.causes_json, d.cache_hit_ratio \
                  FROM sessions s \
                  LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
@@ -7139,6 +7208,7 @@ async fn handle_sessions(
 
         type RecentSessionRow = (
             String,
+            Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
@@ -7157,10 +7227,11 @@ async fn handle_sessions(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<i32>>(5)?.map(|value| value != 0),
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<f64>>(8)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i32>>(6)?.map(|value| value != 0),
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
                 ))
             })
             .ok()?
@@ -7181,6 +7252,7 @@ async fn handle_sessions(
                     session_id,
                     started_at,
                     model,
+                    stored_display_name,
                     initial_prompt,
                     stored_outcome,
                     stored_degraded,
@@ -7239,11 +7311,13 @@ async fn handle_sessions(
                         String::new()
                     };
                     let billed = billing.get(&session_id);
-                    let display_name = persisted_session_display_name(
-                        &session_id,
-                        model.as_deref(),
-                        initial_prompt.as_deref(),
-                    );
+                    let display_name = stored_display_name.unwrap_or_else(|| {
+                        persisted_session_display_name(
+                            &session_id,
+                            model.as_deref(),
+                            initial_prompt.as_deref(),
+                        )
+                    });
                     build_session_summary_json(
                         session_id,
                         display_name,
@@ -8968,6 +9042,18 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .expect("turn count");
         assert_eq!(request_count, 1);
         assert_eq!(turn_count, 1);
+        let (session_display_name, session_initial_prompt): (String, String) = conn
+            .query_row(
+                "SELECT display_name, initial_prompt FROM sessions WHERE session_id = 'phase-4c-session-001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load codex session");
+        assert_eq!(session_display_name, "coditor");
+        assert_eq!(
+            session_initial_prompt,
+            "Summarize the current repository status."
+        );
 
         let (
             provider,
@@ -9424,6 +9510,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                     session_id: "session-anthropic-legacy".to_string(),
                     started_at: "2026-04-30T12:00:07Z".to_string(),
                     model: "claude-sonnet-fixture".to_string(),
+                    display_name: "legacy".to_string(),
                     initial_prompt: Some("legacy fallback prompt".to_string()),
                 },
                 DbCommand::RecordRequest {
@@ -9889,6 +9976,42 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
+    fn codex_hook_skill_event_produces_skill_watch_event() {
+        let payload = serde_json::json!({
+            "schema": "coditor.codex_hook.v1",
+            "event": "skill_fired",
+            "session_id": "codex-hook-session-001",
+            "proxy_session_id": "codex-session-fixture-001",
+            "skill_name": "openai-docs",
+            "source": "coditor-cli-json",
+            "confidence": 0.8,
+            "outcome": "announced by child json"
+        });
+        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:06Z".to_string());
+        assert_eq!(built.status, "accepted");
+        assert!(built.watch_events.iter().any(|event| {
+            matches!(
+                event,
+                super::watch::WatchEvent::SkillEvent {
+                    session_id,
+                    skill_name,
+                    event_type,
+                    source,
+                    confidence,
+                    detail,
+                    ..
+                } if session_id == "codex-session-fixture-001"
+                    && skill_name == "openai-docs"
+                    && event_type == "fired"
+                    && source == "hook"
+                    && (*confidence - 0.8).abs() < f64::EPSILON
+                    && detail.as_deref().unwrap_or("").contains("announced")
+                    && detail.as_deref().unwrap_or("").contains("source=coditor-cli-json")
+            )
+        }));
+    }
+
+    #[test]
     fn codex_hook_unknown_and_malformed_payloads_are_ignored_safely() {
         let unknown = serde_json::json!({
             "event": "future_hook_event",
@@ -10155,6 +10278,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .collect::<Vec<_>>();
 
         assert!(columns.contains(&"initial_prompt".to_string()));
+        assert!(columns.contains(&"display_name".to_string()));
         assert!(!columns.contains(&"cache_hit_ratio".to_string()));
     }
 
@@ -11558,6 +11682,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             session_id: "session-test".to_string(),
             started_at: "2026-01-01T00:00:00Z".to_string(),
             model: "claude-sonnet".to_string(),
+            display_name: "session-test".to_string(),
             initial_prompt: None,
         })
         .expect("queue session insert");

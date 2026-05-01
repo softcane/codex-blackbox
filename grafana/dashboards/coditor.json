@@ -31,7 +31,7 @@
       },
       "id": 21,
       "options": {
-        "content": "### How to read this dashboard\n\nThis dashboard is for Coditor-observed Codex traffic through the local Envoy and coditor-core path. It is still not production readiness proof.\n\n**Codex requests and tokens** come from `coditor_requests_total` and `coditor_tokens_total` with `provider=\"codex_responses\"`.\n\n**Context fill** is a bounded histogram of context-window fill percentage with provider and normalized Codex model labels.\n\n**Codex diagnosis causes** show bounded `codex_*` degradation causes. Session ids must not appear in metric labels.\n\n**Cached input** is Codex/OpenAI cached input from Responses usage details. It is reported exactly as a Responses usage detail.\n\n**Model fallbacks** mean the requested model was not the one actually served.\n\n**Estimated cost** is best-effort and unpriced Codex models stay explicit zero-cost estimates until a trusted pricing catalog is configured.",
+        "content": "### How to read this dashboard\n\n**Codex request** means a model turn Coditor saw, not every ChatGPT backend call.\n\n**Degraded session** means the session hit a problem Coditor can name, not just an early warning.\n\n**Degraded sessions %** is the main health number. Lower is better.\n\n**Degraded causes** tells you what kind of problem happened, so repeated patterns stand out.\n\n**Cached input %** shows how much Codex input came from provider cache reuse. Higher is usually better because less input had to be processed fresh.\n\n**Context fill** shows how much of the model context was used by input. Higher means less room is left.\n\n**Failed or incomplete responses** mean the Responses stream ended badly or stopped before a normal completion.\n\n**Model fallbacks** mean Codex asked for one model and got another.\n\n**Tool, skill, and MCP panels** only show events Coditor could see. Empty panels can mean telemetry is missing, not that nothing happened.\n\n**Estimated cost** is a best-effort cost estimate. It is useful for trends, but it may not match billing.",
         "mode": "markdown"
       },
       "pluginVersion": "11.1.0",
@@ -102,7 +102,7 @@
         }
       ],
       "title": "Estimated Codex cost last 7d",
-      "description": "Rolling 7-day estimated Codex spend from persisted per-model historical gauges.",
+      "description": "Estimated Codex spend over the last 7 days. Useful for trend spotting, but it may not match billing.",
       "type": "stat"
     },
     {
@@ -149,7 +149,7 @@
         }
       ],
       "title": "Sessions finalized (7d)",
-      "description": "Number of finalized sessions in the current 7-day window.",
+      "description": "Finalized sessions in the current 7-day window.",
       "type": "stat"
     },
     {
@@ -215,7 +215,7 @@
         }
       ],
       "title": "Codex cached input % since start",
-      "description": "Cached input as a share of Codex Responses input tokens observed by the current coditor-core process.",
+      "description": "Share of Codex input tokens that came from provider cache reuse. Higher is usually better.",
       "type": "stat"
     },
     {
@@ -279,7 +279,7 @@
         }
       ],
       "title": "Degraded sessions % (7d)",
-      "description": "Share of finalized sessions flagged degraded in the current 7-day window.",
+      "description": "Share of finalized sessions with a diagnosis cause in the current 7-day window. Lower is better.",
       "type": "stat"
     },
     {
@@ -293,7 +293,7 @@
       "id": 5,
       "panels": [],
       "title": "Codex model and token signals",
-      "description": "Live Codex model usage, token mix, and requested-vs-served fallback panels.",
+      "description": "Model usage, token volume, and requested-vs-served model changes.",
       "type": "row"
     },
     {
@@ -345,7 +345,7 @@
         }
       ],
       "title": "Codex tokens by model since start",
-      "description": "Current-process Codex Responses token totals, grouped by normalized Codex/OpenAI model label.",
+      "description": "Total Codex tokens by served model since coditor-core started.",
       "type": "bargauge"
     },
     {
@@ -395,7 +395,7 @@
         }
       ],
       "title": "Codex model fallbacks by route (24h)",
-      "description": "Current rolling 24-hour requested-vs-served Codex/OpenAI model mismatches. Legacy copied-model labels are excluded.",
+      "description": "Requested model to served model changes over the last 24 hours. Only non-zero routes are shown.",
       "type": "bargauge"
     },
     {
@@ -409,7 +409,7 @@
       "id": 8,
       "panels": [],
       "title": "Trends",
-      "description": "Quota burn, spend mix, cached-input reuse, and degraded-session patterns over time.",
+      "description": "Budget, spend, request, and degradation trends.",
       "type": "row"
     },
     {
@@ -487,7 +487,7 @@
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "none"
         }
       },
       "targets": [
@@ -505,7 +505,7 @@
         }
       ],
       "title": "Weekly tokens used vs cap",
-      "description": "Weekly token usage versus the configured or inferred budget cap. If no budget is configured, only usage will render.",
+      "description": "Weekly token usage against the local budget cap. The tooltip compares usage and cap at the same time.",
       "type": "timeseries"
     },
     {
@@ -549,13 +549,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} and on(model) (sum by (model) (coditor_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0)",
+          "expr": "coditor_history_estimated_spend_dollars_by_model{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} > 0",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
       "title": "Estimated Codex cost by model (24h)",
-      "description": "Current rolling 24-hour estimated spend from persisted Codex requests, grouped by normalized Codex/OpenAI model label.",
+      "description": "Estimated Codex spend by model over the last 24 hours. Only non-zero model totals are shown.",
       "type": "bargauge"
     },
     {
@@ -639,7 +639,7 @@
         }
       ],
       "title": "Codex requests by model since start",
-      "description": "Current-process Codex request counters grouped by normalized model label.",
+      "description": "Codex request counts by model since coditor-core started.",
       "type": "timeseries"
     },
     {
@@ -689,7 +689,7 @@
         }
       ],
       "title": "Degraded causes by type (7d)",
-      "description": "Current rolling 7-day degraded-session causes broken out by cause type. Only non-zero causes are shown.",
+      "description": "Degraded-session causes over the last 7 days. Only non-zero causes are shown.",
       "type": "bargauge"
     },
     {
@@ -703,7 +703,7 @@
       "id": 13,
       "panels": [],
       "title": "Operational signals",
-      "description": "Current activity plus Codex response status and tool-failure signals.",
+      "description": "Live session count plus response, tool, skill, and MCP signals.",
       "type": "row"
     },
     {
@@ -767,7 +767,7 @@
         }
       ],
       "title": "Active sessions now",
-      "description": "Current number of active in-memory sessions being tracked.",
+      "description": "Sessions currently tracked in memory.",
       "type": "stat"
     },
     {
@@ -831,7 +831,7 @@
         }
       ],
       "title": "Codex failed responses since start",
-      "description": "Sessions diagnosed with at least one failed Codex Responses turn.",
+      "description": "Sessions with at least one failed Codex Responses turn since coditor-core started.",
       "type": "stat"
     },
     {
@@ -895,7 +895,7 @@
         }
       ],
       "title": "Codex incomplete responses since start",
-      "description": "Sessions diagnosed with at least one incomplete Codex Responses turn.",
+      "description": "Sessions with at least one incomplete Codex Responses turn since coditor-core started.",
       "type": "stat"
     },
     {
@@ -959,7 +959,7 @@
         }
       ],
       "title": "Tool failures (24h)",
-      "description": "Total tool_result failures observed over the last 24 hours.",
+      "description": "Tool failures observed over the last 24 hours.",
       "type": "stat"
     },
     {
@@ -1009,7 +1009,7 @@
         }
       ],
       "title": "Codex diagnostic causes since start",
-      "description": "Current-process Codex diagnosis causes. Only non-zero Codex-specific causes are shown.",
+      "description": "Codex diagnosis causes since coditor-core started. Only non-zero causes are shown.",
       "type": "bargauge"
     },
     {
@@ -1059,7 +1059,7 @@
         }
       ],
       "title": "Tool failures by tool (24h)",
-      "description": "Current rolling 24-hour tool failures grouped by tool label. Only non-zero tools are shown.",
+      "description": "Tool failures by tool over the last 24 hours. Only non-zero tools are shown.",
       "type": "bargauge"
     },
     {
@@ -1103,13 +1103,13 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} and on(model) (sum by (model) (coditor_requests_total{provider=\"codex_responses\"}) > 0)",
+          "expr": "coditor_history_avg_estimated_session_cost_dollars{window=\"1d\",model=~\"gpt-5[.]5|gpt-5[.]4|gpt-5[.]3|gpt-5|gpt-codex|o4-mini|o3|other\"} > 0",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
       ],
       "title": "Average estimated Codex session cost by model (24h)",
-      "description": "Current rolling 24-hour average estimated session cost, grouped by normalized Codex/OpenAI model label.",
+      "description": "Average estimated Codex session cost by model over the last 24 hours. Only non-zero models are shown.",
       "type": "bargauge"
     },
     {
@@ -1156,7 +1156,7 @@
         }
       ],
       "title": "Skill events since start",
-      "description": "Skill lifecycle events observed by Coditor hook/proxy inference since the current coditor-core start. This panel uses bounded skill/event/source labels only.",
+      "description": "Skill lifecycle events Coditor observed since coditor-core started.",
       "type": "stat"
     },
     {
@@ -1220,7 +1220,7 @@
         }
       ],
       "title": "Skill misses/failures since start",
-      "description": "Skill missed, misfired, or failed events since the current coditor-core start.",
+      "description": "Skill missed, misfired, or failed events since coditor-core started.",
       "type": "stat"
     },
     {
@@ -1267,7 +1267,7 @@
         }
       ],
       "title": "MCP events since start",
-      "description": "MCP lifecycle events observed by hooks or proxy-derived metrics since the current coditor-core start.",
+      "description": "MCP lifecycle events Coditor observed since coditor-core started.",
       "type": "stat"
     },
     {
@@ -1331,7 +1331,7 @@
         }
       ],
       "title": "MCP failures/denials since start",
-      "description": "Failed or denied MCP lifecycle events since the current coditor-core start.",
+      "description": "Failed or denied MCP events since coditor-core started.",
       "type": "stat"
     },
     {
@@ -1395,7 +1395,7 @@
         }
       ],
       "title": "Skill lifecycle by skill since start",
-      "description": "Current cumulative skill lifecycle counts by skill, event type, and source since the current coditor-core start. Only non-zero rows are shown.",
+      "description": "Skill lifecycle counts by skill, event type, and source.",
       "type": "table"
     },
     {
@@ -1459,7 +1459,7 @@
         }
       ],
       "title": "MCP lifecycle by tool since start",
-      "description": "Current cumulative MCP lifecycle counts by server, tool, event type, and source since the current coditor-core start. Only non-zero rows are shown.",
+      "description": "MCP lifecycle counts by server, tool, event type, and source.",
       "type": "table"
     },
     {
@@ -1473,7 +1473,7 @@
       "id": 28,
       "panels": [],
       "title": "Codex live observability",
-      "description": "Codex Responses metrics observed through the local Envoy and coditor-core path, bounded by provider/model labels.",
+      "description": "Raw Codex Responses counters for request, token, context, and diagnosis checks.",
       "type": "row"
     },
     {
@@ -1521,8 +1521,8 @@
           "range": false
         }
       ],
-      "title": "Codex/OpenAI requests since start",
-      "description": "Completed Codex Responses turns observed through coditor-core since the current process start.",
+      "title": "Codex Responses requests since start",
+      "description": "Codex Responses model turns observed since coditor-core started.",
       "type": "stat"
     },
     {
@@ -1573,8 +1573,8 @@
           "range": false
         }
       ],
-      "title": "Codex/OpenAI tokens by kind",
-      "description": "Codex-native token counters by kind. Cached input is reported exactly as a Responses usage detail.",
+      "title": "Codex Responses tokens by kind",
+      "description": "Codex token counters by kind. Cached input is part of input, not extra tokens.",
       "type": "bargauge"
     },
     {
@@ -1637,8 +1637,8 @@
           "refId": "A"
         }
       ],
-      "title": "Codex context fill p95",
-      "description": "Five-minute p95 of observed Codex Responses context-window fill percentage.",
+      "title": "Codex context fill p95 (5m)",
+      "description": "Five-minute p95 context fill. Higher means less context room is left.",
       "type": "stat"
     },
     {
@@ -1693,7 +1693,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "coditor_sessions_degraded_total{cause_type=~\"codex_.*\"} >= 0",
+          "expr": "coditor_sessions_degraded_total{cause_type=~\"codex_.*\"} > 0",
           "format": "table",
           "instant": true,
           "legendFormat": "{{cause_type}}",
@@ -1701,8 +1701,8 @@
           "refId": "A"
         }
       ],
-      "title": "Codex diagnosis causes",
-      "description": "Bounded Codex-native diagnosis cause counters. Session ids must never appear as labels.",
+      "title": "Codex diagnosis cause labels",
+      "description": "Codex diagnosis causes by label. Only non-zero causes are shown.",
       "type": "table"
     }
   ],
@@ -1723,6 +1723,6 @@
   "timezone": "",
   "title": "Coditor \u2014 estimated cost & quality over time",
   "uid": "coditor-main",
-  "version": 4,
+  "version": 5,
   "weekStart": "monday"
 }

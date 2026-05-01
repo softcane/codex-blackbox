@@ -125,7 +125,8 @@ pub fn parse_codex_responses_request(
     let metadata = value.get("metadata").cloned();
     let client_metadata = value.get("client_metadata").cloned();
     let cwd = cwd_from_metadata(metadata.as_ref())
-        .or_else(|| cwd_from_metadata(client_metadata.as_ref()));
+        .or_else(|| cwd_from_metadata(client_metadata.as_ref()))
+        .or_else(|| cwd_from_input_preamble(input));
     let session = resolve_session_identity(
         &headers,
         client_metadata.as_ref(),
@@ -219,63 +220,120 @@ fn count_input_items(input: &Value) -> usize {
 }
 
 fn first_user_visible_input(input: &Value) -> Option<String> {
-    match input {
-        Value::String(text) => non_empty_string(text),
-        Value::Array(items) => {
-            first_text_from_items(items, true).or_else(|| first_text_from_items(items, false))
-        }
-        Value::Object(_) => text_from_input_item(input),
-        _ => None,
-    }
-}
-
-fn first_text_from_items(items: &[Value], require_user_role: bool) -> Option<String> {
-    items.iter().find_map(|item| {
-        let role = item.get("role").and_then(Value::as_str);
-        if require_user_role && role != Some("user") {
-            return None;
-        }
-        text_from_input_item(item)
+    let mut user_texts = Vec::new();
+    collect_visible_input_texts(input, true, &mut user_texts);
+    select_user_prompt_candidate(&user_texts).or_else(|| {
+        let mut fallback_texts = Vec::new();
+        collect_visible_input_texts(input, false, &mut fallback_texts);
+        select_user_prompt_candidate(&fallback_texts)
     })
 }
 
-fn text_from_input_item(item: &Value) -> Option<String> {
-    match item {
-        Value::String(text) => non_empty_string(text),
-        Value::Object(object) => {
-            if object.get("type").and_then(Value::as_str) == Some("input_text") {
-                if let Some(text) = object.get("text").and_then(Value::as_str) {
-                    return non_empty_string(text);
-                }
+fn collect_visible_input_texts(input: &Value, require_user_role: bool, out: &mut Vec<String>) {
+    match input {
+        Value::String(text) => {
+            if let Some(text) = non_empty_string(text) {
+                out.push(text);
             }
-            object
-                .get("content")
-                .and_then(text_from_content)
-                .or_else(|| {
-                    object
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .and_then(non_empty_string)
-                })
         }
-        _ => None,
+        Value::Array(items) => {
+            for item in items {
+                collect_visible_input_texts(item, require_user_role, out);
+            }
+        }
+        Value::Object(object) => {
+            let role = object.get("role").and_then(Value::as_str);
+            let is_message_like = object.contains_key("role") || object.contains_key("content");
+            let is_text_part = object.get("type").and_then(Value::as_str) == Some("input_text");
+            if require_user_role && is_message_like && role != Some("user") {
+                return;
+            }
+            if require_user_role && !is_message_like && !is_text_part {
+                return;
+            }
+            collect_text_fragments(input, out);
+        }
+        _ => {}
     }
 }
 
-fn text_from_content(content: &Value) -> Option<String> {
-    match content {
-        Value::String(text) => non_empty_string(text),
-        Value::Array(parts) => {
-            let joined = parts
-                .iter()
-                .filter_map(text_from_input_item)
-                .collect::<Vec<_>>()
-                .join("\n");
-            non_empty_string(&joined)
+fn collect_text_fragments(input: &Value, out: &mut Vec<String>) {
+    match input {
+        Value::String(text) => {
+            if let Some(text) = non_empty_string(text) {
+                out.push(text);
+            }
         }
-        Value::Object(_) => text_from_input_item(content),
-        _ => None,
+        Value::Array(parts) => {
+            for part in parts {
+                collect_text_fragments(part, out);
+            }
+        }
+        Value::Object(object) => {
+            if object.get("type").and_then(Value::as_str) == Some("input_text") {
+                if let Some(text) = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .and_then(non_empty_string)
+                {
+                    out.push(text);
+                    return;
+                }
+            }
+            if let Some(content) = object.get("content") {
+                collect_text_fragments(content, out);
+            }
+            if let Some(text) = object
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(non_empty_string)
+            {
+                out.push(text);
+            }
+        }
+        _ => {}
     }
+}
+
+fn select_user_prompt_candidate(texts: &[String]) -> Option<String> {
+    let mut fallback = None;
+    for text in texts.iter().rev() {
+        let Some(candidate) = codex_user_prompt_candidate(text) else {
+            continue;
+        };
+        if is_codex_instruction_preamble(&candidate) {
+            fallback.get_or_insert(candidate);
+            continue;
+        }
+        return Some(candidate);
+    }
+    fallback
+}
+
+fn codex_user_prompt_candidate(text: &str) -> Option<String> {
+    let mut candidate = text.trim();
+    for marker in [
+        "## My request for Codex:",
+        "</environment_context>",
+        "</INSTRUCTIONS>",
+    ] {
+        if let Some(index) = candidate.rfind(marker) {
+            let tail = candidate[index + marker.len()..].trim();
+            if !tail.is_empty() {
+                candidate = tail;
+                break;
+            }
+        }
+    }
+    non_empty_string(candidate)
+}
+
+fn is_codex_instruction_preamble(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<INSTRUCTIONS>")
+        || trimmed.starts_with("Files called AGENTS.md commonly appear")
 }
 
 fn text_length_from_value(value: &Value) -> usize {
@@ -305,6 +363,26 @@ fn cwd_from_metadata(metadata: Option<&Value>) -> Option<String> {
     None
 }
 
+fn cwd_from_input_preamble(input: &Value) -> Option<String> {
+    let mut texts = Vec::new();
+    collect_visible_input_texts(input, false, &mut texts);
+    texts
+        .iter()
+        .find_map(|text| cwd_from_agents_preamble(text.as_str()))
+}
+
+fn cwd_from_agents_preamble(text: &str) -> Option<String> {
+    let marker = "AGENTS.md instructions for ";
+    let start = text.find(marker)? + marker.len();
+    let path = text[start..]
+        .split(|ch: char| ch.is_whitespace() || ch == '<')
+        .next()
+        .unwrap_or("")
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`'))
+        .to_string();
+    non_empty_string(&path)
+}
+
 fn sessionish_id_from_client_metadata(client_metadata: Option<&Value>) -> Option<String> {
     let client_metadata = client_metadata?;
     for key in [
@@ -327,4 +405,71 @@ fn sessionish_id_from_client_metadata(client_metadata: Option<&Value>) -> Option
 fn non_empty_string(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_codex_responses_request, CodexRequestHeaders};
+
+    #[test]
+    fn request_prompt_prefers_actual_task_after_codex_preamble() {
+        let body = br##"{
+          "model": "gpt-5.5",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [
+                {
+                  "type": "input_text",
+                  "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Follow local rules.</INSTRUCTIONS><environment_context><cwd>/repo</cwd></environment_context>\nCODITOR marker actual prompt. Do not edit files."
+                }
+              ]
+            }
+          ],
+          "client_metadata": {"session_id": "session-preamble"}
+        }"##;
+
+        let parsed = parse_codex_responses_request(body, CodexRequestHeaders::default())
+            .expect("parse request");
+
+        assert_eq!(
+            parsed.first_user_input.as_deref(),
+            Some("CODITOR marker actual prompt. Do not edit files.")
+        );
+        assert_eq!(parsed.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[test]
+    fn request_prompt_prefers_later_user_text_over_agents_text_part() {
+        let body = br##"{
+          "model": "gpt-5.5",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [
+                {
+                  "type": "input_text",
+                  "text": "# AGENTS.md instructions for /repo\n<INSTRUCTIONS>Follow local rules.</INSTRUCTIONS>"
+                },
+                {
+                  "type": "input_text",
+                  "text": "CODITOR marker second text part. Do not edit files."
+                }
+              ]
+            }
+          ],
+          "client_metadata": {"session_id": "session-text-part"}
+        }"##;
+
+        let parsed = parse_codex_responses_request(body, CodexRequestHeaders::default())
+            .expect("parse request");
+
+        assert_eq!(
+            parsed.first_user_input.as_deref(),
+            Some("CODITOR marker second text part. Do not edit files.")
+        );
+        assert_eq!(parsed.cwd.as_deref(), Some("/repo"));
+    }
 }

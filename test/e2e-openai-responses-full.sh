@@ -631,10 +631,10 @@ if dashboard.get("uid") != "coditor-main":
 panel_titles = {panel.get("title") for panel in dashboard.get("panels", [])}
 required_panel_titles = {
     "Estimated Codex cost last 7d",
-    "Codex/OpenAI requests since start",
-    "Codex/OpenAI tokens by kind",
-    "Codex context fill p95",
-    "Codex diagnosis causes",
+    "Codex Responses requests since start",
+    "Codex Responses tokens by kind",
+    "Codex context fill p95 (5m)",
+    "Codex diagnosis cause labels",
 }
 for title in required_panel_titles:
     if title not in panel_titles:

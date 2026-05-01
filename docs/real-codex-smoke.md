@@ -102,6 +102,28 @@ Missing:
 - The MCP prompt reached `openaiDeveloperDocs`; the MCP tool call was cancelled
   inside the child session, and Coditor did not emit `McpEvent` watch events.
 
+### Broader Calibration Update
+
+A later 5-repo live validation is recorded under
+`reports/live-codex-validation-20260430T234815Z/`.
+
+That run captured:
+
+- 5 real Codex sessions, all exit `0`.
+- Marker-backed SQLite rows whose `initial_prompt` stores the real task instead
+  of the injected AGENTS/environment preamble.
+- Distinct persisted display names: `coditor`, `clauditor`, `claude-code`,
+  `LLMs-from-scratch`, and `contextgc_poc`.
+- Real shell `ToolUse`/`ToolResult` events from Codex JSONL
+  `command_execution`.
+- Real `McpEvent` rows from Codex JSONL `mcp_tool_call`.
+- A real `SkillEvent` for `openai-docs`.
+- Matching SQLite session/request token totals and Prometheus request/token
+  totals.
+
+Open: the MCP calls were still cancelled by the child session, so the MCP
+success-result path remains unproven.
+
 ### Rollback
 
 ```sh
@@ -113,11 +135,10 @@ services running.
 
 ### Limitations
 
-- Live support remains experimental until tool and MCP telemetry are captured
-  and correlated through real Codex hooks or another verified source.
-- Real Codex request prompt excerpts begin with injected AGENTS instructions, so
-  the dogfood harness correlates real sessions from Codex JSONL
-  `thread.started` ids rather than prompt markers alone.
+- Live support remains experimental until the MCP success-result path and
+  future Codex version compatibility are validated.
+- Real Codex request prompt excerpts now strip injected AGENTS/environment
+  preambles before persistence; display names are stored separately.
 - Pricing remains untrusted for budget enforcement.
 - The smoke and dogfood reports prove this local ChatGPT subscription path on
   Codex 0.125.0; they do not prove future Codex versions or API-key mode.
