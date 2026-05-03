@@ -1,8 +1,8 @@
 mod tmux;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,6 +12,33 @@ use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
+
+pub(crate) const WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Default)]
+pub(crate) struct WatchRetryLog {
+    last_error: Option<String>,
+}
+
+impl WatchRetryLog {
+    pub(crate) fn retry_message(&mut self, error: impl std::fmt::Display) -> Option<String> {
+        let error = error.to_string();
+        if self.last_error.as_deref() == Some(error.as_str()) {
+            return None;
+        }
+
+        self.last_error = Some(error.clone());
+        Some(format!(
+            "Waiting for coditor-core... (retrying every {}s; {})",
+            WATCH_RECONNECT_DELAY.as_secs(),
+            error
+        ))
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.last_error = None;
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1350,6 +1377,7 @@ fn codex_child_args_with_subscription_overrides(
     codex_model_base_url: &str,
 ) -> Vec<String> {
     let config_args = codex_config_args_for_subscription(chatgpt_base_url, codex_model_base_url);
+    let command_args = codex_args_without_json_stdout(command_args);
     if let Some(exec_index) = command_args
         .iter()
         .position(|arg| matches!(arg.as_str(), "exec" | "e"))
@@ -1364,6 +1392,14 @@ fn codex_child_args_with_subscription_overrides(
         args.extend(command_args.iter().cloned());
         args
     }
+}
+
+fn codex_args_without_json_stdout(command_args: &[String]) -> Vec<String> {
+    command_args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .cloned()
+        .collect()
 }
 
 fn codex_command_requires_observation(command_args: &[String]) -> bool {
@@ -1588,36 +1624,10 @@ fn run_codex_command_with_filtered_stderr(
     }
     let mut child = child
         .stdin(stdin_mode.stdio())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("failed to spawn {command}: {err}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture child stdout".to_string())?;
-    let mut telemetry_state = codex_stdout_telemetry_state(args);
-    let stdout_thread = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    println!("{line}");
-                    let _ = io::stdout().flush();
-                    for payload in codex_json_stdout_hook_payloads(&line, &mut telemetry_state) {
-                        if let Err(err) = post_codex_hook_payload(&payload) {
-                            eprintln!("Coditor: failed to forward Codex JSON telemetry: {err}");
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("Coditor: failed to read Codex stdout: {err}");
-                    break;
-                }
-            }
-        }
-    });
 
     let stderr = child
         .stderr
@@ -1640,7 +1650,6 @@ fn run_codex_command_with_filtered_stderr(
     let status = child
         .wait()
         .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
-    let _ = stdout_thread.join();
     let _ = stderr_thread.join();
 
     Ok(exit_code(status))
@@ -1650,392 +1659,6 @@ fn should_suppress_codex_stderr_line(line: &str) -> bool {
     line.contains("failed to record rollout items")
         || line == "Reading additional input from stdin..."
         || line.contains("write_stdin failed: stdin is closed for this session")
-}
-
-#[derive(Debug, Default)]
-struct CodexJsonTelemetryState {
-    session_id: Option<String>,
-    cwd: Option<String>,
-    model: Option<String>,
-    announced_skills: HashSet<String>,
-}
-
-fn codex_arg_value(args: &[String], long: &str, short: Option<&str>) -> Option<String> {
-    for index in 0..args.len() {
-        let arg = &args[index];
-        if arg == long || short.is_some_and(|short| arg == short) {
-            return args.get(index + 1).cloned();
-        }
-        if let Some(value) = arg.strip_prefix(&format!("{long}=")) {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn codex_stdout_telemetry_state(args: &[String]) -> CodexJsonTelemetryState {
-    CodexJsonTelemetryState {
-        cwd: codex_arg_value(args, "--cd", None),
-        model: codex_arg_value(args, "--model", Some("-m")),
-        ..Default::default()
-    }
-}
-
-fn codex_json_hook_base(
-    state: &CodexJsonTelemetryState,
-    event: &str,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    let session_id = state.session_id.as_ref()?.clone();
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "schema".to_string(),
-        serde_json::Value::String("coditor.codex_hook.v1".to_string()),
-    );
-    payload.insert(
-        "event".to_string(),
-        serde_json::Value::String(event.to_string()),
-    );
-    payload.insert(
-        "session_id".to_string(),
-        serde_json::Value::String(session_id.clone()),
-    );
-    payload.insert(
-        "proxy_session_id".to_string(),
-        serde_json::Value::String(session_id),
-    );
-    payload.insert(
-        "source".to_string(),
-        serde_json::Value::String("coditor-cli-json".to_string()),
-    );
-    if let Some(cwd) = state.cwd.as_ref() {
-        payload.insert("cwd".to_string(), serde_json::Value::String(cwd.clone()));
-    }
-    if let Some(model) = state.model.as_ref() {
-        payload.insert(
-            "model".to_string(),
-            serde_json::Value::String(model.clone()),
-        );
-    }
-    Some(payload)
-}
-
-fn codex_item_failed(item: &serde_json::Value) -> bool {
-    item.get("status")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|status| status.eq_ignore_ascii_case("failed"))
-        || item
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|code| code != 0)
-        || item
-            .get("error")
-            .is_some_and(|error| !error.is_null() && error != "")
-}
-
-fn codex_tool_outcome(item: &serde_json::Value) -> String {
-    if codex_item_failed(item) {
-        item.get("error")
-            .and_then(|error| {
-                error
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| error.as_str())
-            })
-            .map(|message| format!("failed: {message}"))
-            .unwrap_or_else(|| "failed".to_string())
-    } else {
-        "succeeded".to_string()
-    }
-}
-
-fn codex_tool_payload(
-    state: &CodexJsonTelemetryState,
-    event: &str,
-    item: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let command = item.get("command")?.as_str()?.to_string();
-    let mut payload = codex_json_hook_base(state, event)?;
-    let mut tool = serde_json::Map::new();
-    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
-        tool.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    }
-    tool.insert(
-        "name".to_string(),
-        serde_json::Value::String("shell".to_string()),
-    );
-    tool.insert(
-        "input".to_string(),
-        serde_json::json!({
-            "command": command,
-        }),
-    );
-    if event != "tool_start" {
-        tool.insert(
-            "outcome".to_string(),
-            serde_json::Value::String(codex_tool_outcome(item)),
-        );
-    }
-    payload.insert("tool".to_string(), serde_json::Value::Object(tool));
-    Some(serde_json::Value::Object(payload))
-}
-
-fn codex_mcp_payload(
-    state: &CodexJsonTelemetryState,
-    event: &str,
-    item: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let server = item.get("server")?.as_str()?.to_string();
-    let tool_name = item.get("tool")?.as_str()?.to_string();
-    let mut payload = codex_json_hook_base(state, event)?;
-    let mut mcp = serde_json::Map::new();
-    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
-        mcp.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    }
-    mcp.insert("server".to_string(), serde_json::Value::String(server));
-    mcp.insert("tool".to_string(), serde_json::Value::String(tool_name));
-    if let Some(arguments) = item.get("arguments") {
-        mcp.insert("input".to_string(), arguments.clone());
-    }
-    payload.insert("mcp".to_string(), serde_json::Value::Object(mcp));
-    if event != "mcp_tool_start" {
-        payload.insert(
-            "outcome".to_string(),
-            serde_json::Value::String(codex_tool_outcome(item)),
-        );
-    }
-    Some(serde_json::Value::Object(payload))
-}
-
-fn extract_announced_skill(text: &str) -> Option<String> {
-    let lower = text.to_ascii_lowercase();
-    if !lower.contains("skill") {
-        return None;
-    }
-
-    let mut opening_tick: Option<usize> = None;
-    for (index, ch) in text.char_indices() {
-        if ch == '`' {
-            if let Some(start) = opening_tick.take() {
-                let candidate = text[start..index].trim();
-                if is_valid_skill_candidate(candidate)
-                    && backticked_candidate_has_skill_context(text, start - 1, index + 1)
-                {
-                    return Some(candidate.to_string());
-                }
-            } else {
-                opening_tick = Some(index + ch.len_utf8());
-            }
-        }
-    }
-
-    None
-}
-
-fn is_valid_skill_candidate(candidate: &str) -> bool {
-    !candidate.is_empty()
-        && candidate.len() <= 80
-        && candidate
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
-}
-
-fn backticked_candidate_has_skill_context(
-    text: &str,
-    opening_tick: usize,
-    after_closing_tick: usize,
-) -> bool {
-    let before_tail = text[..opening_tick]
-        .chars()
-        .rev()
-        .take(80)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let after_head = text[after_closing_tick..]
-        .chars()
-        .take(64)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    let after = after_head.trim_start_matches(|ch: char| {
-        ch.is_whitespace() || matches!(ch, ':' | '-' | '|' | ',' | '(' | '[')
-    });
-
-    starts_with_word(after, "skill") || before_tail_has_skill_intro(&before_tail)
-}
-
-fn starts_with_word(text: &str, word: &str) -> bool {
-    let Some(rest) = text.strip_prefix(word) else {
-        return false;
-    };
-    rest.chars()
-        .next()
-        .map(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
-        .unwrap_or(true)
-}
-
-fn before_tail_has_skill_intro(before_tail: &str) -> bool {
-    let before = before_tail.trim_end();
-    before.ends_with("skill") || before.ends_with("skill:") || before.ends_with("skill `")
-}
-
-fn codex_skill_payload(
-    state: &mut CodexJsonTelemetryState,
-    text: &str,
-) -> Option<serde_json::Value> {
-    let skill = extract_announced_skill(text)?;
-    codex_named_skill_payload(state, skill, "announced by Codex JSON output")
-}
-
-fn codex_named_skill_payload(
-    state: &mut CodexJsonTelemetryState,
-    skill: String,
-    outcome: &str,
-) -> Option<serde_json::Value> {
-    if !state.announced_skills.insert(skill.clone()) {
-        return None;
-    }
-    let mut payload = codex_json_hook_base(state, "skill_fired")?;
-    payload.insert("skill_name".to_string(), serde_json::Value::String(skill));
-    payload.insert("confidence".to_string(), serde_json::json!(0.75));
-    payload.insert(
-        "outcome".to_string(),
-        serde_json::Value::String(outcome.to_string()),
-    );
-    Some(serde_json::Value::Object(payload))
-}
-
-fn extract_skill_from_command(command: &str) -> Option<String> {
-    for marker in ["/skills/.system/", "/skills/"] {
-        let Some(start) = command.find(marker).map(|index| index + marker.len()) else {
-            continue;
-        };
-        let tail = &command[start..];
-        let Some((candidate, rest)) = tail.split_once('/') else {
-            continue;
-        };
-        if rest.contains("SKILL.md") && is_valid_skill_candidate(candidate) {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-fn codex_skill_payload_from_command(
-    state: &mut CodexJsonTelemetryState,
-    item: &serde_json::Value,
-) -> Option<serde_json::Value> {
-    let command = item.get("command")?.as_str()?;
-    let skill = extract_skill_from_command(command)?;
-    codex_named_skill_payload(state, skill, "observed Codex reading skill instructions")
-}
-
-fn codex_json_stdout_hook_payloads(
-    line: &str,
-    state: &mut CodexJsonTelemetryState,
-) -> Vec<serde_json::Value> {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return Vec::new();
-    };
-    let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
-        return Vec::new();
-    };
-
-    if event_type == "thread.started" {
-        if let Some(thread_id) = value.get("thread_id").and_then(serde_json::Value::as_str) {
-            state.session_id = Some(thread_id.to_string());
-        }
-        return Vec::new();
-    }
-
-    let Some(item) = value.get("item") else {
-        return Vec::new();
-    };
-    let Some(item_type) = item.get("type").and_then(serde_json::Value::as_str) else {
-        return Vec::new();
-    };
-
-    match (event_type, item_type) {
-        ("item.started", "command_execution") => {
-            let mut payloads = Vec::new();
-            payloads.extend(codex_skill_payload_from_command(state, item));
-            payloads.extend(codex_tool_payload(state, "tool_start", item));
-            payloads
-        }
-        ("item.completed", "command_execution") => {
-            let event = if codex_item_failed(item) {
-                "tool_failure"
-            } else {
-                "tool_finish"
-            };
-            codex_tool_payload(state, event, item).into_iter().collect()
-        }
-        ("item.started", "mcp_tool_call") => codex_mcp_payload(state, "mcp_tool_start", item)
-            .into_iter()
-            .collect(),
-        ("item.completed", "mcp_tool_call") => {
-            let event = if codex_item_failed(item) {
-                "mcp_tool_failure"
-            } else {
-                "mcp_tool_finish"
-            };
-            codex_mcp_payload(state, event, item).into_iter().collect()
-        }
-        ("item.completed", "agent_message") => item
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|text| codex_skill_payload(state, text))
-            .into_iter()
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn parse_http_url(url: &str) -> Result<(String, String), String> {
-    let without_scheme = url.strip_prefix("http://").ok_or_else(|| {
-        format!("only http:// URLs are supported for Coditor hook forwarding: {url}")
-    })?;
-    let (host_port, path) = without_scheme
-        .split_once('/')
-        .map(|(host, path)| (host, format!("/{path}")))
-        .unwrap_or((without_scheme, "/".to_string()));
-    let host_port = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
-    Ok((host_port, path))
-}
-
-fn post_codex_hook_payload(payload: &serde_json::Value) -> Result<(), String> {
-    let endpoint = format!(
-        "{}/api/hooks/codex",
-        coditor_core_url().trim_end_matches('/')
-    );
-    let (host_port, path) = parse_http_url(&endpoint)?;
-    let body = serde_json::to_string(payload)
-        .map_err(|err| format!("failed to serialize Codex hook payload: {err}"))?;
-    let mut stream = TcpStream::connect(&host_port)
-        .map_err(|err| format!("failed to connect to {host_port}: {err}"))?;
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|err| format!("failed to write Codex hook request: {err}"))?;
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    if response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2") {
-        Ok(())
-    } else {
-        Err(format!(
-            "Codex hook endpoint rejected payload: {}",
-            response.lines().next().unwrap_or("empty response")
-        ))
-    }
 }
 
 fn parse_codex_requests_total(metrics: &str) -> Option<f64> {
@@ -2342,12 +1965,8 @@ Coditor removes inherited parent-session variables from child Codex runs:
 Coditor closes child stdin for Codex runs so codex exec cannot consume harness
 manifests or shell-loop input.
 
-Suggested fake hook endpoint for Phase 7 fixture experiments:
-  http://localhost:9091/api/hooks/codex
-
-Hook config is not applied automatically. The endpoint currently accepts the
-checked-in coditor.codex_hook.v1 fixture contract only; real Codex hook support
-is not validated.
+Coditor does not pass codex exec --json and does not parse local Codex stdout
+as live telemetry. Envoy-observed Responses traffic is the telemetry source.
 
 # Codex CLI mode requires an existing Codex ChatGPT login and does not use OPENAI_API_KEY.
 "#
@@ -2511,23 +2130,23 @@ fn is_codex_model_name(model: &str) -> bool {
         || lower.starts_with("o4")
 }
 
-fn is_anthropic_model_name(model: &str) -> bool {
+fn is_legacy_model_name(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("claude-")
 }
 
 fn watch_model_label(model: &str) -> String {
     if is_codex_model_name(model) {
         format!("CODEX \u{00b7} {model}")
-    } else if is_anthropic_model_name(model) {
-        format!("UNPORTED ANTHROPIC \u{00b7} {model}")
+    } else if is_legacy_model_name(model) {
+        format!("LEGACY MODEL \u{00b7} {model}")
     } else {
         model.to_string()
     }
 }
 
 fn model_change_label(requested: &str, actual: &str) -> &'static str {
-    if is_anthropic_model_name(requested) || is_anthropic_model_name(actual) {
-        "UNPORTED MODEL FALLBACK"
+    if is_legacy_model_name(requested) || is_legacy_model_name(actual) {
+        "LEGACY MODEL CHANGE"
     } else {
         "MODEL CHANGE"
     }
@@ -3331,6 +2950,7 @@ async fn main() {
                 };
                 println!("Connecting to {}...", watch_url);
                 let mut active = ActiveSessions::new();
+                let mut retry_log = WatchRetryLog::default();
 
                 loop {
                     match connect_and_stream(
@@ -3343,16 +2963,23 @@ async fn main() {
                     .await
                     {
                         Ok(()) => {
-                            eprintln!("{}", "Connection closed. Reconnecting in 3s...".dimmed());
-                        }
-                        Err(e) => {
+                            retry_log.reset();
                             eprintln!(
                                 "{}",
-                                format!("Waiting for coditor-core... ({})", e).dimmed()
+                                format!(
+                                    "Connection closed. Reconnecting in {}s...",
+                                    WATCH_RECONNECT_DELAY.as_secs()
+                                )
+                                .dimmed()
                             );
                         }
+                        Err(e) => {
+                            if let Some(message) = retry_log.retry_message(&e) {
+                                eprintln!("{}", message.dimmed());
+                            }
+                        }
                     }
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
                 }
             }
         }
@@ -3696,15 +3323,14 @@ async fn connect_and_stream(
 mod tests {
     use super::{
         build_child_run_plan, chatgpt_codex_proxy_base_url, codex_command_requires_observation,
-        codex_json_stdout_hook_payloads, codex_model_proxy_base_url, codex_stdout_telemetry_state,
-        codex_subscription_config_overrides, codex_turn_summary_line, compact_datetime_from_iso,
-        context_status_line, event_session_id, extract_announced_skill, extract_run_watch,
-        extract_skill_from_command, format_duration_coarse, format_tokens, local_time_from_iso,
-        model_change_line, parse_codex_requests_total, parse_mcp_tool_name, push_unique,
-        render_child_run_plan, render_codex_config_preview, shell_join, shell_quote,
-        should_suppress_codex_stderr_line, tmux_orchestrator_watch_url, truncate_for_box,
-        watch_model_label, yaml_quote, ActiveSessions, ChildStdinMode, Cli, Commands,
-        ConfigCommands, RunMode, WatchEvent,
+        codex_model_proxy_base_url, codex_subscription_config_overrides, codex_turn_summary_line,
+        compact_datetime_from_iso, context_status_line, event_session_id, extract_run_watch,
+        format_duration_coarse, format_tokens, local_time_from_iso, model_change_line,
+        parse_codex_requests_total, parse_mcp_tool_name, push_unique, render_child_run_plan,
+        render_codex_config_preview, shell_join, shell_quote, should_suppress_codex_stderr_line,
+        tmux_orchestrator_watch_url, truncate_for_box, watch_model_label, yaml_quote,
+        ActiveSessions, ChildStdinMode, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
+        WatchRetryLog,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -3832,20 +3458,20 @@ mod tests {
     }
 
     #[test]
-    fn watch_labels_codex_models_without_anthropic_branding() {
+    fn watch_labels_codex_models_without_legacy_provider_branding() {
         assert_eq!(
             watch_model_label("gpt-codex-fixture"),
             "CODEX \u{00b7} gpt-codex-fixture"
         );
         assert_eq!(
             watch_model_label("claude-sonnet-fixture"),
-            "UNPORTED ANTHROPIC \u{00b7} claude-sonnet-fixture"
+            "LEGACY MODEL \u{00b7} claude-sonnet-fixture"
         );
 
         let line = model_change_line("12:00:00", "gpt-codex", "gpt-codex-served");
         assert!(line.contains("MODEL CHANGE"));
         assert!(line.contains("served gpt-codex-served"));
-        assert!(!line.contains("Anthropic"));
+        assert!(!line.contains("provider fallback"));
         assert!(!line.contains("fallback"));
     }
 
@@ -4073,7 +3699,12 @@ mod tests {
         assert_eq!(plan.args[0], "exec");
         assert_eq!(
             plan.args[args_after_exec_and_overrides..],
-            ["hello".to_string(), "--json".to_string()]
+            ["hello".to_string()]
+        );
+        assert!(
+            !plan.args.iter().any(|arg| arg == "--json"),
+            "Coditor must not pass local Codex JSON stdout mode: {:?}",
+            plan.args
         );
     }
 
@@ -4115,6 +3746,29 @@ mod tests {
         assert_eq!(
             tmux_orchestrator_watch_url("http://localhost:9091/"),
             "http://localhost:9091/watch?replay=recent"
+        );
+    }
+
+    #[test]
+    fn watch_retry_log_suppresses_duplicate_waiting_messages() {
+        let mut retry_log = WatchRetryLog::default();
+
+        assert_eq!(
+            retry_log.retry_message("connection refused").as_deref(),
+            Some("Waiting for coditor-core... (retrying every 3s; connection refused)")
+        );
+        assert_eq!(retry_log.retry_message("connection refused"), None);
+        assert_eq!(retry_log.retry_message("connection refused"), None);
+        assert_eq!(
+            retry_log.retry_message("HTTP 503").as_deref(),
+            Some("Waiting for coditor-core... (retrying every 3s; HTTP 503)")
+        );
+
+        retry_log.reset();
+
+        assert_eq!(
+            retry_log.retry_message("HTTP 503").as_deref(),
+            Some("Waiting for coditor-core... (retrying every 3s; HTTP 503)")
         );
     }
 
@@ -4176,143 +3830,11 @@ mod tests {
 # TYPE coditor_requests_total counter
 coditor_requests_total{model="gpt-5.5",provider="codex_responses"} 2
 coditor_requests_total{model="gpt-5.4",provider="codex_responses"} 3
-coditor_requests_total{model="legacy_claude",provider="legacy_anthropic"} 99
+coditor_requests_total{model="legacy_model",provider="legacy_provider"} 99
 "#;
 
         assert_eq!(parse_codex_requests_total(metrics), Some(5.0));
         assert_eq!(parse_codex_requests_total("other_metric 1"), None);
-    }
-
-    #[test]
-    fn codex_json_stdout_command_events_become_hook_payloads() {
-        let mut state = codex_stdout_telemetry_state(&[
-            "exec".to_string(),
-            "--cd".to_string(),
-            "/repo".to_string(),
-            "--json".to_string(),
-            "prompt".to_string(),
-        ]);
-        assert!(codex_json_stdout_hook_payloads(
-            r#"{"type":"thread.started","thread_id":"thread-1"}"#,
-            &mut state
-        )
-        .is_empty());
-
-        let started = codex_json_stdout_hook_payloads(
-            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'rg --files'","status":"in_progress"}}"#,
-            &mut state,
-        );
-        assert_eq!(started.len(), 1);
-        assert_eq!(started[0]["event"], "tool_start");
-        assert_eq!(started[0]["session_id"], "thread-1");
-        assert_eq!(started[0]["proxy_session_id"], "thread-1");
-        assert_eq!(started[0]["cwd"], "/repo");
-        assert_eq!(started[0]["tool"]["name"], "shell");
-        assert_eq!(
-            started[0]["tool"]["input"]["command"],
-            "/bin/zsh -lc 'rg --files'"
-        );
-
-        let completed = codex_json_stdout_hook_payloads(
-            r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'rg --files'","exit_code":0,"status":"completed"}}"#,
-            &mut state,
-        );
-        assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0]["event"], "tool_finish");
-        assert_eq!(completed[0]["tool"]["outcome"], "succeeded");
-    }
-
-    #[test]
-    fn codex_json_stdout_mcp_and_skill_events_become_hook_payloads() {
-        let mut state = codex_stdout_telemetry_state(&[]);
-        codex_json_stdout_hook_payloads(
-            r#"{"type":"thread.started","thread_id":"thread-mcp"}"#,
-            &mut state,
-        );
-
-        let skill = codex_json_stdout_hook_payloads(
-            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll use the `openai-docs` skill here."}}"#,
-            &mut state,
-        );
-        assert_eq!(skill.len(), 1);
-        assert_eq!(skill[0]["event"], "skill_fired");
-        assert_eq!(skill[0]["skill_name"], "openai-docs");
-        assert!(codex_json_stdout_hook_payloads(
-            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I’ll use the `openai-docs` skill again."}}"#,
-            &mut state,
-        )
-        .is_empty());
-
-        let failed = codex_json_stdout_hook_payloads(
-            r#"{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"openaiDeveloperDocs","tool":"search_openai_docs","arguments":{"query":"Responses API streaming"},"error":{"message":"user cancelled MCP tool call"},"status":"failed"}}"#,
-            &mut state,
-        );
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["event"], "mcp_tool_failure");
-        assert_eq!(failed[0]["mcp"]["server"], "openaiDeveloperDocs");
-        assert_eq!(failed[0]["mcp"]["tool"], "search_openai_docs");
-        assert_eq!(
-            failed[0]["mcp"]["input"]["query"],
-            "Responses API streaming"
-        );
-        assert_eq!(failed[0]["outcome"], "failed: user cancelled MCP tool call");
-    }
-
-    #[test]
-    fn codex_json_stdout_skill_file_read_emits_skill_event() {
-        let mut state = codex_stdout_telemetry_state(&[]);
-        codex_json_stdout_hook_payloads(
-            r#"{"type":"thread.started","thread_id":"thread-skill-file"}"#,
-            &mut state,
-        );
-
-        let payloads = codex_json_stdout_hook_payloads(
-            r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,220p' /Users/example/.codex/skills/.system/openai-docs/SKILL.md\"","status":"in_progress"}}"#,
-            &mut state,
-        );
-
-        assert_eq!(payloads.len(), 2);
-        assert!(payloads
-            .iter()
-            .any(|payload| payload["event"] == "skill_fired"
-                && payload["skill_name"] == "openai-docs"));
-        assert!(payloads
-            .iter()
-            .any(|payload| payload["event"] == "tool_start" && payload["tool"]["name"] == "shell"));
-    }
-
-    #[test]
-    fn skill_announcement_extraction_is_conservative() {
-        assert_eq!(
-            extract_announced_skill("I’ll use the `openai-docs` skill here."),
-            Some("openai-docs".to_string())
-        );
-        assert_eq!(
-            extract_announced_skill("Skill: `qa` for this validation pass."),
-            Some("qa".to_string())
-        );
-        assert_eq!(
-            extract_announced_skill(
-                "The openai-docs skill called `search_openai_docs`, which was cancelled."
-            ),
-            None
-        );
-        assert_eq!(
-            extract_announced_skill(
-                "The MCP tool `search_openai_docs` ran after a skill was announced."
-            ),
-            None
-        );
-        assert_eq!(
-            extract_announced_skill("This mentions `README.md` but not the trigger word."),
-            None
-        );
-        assert_eq!(
-            extract_skill_from_command(
-                "/bin/zsh -lc \"sed -n '1,220p' /Users/me/.codex/skills/.system/openai-docs/SKILL.md\""
-            ),
-            Some("openai-docs".to_string())
-        );
     }
 
     #[test]
@@ -4400,8 +3922,8 @@ coditor_requests_total{model="legacy_claude",provider="legacy_anthropic"} 99
         ));
         assert!(preview.contains("-c model_providers.coditor-chatgpt.supports_websockets=false"));
         assert!(preview.contains("-c features.enable_request_compression=false"));
-        assert!(preview.contains("http://localhost:9091/api/hooks/codex"));
-        assert!(preview.contains("coditor.codex_hook.v1"));
+        assert!(preview.contains("does not pass codex exec --json"));
+        assert!(preview.contains("Envoy-observed Responses traffic is the telemetry source"));
         assert!(preview.contains("does not use OPENAI_API_KEY"));
         assert!(preview.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
         assert!(!preview.contains("forced_login_method"));

@@ -146,9 +146,9 @@ assert_contains "$watch_output" '"type":"context_status"' "/watch exposes Codex 
 assert_contains "$watch_output" '"cached_input_tokens"' "/watch exposes Codex cached input accounting"
 assert_contains "$watch_output" '"reasoning_output_tokens"' "/watch exposes Codex reasoning output accounting"
 assert_contains "$watch_output" "$SESSION_ID" "/watch is scoped to the fixture session"
-assert_not_contains "$watch_output" '"type":"cache_event"' "/watch does not emit Anthropic CacheEvent for Codex"
-assert_not_contains "$watch_output" "cache_expires_at_epoch" "/watch has no Anthropic cache TTL for Codex"
-assert_not_contains "$watch_output" "estimated_rebuild_cost_dollars" "/watch has no Anthropic rebuild estimate for Codex"
+assert_not_contains "$watch_output" '"type":"cache_event"' "/watch does not emit cache-event telemetry for Codex"
+assert_not_contains "$watch_output" "cache_expires_at_epoch" "/watch has no cache TTL for Codex"
+assert_not_contains "$watch_output" "estimated_rebuild_cost_dollars" "/watch has no rebuild estimate for Codex"
 
 metrics=$(curl -fsS "$CORE_URL/metrics")
 assert_contains "$metrics" "coditor_requests_total" "Core metrics endpoint is live"

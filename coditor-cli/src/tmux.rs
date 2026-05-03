@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use colored::Colorize;
 use futures_util::StreamExt;
 
-use crate::{event_session_id, WatchEvent};
+use crate::{event_session_id, WatchEvent, WatchRetryLog, WATCH_RECONNECT_DELAY};
 
 // ---------------------------------------------------------------------------
 // Tmux environment checks
@@ -154,7 +154,7 @@ struct ManagedPane {
     /// If the served model differed from the requested model.
     model_fallback: Option<(String, String)>,
     /// Latest Codex-native turn accounting summary. Kept separate from
-    /// CacheEvent because cached input has no Anthropic TTL/rebuild semantics.
+    /// CacheEvent because cached input has no TTL/rebuild semantics.
     codex_turn: Option<CodexPaneTurnSummary>,
     applied_activity: Option<Activity>,
 }
@@ -206,23 +206,23 @@ fn is_codex_model_name(model: &str) -> bool {
         || lower.starts_with("o4")
 }
 
-fn is_anthropic_model_name(model: &str) -> bool {
+fn is_legacy_model_name(model: &str) -> bool {
     model.to_ascii_lowercase().starts_with("claude-")
 }
 
 fn pane_model_label(model: &str) -> String {
     if is_codex_model_name(model) {
         format!("CODEX \u{00b7} {model}")
-    } else if is_anthropic_model_name(model) {
-        format!("UNPORTED ANTHROPIC \u{00b7} {model}")
+    } else if is_legacy_model_name(model) {
+        format!("LEGACY MODEL \u{00b7} {model}")
     } else {
         model.to_string()
     }
 }
 
 fn model_change_hint_label(requested: &str, actual: &str) -> &'static str {
-    if is_anthropic_model_name(requested) || is_anthropic_model_name(actual) {
-        "unported fallback"
+    if is_legacy_model_name(requested) || is_legacy_model_name(actual) {
+        "legacy model change"
     } else {
         "model change"
     }
@@ -1149,20 +1149,28 @@ impl TmuxOrchestrator {
         });
 
         // Reconnect loop — same pattern as the regular watch mode.
+        let mut retry_log = WatchRetryLog::default();
         loop {
             match self.connect_and_process(watch_url, &cleanup_pane_ids).await {
                 Ok(()) => {
-                    eprintln!("{}", "Connection closed. Reconnecting in 3s...".dimmed());
-                }
-                Err(e) => {
+                    retry_log.reset();
                     eprintln!(
                         "{}",
-                        format!("Waiting for coditor-core... ({})", e).dimmed()
+                        format!(
+                            "Connection closed. Reconnecting in {}s...",
+                            WATCH_RECONNECT_DELAY.as_secs()
+                        )
+                        .dimmed()
                     );
+                }
+                Err(e) => {
+                    if let Some(message) = retry_log.retry_message(&e) {
+                        eprintln!("{}", message.dimmed());
+                    }
                 }
             }
             self.render_status();
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            tokio::time::sleep(WATCH_RECONNECT_DELAY).await;
         }
     }
 }
@@ -1240,14 +1248,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_pane_labels_do_not_use_anthropic_cache_language() {
+    fn codex_pane_labels_do_not_use_legacy_cache_language() {
         assert_eq!(
             pane_model_label("gpt-codex-fixture"),
             "CODEX \u{00b7} gpt-codex-fixture"
         );
         assert_eq!(
             pane_model_label("claude-sonnet-fixture"),
-            "UNPORTED ANTHROPIC \u{00b7} claude-sonnet-fixture"
+            "LEGACY MODEL \u{00b7} claude-sonnet-fixture"
         );
         assert_eq!(
             model_change_hint_label("gpt-codex-fixture", "gpt-codex-served"),

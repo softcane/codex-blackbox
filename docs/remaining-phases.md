@@ -2,7 +2,8 @@
 
 Current checkpoint: Phase 9B has a real Codex smoke result documented in
 `docs/real-codex-smoke.md`. Phase 9C has a real automated dogfood harness, and
-the broader 5-repo validation now captures real tool, MCP, and skill telemetry.
+the current product surface is constrained to Envoy-observed Codex Responses
+traffic.
 
 Coditor already has unit, contract, and fake Envoy e2e tests. The remaining question is when to start each kind of testing.
 
@@ -29,8 +30,7 @@ Completed:
 Implemented:
 
 - Phase 9C: `test/dogfood-codex-sessions.sh` can run 1-4 real Codex sessions
-  and report passed, failed, skipped, and missing capabilities. Subsequent live
-  validation added real Codex JSONL-derived tool/MCP/skill telemetry.
+  and report passed, failed, skipped, and missing Envoy-derived capabilities.
 
 ## Remaining Work
 
@@ -45,7 +45,8 @@ Completed as an experimental/manual wrapper path for Codex:
 
 - points Codex at the local Coditor proxy with command-line `-c` overrides
 - disables Codex request compression for MVP
-- preserves user-provided Codex arguments
+- preserves user-provided Codex arguments except local JSON stdout mode, which
+  is stripped from the subscription proxy path
 - uses the ChatGPT/Codex subscription backend override for live smoke
   planning
 - avoids editing `~/.codex/config.toml`
@@ -57,34 +58,26 @@ subscription path is live-validated.
 
 Finish user-facing watch behavior:
 
-- remove stale Claude/Anthropic labels from active Codex UI
+- remove stale legacy-provider labels from active Codex UI
 - render Codex cached input, reasoning output, model change, and status
   language correctly
 - keep no-TTL cached input behavior clear by using `CodexTurnSummary` instead
-  of Anthropic-shaped `CacheEvent`
+  of cache-event semantics
 - ensure `watch --tmux` still self-bootstraps and renders Codex sessions
 
 Done when inline watch and tmux views make sense for Codex fake sessions.
 
-### Phase 7: Codex Hooks Integration
+### Phase 7: Quarantined Local Lifecycle Experiments
 
-Add `/api/hooks/codex` and hook-helper/config output in a fake-first way:
-
-- parse fake Codex hook payloads under the `coditor.codex_hook.v1` fixture
-  contract
-- treat prompt/session hooks as provisional in-memory watch sessions while the
-  proxy remains authoritative for durable turns
-- correlate hook ids with proxy session ids when `proxy_session_id` is present
-- emit tool and MCP watch events without duplicating proxy tool starts
-
-Done when fake hook payloads produce expected watch events and hook failures cannot affect model traffic.
+Local lifecycle experiments are not part of the Codex product surface. Normal
+wrapper runs do not request Codex JSON stdout and do not use hooks, terminal
+scraping, local session files, or app-server side channels for live telemetry.
 
 ### Phase 8: Diagnostics, Rate Limits, And Context Intelligence
 
 Make diagnosis useful for Codex:
 
 - failed/incomplete responses
-- repeated tool failures
 - model mismatch
 - context pressure
 - high reasoning token use
@@ -139,7 +132,7 @@ The harness described in
 
 - launch 3-4 Codex sessions
 - cover same-repo and different-repo sessions
-- run read-only prompts, tool-call prompts, and MCP prompts when MCP is configured
+- run read-only prompts and prompts likely to exercise model turns
 - capture `/watch`
 - query SQLite
 - query Prometheus
@@ -147,8 +140,9 @@ The harness described in
 - write a report that names passed, failed, skipped, and missing capabilities
 
 Done for the harness shape when it can say exactly what is left rather than
-only pass/fail. The current report does that; real tool/MCP/skill telemetry is
-now captured from Codex JSONL, while MCP success-path validation remains open.
+only pass/fail. Current missing/skipped entries must distinguish Envoy-observed
+Codex facts from local lifecycle observations that are outside the product
+surface.
 
 ### Phase 10: Documentation And Release Readiness
 

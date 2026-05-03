@@ -1,6 +1,6 @@
 # Automated Feedback Testing
 
-This is the real dogfood target: run several Codex sessions through Coditor, then automatically report what worked and what is still missing across watch events, SQLite, Prometheus, Grafana, tools, and MCP telemetry.
+This is the real dogfood target: run several Codex sessions through Coditor, then automatically report what worked and what is still missing across Envoy-observed watch events, SQLite, Prometheus, and Grafana.
 
 This is different from the current fake Envoy e2e. The fake e2e proves the proxy path and Responses parser. The automated feedback test proves Coditor is useful with actual Codex sessions.
 
@@ -11,8 +11,9 @@ Run 3-4 Codex sessions through Coditor:
 - at least two sessions in the same repo
 - at least one session in a different repo
 - at least one read-only prompt
-- at least one prompt that triggers local tool calls
-- at least one prompt that exercises MCP if any MCP servers are configured
+- at least one prompt that may trigger local activity, without treating that
+  activity as Codex telemetry unless it appears in Envoy-observed Responses
+  traffic
 - one session with enough context or repeated prompts to show cached input or context status
 
 Each session should be intentionally small and reversible. Prefer prompts that inspect files, list project structure, summarize tests, or read local docs. Do not use destructive prompts for the dogfood harness.
@@ -45,10 +46,11 @@ Grafana, command, and Compose artifacts under `reports/dogfood/<timestamp>/`.
 a Phase 9A fake regression convenience. It is not a real dogfood substitute.
 
 First live result: on 2026-04-30 UTC / 2026-05-01 Europe/Stockholm, the harness
-ran four real Codex 0.125.0 sessions and produced a `partial` report. A later
-5-repo validation captured real tool, MCP, and skill telemetry through Codex
-JSONL stdout. The detailed log is in `docs/real-codex-smoke.md`; the broader
-calibration report is under `reports/live-codex-validation-20260430T234815Z/`.
+ran four real Codex 0.125.0 sessions and produced a `partial` report. Local
+stdout-derived lifecycle observations from later calibration are quarantined
+from the Codex product surface. The detailed log is in
+`docs/real-codex-smoke.md`; the broader calibration report is under
+`reports/live-codex-validation-20260430T234815Z/`.
 
 ## What The Harness Should Do
 
@@ -62,8 +64,7 @@ calibration report is under `reports/live-codex-validation-20260430T234815Z/`.
 5. Use prompt fixtures for:
    - read-only repo inspection
    - file search/read
-   - local command/tool use
-   - MCP use, if configured
+   - local command use, with no telemetry claim unless Envoy observes it
 6. Wait for sessions to finish.
 7. Query Coditor HTTP APIs.
 8. Query SQLite.
@@ -79,10 +80,9 @@ The captured `/watch` stream should show:
 
 - one `SessionStart` per Codex session
 - one `ContextStatus` per completed turn
-- no TTL/rebuild `CacheEvent` for Codex cached input
+- no cache-event telemetry for Codex cached input
 - `ModelFallback` only when requested and served model differ
-- tool events when tool calls are observed
-- MCP events when MCP was exercised and telemetry is available
+- `CodexTurnSummary` status and token fields for model turns
 
 ### SQLite Assertions
 
@@ -154,7 +154,6 @@ The live Phase 9B direction is ChatGPT/Codex subscription auth. Use the default
 cargo run -q -p coditor-cli -- preflight codex-subscription -- codex exec \
   --cd /Users/pradeepsingh/code/coditor \
   --sandbox read-only \
-  --json \
   "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
 ```
 
@@ -245,7 +244,7 @@ The earliest useful real test is smaller:
 - one different-repo Codex session
 - read-only prompts only
 - assert `/watch` has `SessionStart` and `ContextStatus`
-- assert no Anthropic `CacheEvent` TTL/rebuild fields
+- assert no cache-event telemetry for Codex cached input
 - assert Prometheus has basic request/token metrics
 
 That can start after Phase 6B, but it should be labeled `smoke`, not full dogfood.
@@ -266,10 +265,8 @@ and produce a report that answers:
 - Did token accounting avoid cached-input double counting?
 - Did Prometheus expose expected metrics without session labels?
 - Did Grafana load dashboards backed by real metrics?
-- Did tool and MCP events appear when expected?
+- Did response status, token, model, and context signals appear from Envoy?
 - What is still missing, skipped, or failing?
 
-The current answer is no longer missing real tool/MCP/skill telemetry: Coditor
-captures Codex JSONL `command_execution`, `mcp_tool_call`, and skill-file-read
-signals. MCP calls in the latest validation were cancelled by the child session,
-so the MCP success-result path still needs separate validation.
+The current target intentionally excludes local stdout, hook, terminal, session
+file, and app-server side channels from live Codex telemetry.

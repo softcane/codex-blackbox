@@ -339,57 +339,6 @@ fn codex_diagnostic_causes(turns: &[TurnSnapshot]) -> Vec<DegradationCause> {
         }
     }
 
-    let total_tool_failures: u32 = codex_turns
-        .iter()
-        .map(|turn| turn.tool_results_failed)
-        .sum();
-    if total_tool_failures >= 3 {
-        let first_turn = codex_turns
-            .iter()
-            .find(|turn| turn.tool_results_failed > 0)
-            .map(|turn| turn.turn_number)
-            .unwrap_or(1);
-        push_cause_once(
-            &mut causes,
-            DegradationCause {
-                turn_first_noticed: first_turn,
-                cause_type: "codex_repeated_tool_failures".to_string(),
-                detail: format!(
-                    "{} Codex tool failure(s) were observed for this session.",
-                    total_tool_failures
-                ),
-                estimated_cost: 0.0,
-                is_heuristic: false,
-                requested_model: None,
-                actual_model: None,
-            },
-        );
-    }
-
-    let total_mcp_failures: u32 = codex_turns.iter().map(|turn| turn.mcp_tool_failures).sum();
-    if total_mcp_failures >= 2 {
-        let first_turn = codex_turns
-            .iter()
-            .find(|turn| turn.mcp_tool_failures > 0)
-            .map(|turn| turn.turn_number)
-            .unwrap_or(1);
-        push_cause_once(
-            &mut causes,
-            DegradationCause {
-                turn_first_noticed: first_turn,
-                cause_type: "codex_mcp_tool_failures".to_string(),
-                detail: format!(
-                    "{} Codex MCP tool failure(s) were observed for this session.",
-                    total_mcp_failures
-                ),
-                estimated_cost: 0.0,
-                is_heuristic: false,
-                requested_model: None,
-                actual_model: None,
-            },
-        );
-    }
-
     if codex_turns.len() >= 3 {
         let total_input: u64 = codex_turns
             .iter()
@@ -813,8 +762,6 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         "codex_response_incomplete",
         "codex_model_mismatch",
         "codex_accounting_anomaly",
-        "codex_repeated_tool_failures",
-        "codex_mcp_tool_failures",
         "codex_high_context_fill",
         "codex_high_reasoning_share",
         "codex_low_cached_input_reuse",
@@ -929,12 +876,6 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
         }
         "codex_accounting_anomaly" => {
             "Codex token accounting was internally inconsistent. Trust local totals over provider-reported totals for this turn.".to_string()
-        }
-        "codex_repeated_tool_failures" => {
-            "Multiple Codex tool failures were observed. Interrupt or redirect before retrying the same failing approach.".to_string()
-        }
-        "codex_mcp_tool_failures" => {
-            "Codex MCP tool failures were observed. Check the MCP server/tool result before continuing the session.".to_string()
         }
         "codex_high_context_fill" => {
             "Codex context fill is high. Start a fresh session or target fewer files before compaction pressure rises.".to_string()
@@ -1108,27 +1049,6 @@ mod tests {
 
         assert!(!report.degraded);
         assert!(cause_types(&report).contains(&"codex_high_reasoning_share"));
-    }
-
-    #[test]
-    fn codex_diagnosis_repeated_tool_and_mcp_failures_are_diagnosed() {
-        let mut turns = vec![
-            codex_snapshot(1, "completed"),
-            codex_snapshot(2, "completed"),
-            codex_snapshot(3, "completed"),
-        ];
-        turns[0].tool_results_failed = 1;
-        turns[1].tool_results_failed = 1;
-        turns[2].tool_results_failed = 1;
-        turns[1].mcp_tool_failures = 1;
-        turns[2].mcp_tool_failures = 1;
-
-        let report = analyze_session("codex-tool-failures", &turns);
-
-        assert!(report.degraded);
-        let causes = cause_types(&report);
-        assert!(causes.contains(&"codex_repeated_tool_failures"));
-        assert!(causes.contains(&"codex_mcp_tool_failures"));
     }
 
     #[test]

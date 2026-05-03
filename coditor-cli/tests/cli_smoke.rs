@@ -1,5 +1,5 @@
 // UNPORTED/DEFERRED: copied baseline from Phase 0A for workspace shape only.
-// This still validates Anthropic-shaped behavior and is not Coditor validation.
+// This still validates legacy-provider behavior and is not Coditor validation.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -161,6 +161,8 @@ fn config_codex_prints_read_only_future_override() {
     assert!(out.contains("-c features.enable_request_compression=false"));
     assert!(out.contains("Coditor removes inherited parent-session variables"));
     assert!(out.contains("Coditor closes child stdin for Codex runs"));
+    assert!(out.contains("does not pass codex exec --json"));
+    assert!(out.contains("Envoy-observed Responses traffic is the telemetry source"));
     assert!(out.contains("CODEX_THREAD_ID"));
     assert!(out.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
     assert!(!out.contains("model_providers.coditor-openai"));
@@ -206,7 +208,8 @@ fn codex_dry_run_prints_overrides_and_preserves_user_args() {
     assert!(!out.contains("forced_login_method"));
     assert!(!out.contains("openai_base_url"));
     assert!(!out.contains("model_providers.coditor-openai"));
-    assert!(out.contains("hello --json"));
+    assert!(!out.contains("--json"));
+    assert!(out.contains("hello"));
 }
 
 #[test]
@@ -283,7 +286,7 @@ fn sessions_command_renders_sessions_from_api() {
             {
               "session_id": "session_abcdefghijklmnopqrstuvwxyz",
               "display_name": "coditor",
-              "model": "claude-sonnet-4-5-20250929",
+              "model": "gpt-5.5",
               "total_turns": 7,
               "outcome": "Likely Completed",
               "estimated_total_cost_dollars": 1.23,
@@ -306,7 +309,7 @@ fn sessions_command_renders_sessions_from_api() {
     let out = stdout(&output);
     assert!(out.contains("Estimated cost source: built-in model-family pricing"));
     assert!(out.contains("coditor"));
-    assert!(out.contains("sonnet-4-5-20250929"));
+    assert!(out.contains("gpt-5.5"));
     assert!(out.contains("$1.23"));
     assert!(out.contains("$1.11"));
 }
@@ -337,7 +340,7 @@ fn recall_command_renders_ranked_hits_from_api() {
               "session_id": "session_recall",
               "started_at": "2026-04-28T10:15:00Z",
               "completed_at": "2026-04-28T10:45:00Z",
-              "model": "claude-sonnet-4-5-20250929",
+              "model": "gpt-5.5",
               "outcome": "Likely Completed",
               "initial_prompt": "Investigate auth cache",
               "final_response_summary": "Fixed the auth cache warm path."

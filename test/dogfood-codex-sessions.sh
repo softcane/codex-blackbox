@@ -409,12 +409,6 @@ turn_summaries = [
 cache_events = [
     event for event in marker_watch_events if isinstance(event, dict) and event.get("type") == "cache_event"
 ]
-tool_events = [
-    event for event in marker_watch_events if isinstance(event, dict) and event.get("type") in {"tool_use", "tool_result"}
-]
-mcp_events = [
-    event for event in marker_watch_events if isinstance(event, dict) and event.get("type") == "mcp_event"
-]
 
 if len(session_starts) >= expected_sessions:
     add("passed", "watch_session_start", f"{len(session_starts)} events")
@@ -431,22 +425,9 @@ else:
 if cache_events:
     add("failed", "watch_no_codex_cache_event", f"unexpected cache events: {len(cache_events)}")
 else:
-    add("passed", "watch_no_codex_cache_event", "no Anthropic cache_event observed for marker sessions")
-if tool_events:
-    add("passed", "tool_watch_events", f"{len(tool_events)} events")
-elif tool_prompt_planned:
-    add("missing", "tool_watch_events", "tool-oriented prompt ran, but no tool_use/tool_result events were observed")
-else:
-    add("skipped", "tool_watch_events", "no tool-oriented prompt was launched in this run")
-if include_mcp and mcp_configured:
-    if mcp_events:
-        add("passed", "mcp_watch_events", f"{len(mcp_events)} events")
-    else:
-        add("missing", "mcp_watch_events", "MCP configured and prompt requested, but no mcp_event observed")
-elif include_mcp:
-    add("skipped", "mcp_watch_events", "MCP prompt requested but no mcp_servers config was detected")
-else:
-    add("skipped", "mcp_watch_events", "--include-mcp not set")
+    add("passed", "watch_no_codex_cache_event", "no cache_event observed for marker sessions")
+add("skipped", "tool_watch_events", "local Codex stdout JSON is not a live telemetry source")
+add("skipped", "mcp_watch_events", "non-Envoy activity is outside the Codex telemetry surface")
 
 sessions_json_path = report_dir / "sessions.json"
 sessions_payload = {}
@@ -791,7 +772,6 @@ preflight_cmd=(
     "$CODEX_BIN" exec
     --cd "$SAME_REPO"
     --sandbox read-only
-    --json
     "$SMOKE_PROMPT"
 )
 printf "%s\n" "$(shell_join "${preflight_cmd[@]}")" >"$REPORT_DIR/preflight-command.txt"
@@ -882,7 +862,7 @@ for index in $(seq 0 $((SESSIONS - 1))); do
     repo_kind="${REPO_KINDS[$index]}"
     repo_path="${REPOS_FOR_CASE[$index]}"
     prompt="${PROMPTS[$index]}"
-    stdout_path="$REPORT_DIR/session-${case_name}.jsonl"
+    stdout_path="$REPORT_DIR/session-${case_name}.stdout"
     stderr_path="$REPORT_DIR/session-${case_name}.stderr"
     exit_path="$REPORT_DIR/session-${case_name}.exit"
     session_cmd=(
@@ -891,7 +871,6 @@ for index in $(seq 0 $((SESSIONS - 1))); do
         "$CODEX_BIN" exec
         --cd "$repo_path"
         --sandbox read-only
-        --json
         "$prompt"
     )
     printf "%s\n" "$(shell_join "${session_cmd[@]}")" >>"$COMMAND_LOG"

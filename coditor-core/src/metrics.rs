@@ -38,8 +38,9 @@ const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
 const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
 const LIVE_MCP_EVENT_SOURCES: [&str; 2] = ["hook", "proxy"];
 const LIVE_CONTEXT_PROVIDERS: [&str; 2] = ["codex_responses", "unknown"];
+const LIVE_CODEX_RESPONSE_STATUSES: [&str; 4] = ["completed", "failed", "incomplete", "unknown"];
 pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
-pub const HISTORY_CAUSE_TYPES: [&str; 17] = [
+pub const HISTORY_CAUSE_TYPES: [&str; 15] = [
     "cache_miss_ttl",
     "context_bloat",
     "model_fallback",
@@ -53,8 +54,6 @@ pub const HISTORY_CAUSE_TYPES: [&str; 17] = [
     "codex_model_mismatch",
     "codex_high_context_fill",
     "codex_high_reasoning_share",
-    "codex_repeated_tool_failures",
-    "codex_mcp_tool_failures",
     "codex_accounting_anomaly",
     "codex_low_cached_input_reuse",
 ];
@@ -85,6 +84,7 @@ pub struct CoditorMetrics {
     sessions_total: IntCounterVec,
     degraded_sessions_total: IntCounter,
     sessions_degraded_total: IntCounterVec,
+    codex_response_status_total: IntCounterVec,
     model_fallback_total: IntCounterVec,
     compaction_suspected_total: IntCounter,
     tool_calls_total: IntCounterVec,
@@ -185,6 +185,14 @@ impl CoditorMetrics {
                 &["cause_type"]
             )
             .expect("register coditor_sessions_degraded_total"),
+            codex_response_status_total: register_int_counter_vec!(
+                opts!(
+                    "coditor_codex_response_status_total",
+                    "Envoy-observed Codex Responses terminal statuses by normalized served model."
+                ),
+                &["status", "model"]
+            )
+            .expect("register coditor_codex_response_status_total"),
             model_fallback_total: register_int_counter_vec!(
                 opts!(
                     "coditor_model_fallback_total",
@@ -466,6 +474,13 @@ pub fn init() {
     metrics
         .sessions_degraded_total
         .with_label_values(&["unknown"]);
+    for status in LIVE_CODEX_RESPONSE_STATUSES {
+        for model in LIVE_MODELS {
+            metrics
+                .codex_response_status_total
+                .with_label_values(&[status, model]);
+        }
+    }
 }
 
 pub fn record_request(
@@ -558,6 +573,16 @@ pub fn record_codex_turn(
         .turn_duration_seconds
         .with_label_values(&[model])
         .observe(duration_seconds.max(0.0));
+}
+
+pub fn record_codex_response_status(status: &str, model: &str) {
+    METRICS
+        .codex_response_status_total
+        .with_label_values(&[
+            normalize_codex_response_status(status),
+            normalize_model(model),
+        ])
+        .inc();
 }
 
 pub fn record_cache_event(model: &str, event_type: &str, estimated_waste_dollars: Option<f64>) {
@@ -994,6 +1019,15 @@ fn normalize_outcome(outcome: &str) -> &'static str {
     }
 }
 
+fn normalize_codex_response_status(status: &str) -> &'static str {
+    match status {
+        "completed" => "completed",
+        "failed" => "failed",
+        "incomplete" => "incomplete",
+        _ => "unknown",
+    }
+}
+
 fn normalize_cause(cause_type: &str) -> &str {
     if cause_type.is_empty() {
         "unknown"
@@ -1101,8 +1135,8 @@ pub fn mcp_tool_labels(tool_name: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        init, mcp_tool_labels, record_codex_turn, record_context_fill_percent,
-        record_degraded_cause, render,
+        init, mcp_tool_labels, record_codex_response_status, record_codex_turn,
+        record_context_fill_percent, record_degraded_cause, render,
     };
 
     #[test]
@@ -1135,6 +1169,7 @@ mod tests {
         record_context_fill_percent("codex_responses", "gpt-codex-fixture", 42.0);
         record_degraded_cause("session-id-like-cause-phase-8b");
         record_codex_turn("gpt-5.5", 1_280, 512, 768, 96, 32, 1_376, 0.006976, 1.5);
+        record_codex_response_status("failed", "gpt-5.5");
 
         let (_, body) = render().expect("render metrics");
         assert!(body.contains(
@@ -1150,6 +1185,9 @@ mod tests {
         assert!(
             body.contains("coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}")
         );
+        assert!(body.contains(
+            "coditor_codex_response_status_total{model=\"gpt-5.5\",status=\"failed\"} 1"
+        ));
         assert!(body.contains("coditor_sessions_degraded_total{cause_type=\"unknown\"}"));
         assert!(!body.contains("session-id-like-cause-phase-8b"));
         assert!(!body.contains("session_id="));

@@ -192,7 +192,7 @@ required_metrics = {
     "context fill histogram": "coditor_context_fill_percent_count",
     "context fill bucket": "coditor_context_fill_percent_bucket",
     "diagnosis counter": 'coditor_sessions_degraded_total{cause_type="codex_response_failed"}',
-    "MCP lifecycle counter": "coditor_mcp_events_total",
+    "Codex response status counter": "coditor_codex_response_status_total",
 }
 for label, expr in required_metrics.items():
     wait_until(label, lambda expr=expr: len(prom_query(expr)) > 0)

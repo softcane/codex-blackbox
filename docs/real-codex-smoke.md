@@ -65,7 +65,7 @@ Observed events and data:
 - Served model was captured as `gpt-5.5`.
 - Smoke metrics showed 2 Codex requests and token kinds for input, cached input,
   uncached input, output, reasoning output, and total tokens.
-- No Anthropic `CacheEvent` was emitted for Codex cached input.
+- No cache-event telemetry was emitted for Codex cached input.
 
 ### Phase 9C Dogfood Command
 
@@ -95,12 +95,11 @@ Passed:
 - Grafana was reachable and provisioned `coditor-main` with panels backed by
   scraped Prometheus metrics.
 
-Missing:
+Quarantined:
 
-- Tool-oriented prompts produced Codex JSONL `command_execution` items, but
-  Coditor did not emit `ToolUse` or `ToolResult` watch events for them.
-- The MCP prompt reached `openaiDeveloperDocs`; the MCP tool call was cancelled
-  inside the child session, and Coditor did not emit `McpEvent` watch events.
+- Local Codex stdout and lifecycle-style tool/MCP/skill observations from this
+  run are not product support evidence. Current Codex telemetry is limited to
+  Envoy-observed Responses request/response facts.
 
 ### Broader Calibration Update
 
@@ -112,17 +111,12 @@ That run captured:
 - 5 real Codex sessions, all exit `0`.
 - Marker-backed SQLite rows whose `initial_prompt` stores the real task instead
   of the injected AGENTS/environment preamble.
-- Distinct persisted display names: `coditor`, `clauditor`, `claude-code`,
-  `LLMs-from-scratch`, and `contextgc_poc`.
-- Real shell `ToolUse`/`ToolResult` events from Codex JSONL
-  `command_execution`.
-- Real `McpEvent` rows from Codex JSONL `mcp_tool_call`.
-- A real `SkillEvent` for `openai-docs`.
+- Distinct persisted display names across five test workspaces.
 - Matching SQLite session/request token totals and Prometheus request/token
   totals.
 
-Open: the MCP calls were still cancelled by the child session, so the MCP
-success-result path remains unproven.
+Open: lifecycle telemetry outside Envoy-observed Responses traffic remains
+outside the Codex product surface.
 
 ### Rollback
 

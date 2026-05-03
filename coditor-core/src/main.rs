@@ -542,10 +542,10 @@ enum DbCommand {
         context_window_tokens: u64,
         display_name: String,
         initial_prompt: Option<String>,
+        response_summary: Option<String>,
         response_id: Option<String>,
         tool_names_json: String,
         tool_calls_json: String,
-        tool_calls_list: Vec<(String, String)>,
         accounting_anomalies_json: String,
         cost_dollars: f64,
         cost_source: String,
@@ -1089,10 +1089,10 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                 context_window_tokens,
                 display_name,
                 initial_prompt,
+                response_summary,
                 response_id,
                 tool_names_json,
                 tool_calls_json,
-                tool_calls_list,
                 accounting_anomalies_json,
                 cost_dollars,
                 cost_source,
@@ -1165,13 +1165,6 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     continue;
                 }
 
-                for (name, ts) in &tool_calls_list {
-                    let _ = conn.execute(
-                        "INSERT INTO tool_calls (request_id, timestamp, tool_name) VALUES (?1,?2,?3)",
-                        rusqlite::params![&request_id, ts, name],
-                    );
-                }
-
                 let turn_number = conn
                     .query_row(
                         "SELECT COALESCE(MAX(turn_number), 0) + 1 \
@@ -1196,9 +1189,9 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         codex_accounting_anomalies
                      ) VALUES (
                         ?1, ?2, ?3, ?4, 0, 0, ?5, ?6, ?7,
-                        0, 0.0, ?8, ?9, 0, ?10, ?11, NULL, ?12,
-                        'codex_responses', ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                        ?20, ?21, ?22, ?23
+                        0, 0.0, ?8, ?9, 0, ?10, ?11, ?12, ?13,
+                        'codex_responses', ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                        ?21, ?22, ?23, ?24
                      )",
                     rusqlite::params![
                         &session_id,
@@ -1212,6 +1205,7 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         context_window_tokens,
                         &requested_model,
                         &served_model,
+                        &response_summary,
                         &request_id,
                         &status,
                         input_tokens,
@@ -1843,6 +1837,8 @@ fn build_session_summary_json(
     primary_cause: String,
     cache_hit_ratio: f64,
     model: Option<String>,
+    requested_model: Option<String>,
+    served_model: Option<String>,
 ) -> Value {
     serde_json::json!({
         "session_id": session_id,
@@ -1860,6 +1856,8 @@ fn build_session_summary_json(
         "primary_cause": primary_cause,
         "cache_hit_ratio": cache_hit_ratio,
         "model": model,
+        "requested_model": requested_model,
+        "served_model": served_model,
     })
 }
 
@@ -2509,6 +2507,7 @@ struct CodexFinalizationOutcome {
     duration_ms: u64,
     context_window_tokens: u64,
     context_fill_percent: f64,
+    response_summary: Option<String>,
     watch_events: Vec<watch::WatchEvent>,
 }
 
@@ -3086,6 +3085,7 @@ fn build_codex_finalization_outcome(
     context_window_tokens: u64,
 ) -> CodexFinalizationOutcome {
     let accounting = codex_accounting::summarize_codex_turn(request, response);
+    let response_summary = compact_response_summary(&response.output_text, &[]);
     let context_fill_percent =
         context_fill_percent(accounting.input_tokens, 0, 0, context_window_tokens);
     let mut watch_events = Vec::new();
@@ -3146,6 +3146,7 @@ fn build_codex_finalization_outcome(
         duration_ms: duration.as_millis() as u64,
         context_window_tokens,
         context_fill_percent,
+        response_summary,
         watch_events,
     }
 }
@@ -3192,6 +3193,10 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
         outcome.accounting.pricing.cost_dollars.unwrap_or(0.0),
         duration.as_secs_f64(),
     );
+    metrics::record_codex_response_status(
+        codex_status_label(&outcome.accounting.status),
+        metric_model,
+    );
     metrics::record_context_fill_percent(
         "codex_responses",
         metric_model,
@@ -3201,11 +3206,10 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
     for event in &outcome.watch_events {
         match event {
             watch::WatchEvent::SessionStart { .. } if !newly_started => {}
-            watch::WatchEvent::ToolUse { tool_name, .. } => {
+            watch::WatchEvent::ToolUse { .. } => {
                 if codex_watch_event_is_duplicate_or_remember(event) {
                     continue;
                 }
-                metrics::record_tool_call(tool_name);
                 watch::BROADCASTER.broadcast(event.clone());
             }
             watch::WatchEvent::ModelFallback {
@@ -3338,15 +3342,6 @@ fn summarize_codex_tool_input(tool: &codex_response::CodexToolCallSummary) -> St
     truncate_detail(input, 100)
 }
 
-fn codex_tool_names_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
-    let names = accounting
-        .tool_calls
-        .iter()
-        .map(codex_tool_name)
-        .collect::<Vec<_>>();
-    serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
-}
-
 fn codex_tool_calls_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
     let calls = accounting
         .tool_calls
@@ -3360,17 +3355,6 @@ fn codex_tool_calls_json(accounting: &codex_accounting::CodexTurnAccounting) -> 
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&calls).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn codex_tool_calls_list(
-    accounting: &codex_accounting::CodexTurnAccounting,
-    timestamp: &str,
-) -> Vec<(String, String)> {
-    accounting
-        .tool_calls
-        .iter()
-        .map(|tool| (codex_tool_name(tool), timestamp.to_string()))
-        .collect()
 }
 
 fn codex_accounting_anomalies_json(accounting: &codex_accounting::CodexTurnAccounting) -> String {
@@ -3441,7 +3425,7 @@ fn codex_turn_snapshot_from_outcome(
         frustration_signals: 0,
         requested_model: Some(accounting.requested_model.clone()),
         actual_model: accounting.served_model.clone(),
-        response_summary: None,
+        response_summary: outcome.response_summary.clone(),
     }
 }
 
@@ -3496,10 +3480,10 @@ fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: Stri
         context_window_tokens: outcome.context_window_tokens,
         display_name: codex_display_name(accounting),
         initial_prompt: accounting.first_user_prompt_excerpt.clone(),
+        response_summary: outcome.response_summary.clone(),
         response_id: accounting.identity.response_id.clone(),
-        tool_names_json: codex_tool_names_json(accounting),
+        tool_names_json: "[]".to_string(),
         tool_calls_json: codex_tool_calls_json(accounting),
-        tool_calls_list: codex_tool_calls_list(accounting, &timestamp),
         accounting_anomalies_json: codex_accounting_anomalies_json(accounting),
         cost_dollars: accounting.pricing.cost_dollars.unwrap_or(0.0),
         cost_source: codex_cost_source(accounting),
@@ -3650,6 +3634,27 @@ fn parse_tool_calls_json(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
 
+fn parse_codex_tool_calls_json(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            item.get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .map(|id| format!("custom_tool_call:{id}"))
+                })
+        })
+        .collect()
+}
+
 fn load_turn_snapshots_from_db(
     conn: &Connection,
     session_id: &str,
@@ -3663,7 +3668,7 @@ fn load_turn_snapshots_from_db(
          FROM turn_snapshots WHERE session_id = ?1 ORDER BY turn_number ASC",
     )?;
 
-    let mut turns = stmt
+    let turns = stmt
         .query_map(rusqlite::params![session_id], |row| {
             let tool_calls_raw = row.get::<_, String>(6)?;
             let input_tokens = row.get::<_, i64>(1)?.max(0) as u32;
@@ -3721,54 +3726,7 @@ fn load_turn_snapshots_from_db(
         .filter_map(|row| row.ok())
         .collect::<Vec<_>>();
 
-    augment_codex_telemetry_failures_from_db(conn, session_id, &mut turns)?;
-
     Ok(turns)
-}
-
-fn failed_tool_outcome_count_from_db(conn: &Connection, session_id: &str) -> rusqlite::Result<u32> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM tool_outcomes \
-         WHERE session_id = ?1 \
-           AND (lower(COALESCE(outcome, '')) LIKE '%fail%' \
-                OR lower(COALESCE(outcome, '')) LIKE '%denied%' \
-                OR lower(COALESCE(outcome, '')) = 'error')",
-        rusqlite::params![session_id],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count.max(0) as u32)
-}
-
-fn failed_mcp_event_count_from_db(conn: &Connection, session_id: &str) -> rusqlite::Result<u32> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM mcp_events \
-         WHERE session_id = ?1 AND event_type IN ('failed', 'denied')",
-        rusqlite::params![session_id],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|count| count.max(0) as u32)
-}
-
-fn augment_codex_telemetry_failures_from_db(
-    conn: &Connection,
-    session_id: &str,
-    turns: &mut [diagnosis::TurnSnapshot],
-) -> rusqlite::Result<()> {
-    if !turns.iter().any(diagnosis::TurnSnapshot::is_codex) {
-        return Ok(());
-    }
-
-    let tool_failures = failed_tool_outcome_count_from_db(conn, session_id)?;
-    let mcp_failures = failed_mcp_event_count_from_db(conn, session_id)?;
-    if tool_failures == 0 && mcp_failures == 0 {
-        return Ok(());
-    }
-
-    if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.is_codex()) {
-        turn.tool_results_failed = turn.tool_results_failed.saturating_add(tool_failures);
-        turn.mcp_tool_failures = turn.mcp_tool_failures.saturating_add(mcp_failures);
-    }
-    Ok(())
 }
 
 fn stored_tool_recall_context(
@@ -3894,7 +3852,7 @@ fn load_persisted_watch_turns(
                 codex_input_tokens, codex_cached_input_tokens, \
                 codex_uncached_input_tokens, codex_output_tokens, \
                 codex_reasoning_output_tokens, codex_total_tokens, \
-                context_utilization, context_window_tokens, tool_calls \
+                context_utilization, context_window_tokens, codex_tool_calls \
          FROM turn_snapshots \
          WHERE session_id = ?1 AND provider = 'codex_responses' \
          ORDER BY turn_number ASC",
@@ -3924,7 +3882,7 @@ fn load_persisted_watch_turns(
                 total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
                 context_utilization: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                 context_window_tokens,
-                tool_calls: parse_tool_calls_json(&tool_calls_raw),
+                tool_calls: parse_codex_tool_calls_json(&tool_calls_raw),
             })
         })?
         .collect();
@@ -4577,8 +4535,6 @@ impl AutoWeeklyBudgetCache {
 
 static AUTO_WEEKLY_BUDGET_CACHE: LazyLock<Mutex<AutoWeeklyBudgetCache>> =
     LazyLock::new(|| Mutex::new(AutoWeeklyBudgetCache::new()));
-static CODEX_HOOK_SESSION_CORRELATIONS: LazyLock<Mutex<HashMap<String, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 static CODEX_TOOL_EVENT_DEDUP: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 const CODEX_TOOL_EVENT_DEDUP_TTL: Duration = Duration::from_secs(300);
@@ -5083,33 +5039,6 @@ struct McpTelemetryEvent {
     detail: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-struct CodexHookToolTelemetry {
-    id: Option<String>,
-    name: String,
-    input_summary: Option<String>,
-    duration_ms: u64,
-    outcome: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct CodexHookBuildResult {
-    status: &'static str,
-    reason: Option<String>,
-    hook_session_id: Option<String>,
-    proxy_session_id: Option<String>,
-    resolved_session_id: Option<String>,
-    watch_events: Vec<watch::WatchEvent>,
-}
-
-#[derive(Clone, Debug)]
-struct CodexHookProcessResult {
-    status: &'static str,
-    reason: Option<String>,
-    events_emitted: usize,
-    duplicates_suppressed: usize,
-}
-
 #[derive(Default)]
 struct SkillTurnState {
     expected: HashSet<String>,
@@ -5225,540 +5154,6 @@ fn summarize_hook_tool_input(value: Option<&Value>) -> Option<String> {
         .map(|json| truncate_detail(&json, 100))
 }
 
-fn non_empty_hook_string(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
-fn codex_hook_value_at_path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
-    let mut current = value;
-    for segment in path {
-        current = current.get(*segment)?;
-    }
-    Some(current)
-}
-
-fn codex_hook_string_field(value: &Value, names: &[&str]) -> Option<String> {
-    names.iter().find_map(|name| {
-        value
-            .get(*name)
-            .and_then(Value::as_str)
-            .and_then(non_empty_hook_string)
-    })
-}
-
-fn codex_hook_nested_string(value: &Value, paths: &[&[&str]]) -> Option<String> {
-    paths.iter().find_map(|path| {
-        codex_hook_value_at_path(value, path)
-            .and_then(Value::as_str)
-            .and_then(non_empty_hook_string)
-    })
-}
-
-fn codex_hook_first_string(
-    value: &Value,
-    names: &[&str],
-    nested_paths: &[&[&str]],
-) -> Option<String> {
-    codex_hook_string_field(value, names).or_else(|| codex_hook_nested_string(value, nested_paths))
-}
-
-fn normalize_codex_hook_event(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .map(|ch| {
-            if matches!(ch, '.' | '-' | ' ') {
-                '_'
-            } else {
-                ch.to_ascii_lowercase()
-            }
-        })
-        .collect()
-}
-
-fn codex_hook_event_name(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["event", "event_type", "hook_event_name"],
-        &[&["hook", "event"], &["codex", "event"]],
-    )
-    .map(|event| normalize_codex_hook_event(&event))
-}
-
-fn codex_hook_session_id(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &[
-            "session_id",
-            "codex_session_id",
-            "hook_session_id",
-            "conversation_id",
-        ],
-        &[
-            &["session", "id"],
-            &["codex", "session_id"],
-            &["metadata", "session_id"],
-            &["client_metadata", "session_id"],
-        ],
-    )
-}
-
-fn codex_hook_proxy_session_id(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &[
-            "proxy_session_id",
-            "coditor_session_id",
-            "coditor_proxy_session_id",
-        ],
-        &[
-            &["coditor", "session_id"],
-            &["metadata", "proxy_session_id"],
-            &["metadata", "coditor_session_id"],
-            &["client_metadata", "proxy_session_id"],
-        ],
-    )
-}
-
-fn resolve_codex_hook_session_ids(
-    payload: &Value,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let hook_session_id = codex_hook_session_id(payload);
-    let proxy_session_id = codex_hook_proxy_session_id(payload);
-
-    if let (Some(hook), Some(proxy)) = (hook_session_id.as_ref(), proxy_session_id.as_ref()) {
-        CODEX_HOOK_SESSION_CORRELATIONS
-            .lock()
-            .unwrap()
-            .insert(hook.clone(), proxy.clone());
-    }
-
-    let remembered = hook_session_id.as_ref().and_then(|hook| {
-        CODEX_HOOK_SESSION_CORRELATIONS
-            .lock()
-            .unwrap()
-            .get(hook)
-            .cloned()
-    });
-    let resolved = proxy_session_id
-        .clone()
-        .or(remembered)
-        .or_else(|| hook_session_id.clone());
-
-    (hook_session_id, proxy_session_id, resolved)
-}
-
-fn codex_hook_model(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["model", "requested_model"],
-        &[
-            &["codex", "model"],
-            &["session", "model"],
-            &["metadata", "model"],
-        ],
-    )
-}
-
-fn codex_hook_cwd(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["cwd", "working_directory"],
-        &[
-            &["session", "cwd"],
-            &["codex", "cwd"],
-            &["metadata", "cwd"],
-            &["client_metadata", "cwd"],
-        ],
-    )
-}
-
-fn codex_hook_source(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["source", "permission_source"],
-        &[&["tool", "source"], &["metadata", "source"]],
-    )
-}
-
-fn codex_hook_permission_mode(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["permission_mode", "permission"],
-        &[
-            &["tool", "permission_mode"],
-            &["tool", "permission"],
-            &["metadata", "permission_mode"],
-        ],
-    )
-}
-
-fn codex_hook_prompt_excerpt(payload: &Value) -> Option<String> {
-    let raw = codex_hook_first_string(
-        payload,
-        &["prompt", "input", "message"],
-        &[
-            &["prompt", "text"],
-            &["session", "prompt"],
-            &["metadata", "prompt"],
-        ],
-    )?;
-    Some(truncate_detail(&raw, 160))
-}
-
-fn codex_hook_display_name(payload: &Value, model: &str) -> String {
-    codex_hook_cwd(payload)
-        .as_deref()
-        .and_then(|cwd| cwd.rsplit('/').find(|part| !part.is_empty()))
-        .map(str::to_string)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| model.to_string())
-}
-
-fn codex_hook_tool_input_value(payload: &Value) -> Option<&Value> {
-    payload
-        .get("tool_input")
-        .or_else(|| payload.get("input"))
-        .or_else(|| codex_hook_value_at_path(payload, &["tool", "input"]))
-        .or_else(|| codex_hook_value_at_path(payload, &["tool_call", "input"]))
-        .or_else(|| codex_hook_value_at_path(payload, &["mcp", "input"]))
-}
-
-fn codex_hook_tool_name(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["tool_name", "name"],
-        &[
-            &["tool", "name"],
-            &["tool", "tool_name"],
-            &["tool_call", "name"],
-            &["mcp", "tool"],
-        ],
-    )
-}
-
-fn codex_hook_tool_id(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["tool_call_id", "call_id", "tool_id"],
-        &[&["tool", "id"], &["tool_call", "id"], &["mcp", "id"]],
-    )
-}
-
-fn codex_hook_duration_ms(payload: &Value) -> u64 {
-    let direct = payload.get("duration_ms");
-    let nested = codex_hook_value_at_path(payload, &["tool", "duration_ms"])
-        .or_else(|| codex_hook_value_at_path(payload, &["tool_call", "duration_ms"]));
-    direct
-        .or(nested)
-        .and_then(|value| {
-            value
-                .as_u64()
-                .or_else(|| value.as_f64().map(|duration| duration.max(0.0) as u64))
-        })
-        .unwrap_or(0)
-}
-
-fn codex_hook_outcome(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["outcome", "status", "result"],
-        &[
-            &["tool", "outcome"],
-            &["tool", "status"],
-            &["tool_call", "outcome"],
-            &["error", "message"],
-        ],
-    )
-}
-
-fn codex_hook_tool_telemetry(payload: &Value) -> Option<CodexHookToolTelemetry> {
-    let name = codex_hook_tool_name(payload)?;
-    Some(CodexHookToolTelemetry {
-        id: codex_hook_tool_id(payload),
-        name,
-        input_summary: summarize_hook_tool_input(codex_hook_tool_input_value(payload)),
-        duration_ms: codex_hook_duration_ms(payload),
-        outcome: codex_hook_outcome(payload),
-    })
-}
-
-fn codex_hook_detail(payload: &Value, base: Option<String>) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(base) = base.filter(|value| !value.trim().is_empty()) {
-        parts.push(base);
-    }
-    if let Some(source) = codex_hook_source(payload) {
-        parts.push(format!("source={source}"));
-    }
-    if let Some(permission_mode) = codex_hook_permission_mode(payload) {
-        parts.push(format!("permission={permission_mode}"));
-    }
-    if let Some(cwd) = codex_hook_cwd(payload) {
-        parts.push(format!("cwd={cwd}"));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" | "))
-    }
-}
-
-fn codex_hook_mcp_parts(
-    payload: &Value,
-    fallback_tool_name: Option<&str>,
-) -> Option<(String, String)> {
-    let explicit_server = codex_hook_first_string(
-        payload,
-        &["mcp_server"],
-        &[&["mcp", "server"], &["tool", "mcp_server"]],
-    );
-    let explicit_tool = codex_hook_first_string(
-        payload,
-        &["mcp_tool"],
-        &[&["mcp", "tool"], &["tool", "mcp_tool"]],
-    );
-    if let (Some(server), Some(tool)) = (explicit_server, explicit_tool) {
-        return Some((server, tool));
-    }
-
-    fallback_tool_name.and_then(metrics::mcp_tool_labels)
-}
-
-fn codex_hook_skill_name(payload: &Value) -> Option<String> {
-    codex_hook_first_string(
-        payload,
-        &["skill", "skill_name"],
-        &[&["skill", "name"], &["metadata", "skill_name"]],
-    )
-}
-
-fn build_codex_hook_watch_events(payload: &Value, timestamp: String) -> CodexHookBuildResult {
-    let (hook_session_id, proxy_session_id, resolved_session_id) =
-        resolve_codex_hook_session_ids(payload);
-    let Some(event_name) = codex_hook_event_name(payload) else {
-        return CodexHookBuildResult {
-            status: "ignored",
-            reason: Some("missing_event".to_string()),
-            hook_session_id,
-            proxy_session_id,
-            resolved_session_id,
-            watch_events: Vec::new(),
-        };
-    };
-
-    let Some(session_id) = resolved_session_id.clone() else {
-        return CodexHookBuildResult {
-            status: "ignored",
-            reason: Some("missing_session_id".to_string()),
-            hook_session_id,
-            proxy_session_id,
-            resolved_session_id,
-            watch_events: Vec::new(),
-        };
-    };
-
-    let mut watch_events = Vec::new();
-    let mut ignored_reason = None;
-
-    match event_name.as_str() {
-        "session_start" | "prompt_submit" | "user_prompt_submit" => {
-            let model = codex_hook_model(payload).unwrap_or_else(|| "unknown".to_string());
-            watch_events.push(watch::WatchEvent::SessionStart {
-                session_id: session_id.clone(),
-                display_name: codex_hook_display_name(payload, &model),
-                model,
-                initial_prompt: codex_hook_prompt_excerpt(payload),
-            });
-        }
-        "tool_start" | "pre_tool_use" => {
-            if let Some(tool) = codex_hook_tool_telemetry(payload) {
-                let summary = codex_hook_detail(
-                    payload,
-                    tool.input_summary
-                        .or_else(|| tool.id.as_ref().map(|id| format!("id={id}"))),
-                )
-                .unwrap_or_else(|| "started".to_string());
-                watch_events.push(watch::WatchEvent::ToolUse {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    tool_name: tool.name,
-                    summary,
-                });
-            } else {
-                ignored_reason = Some("missing_tool_name".to_string());
-            }
-        }
-        "tool_finish" | "tool_end" | "post_tool_use" => {
-            if let Some(tool) = codex_hook_tool_telemetry(payload) {
-                let outcome = codex_hook_detail(
-                    payload,
-                    tool.outcome.or_else(|| Some("succeeded".to_string())),
-                )
-                .unwrap_or_else(|| "succeeded".to_string());
-                watch_events.push(watch::WatchEvent::ToolResult {
-                    session_id: session_id.clone(),
-                    tool_name: tool.name,
-                    outcome,
-                    duration_ms: tool.duration_ms,
-                });
-            } else {
-                ignored_reason = Some("missing_tool_name".to_string());
-            }
-        }
-        "tool_failure" | "tool_failed" | "post_tool_use_failure" | "permission_denied" => {
-            if let Some(tool) = codex_hook_tool_telemetry(payload) {
-                let outcome =
-                    codex_hook_detail(payload, tool.outcome.or_else(|| Some("failed".to_string())))
-                        .unwrap_or_else(|| "failed".to_string());
-                watch_events.push(watch::WatchEvent::ToolResult {
-                    session_id: session_id.clone(),
-                    tool_name: tool.name,
-                    outcome,
-                    duration_ms: tool.duration_ms,
-                });
-            } else {
-                ignored_reason = Some("missing_tool_name".to_string());
-            }
-        }
-        "mcp_tool_start" | "mcp_start" => {
-            let tool = codex_hook_tool_telemetry(payload);
-            if let Some((server, mcp_tool)) =
-                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
-            {
-                watch_events.push(watch::WatchEvent::McpEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    server,
-                    tool: mcp_tool,
-                    event_type: "called".to_string(),
-                    source: "hook".to_string(),
-                    detail: codex_hook_detail(payload, tool.and_then(|tool| tool.input_summary)),
-                });
-            } else {
-                ignored_reason = Some("missing_mcp_tool".to_string());
-            }
-        }
-        "mcp_tool_finish" | "mcp_finish" => {
-            let tool = codex_hook_tool_telemetry(payload);
-            if let Some((server, mcp_tool)) =
-                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
-            {
-                watch_events.push(watch::WatchEvent::McpEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    server,
-                    tool: mcp_tool,
-                    event_type: "succeeded".to_string(),
-                    source: "hook".to_string(),
-                    detail: codex_hook_detail(
-                        payload,
-                        tool.and_then(|tool| tool.outcome.or(tool.input_summary)),
-                    ),
-                });
-            } else {
-                ignored_reason = Some("missing_mcp_tool".to_string());
-            }
-        }
-        "mcp_tool_failure" | "mcp_failed" | "mcp_failure" => {
-            let tool = codex_hook_tool_telemetry(payload);
-            if let Some((server, mcp_tool)) =
-                codex_hook_mcp_parts(payload, tool.as_ref().map(|tool| tool.name.as_str()))
-            {
-                watch_events.push(watch::WatchEvent::McpEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    server,
-                    tool: mcp_tool,
-                    event_type: "failed".to_string(),
-                    source: "hook".to_string(),
-                    detail: codex_hook_detail(
-                        payload,
-                        tool.and_then(|tool| tool.outcome.or(tool.input_summary)),
-                    ),
-                });
-            } else {
-                ignored_reason = Some("missing_mcp_tool".to_string());
-            }
-        }
-        "skill_expected" | "skill_fired" | "skill_failed" | "skill_missed" | "skill_misfired" => {
-            if let Some(skill_name) = codex_hook_skill_name(payload) {
-                let event_type = event_name
-                    .strip_prefix("skill_")
-                    .unwrap_or(event_name.as_str())
-                    .to_string();
-                watch_events.push(watch::WatchEvent::SkillEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    skill_name,
-                    event_type,
-                    source: "hook".to_string(),
-                    confidence: payload
-                        .get("confidence")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(1.0)
-                        .clamp(0.0, 1.0),
-                    detail: codex_hook_detail(payload, codex_hook_outcome(payload)),
-                });
-            } else {
-                ignored_reason = Some("missing_skill_name".to_string());
-            }
-        }
-        _ => ignored_reason = Some("unknown_event".to_string()),
-    }
-
-    CodexHookBuildResult {
-        status: if watch_events.is_empty() {
-            "ignored"
-        } else {
-            "accepted"
-        },
-        reason: ignored_reason,
-        hook_session_id,
-        proxy_session_id,
-        resolved_session_id: Some(session_id),
-        watch_events,
-    }
-}
-
-fn upsert_codex_hook_session(
-    session_id: &str,
-    display_name: &str,
-    model: &str,
-    initial_prompt: Option<&String>,
-) -> bool {
-    if session_id.trim().is_empty() {
-        return false;
-    }
-    let session_key = codex_request::fallback_session_hash("", session_id);
-    if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&session_key) {
-        existing.last_activity = Instant::now();
-        existing.cache_warning_sent = true;
-        if existing.initial_prompt.is_none() {
-            existing.initial_prompt = initial_prompt.cloned();
-        }
-        if existing.model == "unknown" && model != "unknown" {
-            existing.model = model.to_string();
-        }
-        return false;
-    }
-
-    diagnosis::SESSIONS.insert(
-        session_key,
-        diagnosis::SessionState {
-            session_id: session_id.to_string(),
-            display_name: display_name.to_string(),
-            model: model.to_string(),
-            initial_prompt: initial_prompt.cloned(),
-            created_at: Instant::now(),
-            last_activity: Instant::now(),
-            session_inserted: false,
-            cache_warning_sent: true,
-        },
-    );
-    true
-}
-
 fn codex_watch_event_dedupe_key(event: &watch::WatchEvent) -> Option<String> {
     match event {
         watch::WatchEvent::ToolUse {
@@ -5814,190 +5209,6 @@ fn codex_watch_event_is_duplicate_or_remember(event: &watch::WatchEvent) -> bool
     }
     seen.insert(key, now);
     false
-}
-
-fn note_codex_tool_failure_for_active_turn(session_id: &str, mcp_failure: bool) {
-    if let Some(mut turns) = diagnosis::SESSION_TURNS.get_mut(session_id) {
-        if let Some(turn) = turns.iter_mut().rev().find(|turn| turn.is_codex()) {
-            if mcp_failure {
-                turn.mcp_tool_failures = turn.mcp_tool_failures.saturating_add(1);
-            } else {
-                turn.tool_results_failed = turn.tool_results_failed.saturating_add(1);
-            }
-        }
-    }
-}
-
-fn process_codex_hook_payload(payload: &Value, timestamp: String) -> CodexHookProcessResult {
-    let built = build_codex_hook_watch_events(payload, timestamp);
-    let mut result = CodexHookProcessResult {
-        status: built.status,
-        reason: built.reason.clone(),
-        events_emitted: 0,
-        duplicates_suppressed: 0,
-    };
-
-    debug!(
-        hook_session_id = built.hook_session_id.as_deref().unwrap_or(""),
-        proxy_session_id = built.proxy_session_id.as_deref().unwrap_or(""),
-        resolved_session_id = built.resolved_session_id.as_deref().unwrap_or(""),
-        status = built.status,
-        reason = built.reason.as_deref().unwrap_or(""),
-        events = built.watch_events.len(),
-        "processed Codex hook payload"
-    );
-
-    for event in built.watch_events {
-        match event {
-            watch::WatchEvent::SessionStart {
-                session_id,
-                display_name,
-                model,
-                initial_prompt,
-            } => {
-                if !upsert_codex_hook_session(
-                    &session_id,
-                    &display_name,
-                    &model,
-                    initial_prompt.as_ref(),
-                ) {
-                    result.duplicates_suppressed += 1;
-                    continue;
-                }
-                watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
-                    session_id,
-                    display_name,
-                    model,
-                    initial_prompt,
-                });
-                metrics::set_active_sessions(active_session_count());
-                result.events_emitted += 1;
-            }
-            event @ watch::WatchEvent::ToolUse { .. } => {
-                let tool_name = match &event {
-                    watch::WatchEvent::ToolUse { tool_name, .. } => tool_name.clone(),
-                    _ => unreachable!(),
-                };
-                if codex_watch_event_is_duplicate_or_remember(&event) {
-                    result.duplicates_suppressed += 1;
-                    continue;
-                }
-                metrics::record_tool_call(&tool_name);
-                watch::BROADCASTER.broadcast(event);
-                result.events_emitted += 1;
-            }
-            event @ watch::WatchEvent::ToolResult { .. } => {
-                let (session_id, tool_name, outcome, duration_ms) = match &event {
-                    watch::WatchEvent::ToolResult {
-                        session_id,
-                        tool_name,
-                        outcome,
-                        duration_ms,
-                        ..
-                    } => (
-                        session_id.clone(),
-                        tool_name.clone(),
-                        outcome.clone(),
-                        *duration_ms,
-                    ),
-                    _ => unreachable!(),
-                };
-                if codex_watch_event_is_duplicate_or_remember(&event) {
-                    result.duplicates_suppressed += 1;
-                    continue;
-                }
-                let outcome_lower = outcome.to_ascii_lowercase();
-                if outcome_lower.contains("fail") || outcome_lower.contains("denied") {
-                    metrics::record_tool_failures(&tool_name, 1);
-                    note_codex_tool_failure_for_active_turn(&session_id, false);
-                }
-                let _ = DB_TX.send(DbCommand::WriteToolOutcome {
-                    session_id,
-                    turn_number: 0,
-                    timestamp: now_iso8601(),
-                    tool_name: tool_name.clone(),
-                    input_summary: String::new(),
-                    outcome: outcome.clone(),
-                    duration_ms,
-                });
-                watch::BROADCASTER.broadcast(event);
-                result.events_emitted += 1;
-            }
-            watch::WatchEvent::McpEvent {
-                session_id,
-                timestamp,
-                server,
-                tool,
-                event_type,
-                source,
-                detail,
-            } => {
-                let event = watch::WatchEvent::McpEvent {
-                    session_id,
-                    timestamp,
-                    server,
-                    tool,
-                    event_type,
-                    source,
-                    detail,
-                };
-                if codex_watch_event_is_duplicate_or_remember(&event) {
-                    result.duplicates_suppressed += 1;
-                    continue;
-                }
-                if let watch::WatchEvent::McpEvent {
-                    session_id,
-                    timestamp,
-                    server,
-                    tool,
-                    event_type,
-                    source,
-                    detail,
-                } = event
-                {
-                    if matches!(event_type.as_str(), "failed" | "denied") {
-                        note_codex_tool_failure_for_active_turn(&session_id, true);
-                    }
-                    emit_mcp_event(McpTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        server,
-                        tool,
-                        event_type,
-                        source,
-                        detail,
-                    });
-                }
-                result.events_emitted += 1;
-            }
-            watch::WatchEvent::SkillEvent {
-                session_id,
-                timestamp,
-                skill_name,
-                event_type,
-                source,
-                confidence,
-                detail,
-            } => {
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id,
-                    timestamp,
-                    skill_name,
-                    event_type,
-                    source,
-                    confidence,
-                    detail,
-                });
-                result.events_emitted += 1;
-            }
-            other => {
-                watch::BROADCASTER.broadcast(other);
-                result.events_emitted += 1;
-            }
-        }
-    }
-
-    result
 }
 
 fn remember_skill_turn_event(event: &SkillTelemetryEvent) {
@@ -6925,29 +6136,6 @@ async fn handle_claude_code_hook(Json(payload): Json<Value>) -> impl IntoRespons
     StatusCode::NO_CONTENT
 }
 
-async fn handle_codex_hook(body: axum::body::Bytes) -> impl IntoResponse {
-    let result = match serde_json::from_slice::<Value>(&body) {
-        Ok(payload) => process_codex_hook_payload(&payload, now_iso8601()),
-        Err(err) => CodexHookProcessResult {
-            status: "ignored",
-            reason: Some(format!("invalid_json: {err}")),
-            events_emitted: 0,
-            duplicates_suppressed: 0,
-        },
-    };
-    let body = serde_json::json!({
-        "status": result.status,
-        "reason": result.reason,
-        "events_emitted": result.events_emitted,
-        "duplicates_suppressed": result.duplicates_suppressed,
-    });
-    (
-        StatusCode::ACCEPTED,
-        [("content-type", "application/json")],
-        serde_json::to_string_pretty(&body).unwrap_or_default(),
-    )
-}
-
 async fn handle_summary() -> impl IntoResponse {
     let summary = tokio::task::spawn_blocking(|| {
         let conn = Connection::open(db_path()).ok()?;
@@ -7198,7 +6386,17 @@ async fn handle_sessions(
         let mut stmt = conn
             .prepare(
                 "SELECT s.session_id, s.started_at, s.model, s.display_name, s.initial_prompt, d.outcome, d.degraded, \
-                        d.total_turns, d.causes_json, d.cache_hit_ratio \
+                        d.total_turns, d.causes_json, d.cache_hit_ratio, \
+                        (SELECT r.requested_model FROM requests r \
+                         WHERE r.session_id = s.session_id \
+                           AND r.provider = 'codex_responses' \
+                           AND r.requested_model IS NOT NULL \
+                         ORDER BY r.timestamp DESC LIMIT 1), \
+                        (SELECT r.served_model FROM requests r \
+                         WHERE r.session_id = s.session_id \
+                           AND r.provider = 'codex_responses' \
+                           AND r.served_model IS NOT NULL \
+                         ORDER BY r.timestamp DESC LIMIT 1) \
                  FROM sessions s \
                  LEFT JOIN session_diagnoses d ON d.session_id = s.session_id \
                  WHERE COALESCE(s.ended_at, s.started_at) >= ?1 \
@@ -7217,6 +6415,8 @@ async fn handle_sessions(
             Option<i64>,
             Option<String>,
             Option<f64>,
+            Option<String>,
+            Option<String>,
         );
 
         let session_rows: Vec<RecentSessionRow> = stmt
@@ -7232,6 +6432,8 @@ async fn handle_sessions(
                     row.get::<_, Option<i64>>(7)?,
                     row.get::<_, Option<String>>(8)?,
                     row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             })
             .ok()?
@@ -7259,6 +6461,8 @@ async fn handle_sessions(
                     stored_total_turns,
                     stored_causes_str,
                     stored_cache_hit_ratio,
+                    requested_model,
+                    served_model,
                 )| {
                     let estimated = estimated_costs
                         .get(&session_id)
@@ -7334,6 +6538,8 @@ async fn handle_sessions(
                         primary_cause,
                         cache_hit_ratio,
                         model,
+                        requested_model,
+                        served_model,
                     )
                 },
             )
@@ -7607,7 +6813,17 @@ async fn handle_recall(
         let mut stmt = conn
             .prepare(
             "SELECT r.session_id, s.started_at, s.model, d.completed_at, d.outcome, \
-             r.initial_prompt, r.final_response_summary \
+             r.initial_prompt, r.final_response_summary, \
+             (SELECT req.requested_model FROM requests req \
+              WHERE req.session_id = r.session_id \
+                AND req.provider = 'codex_responses' \
+                AND req.requested_model IS NOT NULL \
+              ORDER BY req.timestamp DESC LIMIT 1), \
+             (SELECT req.served_model FROM requests req \
+              WHERE req.session_id = r.session_id \
+                AND req.provider = 'codex_responses' \
+                AND req.served_model IS NOT NULL \
+              ORDER BY req.timestamp DESC LIMIT 1) \
              FROM session_recall r \
              LEFT JOIN sessions s ON r.session_id = s.session_id \
              LEFT JOIN session_diagnoses d ON r.session_id = d.session_id \
@@ -7627,6 +6843,8 @@ async fn handle_recall(
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|e| format!("query recall rows: {e}"))?
@@ -7637,7 +6855,7 @@ async fn handle_recall(
                     None
                 }
             })
-            .filter_map(|(session_id, started_at, model, completed_at, outcome, initial_prompt, final_response_summary)| {
+            .filter_map(|(session_id, started_at, model, completed_at, outcome, initial_prompt, final_response_summary, requested_model, served_model)| {
                 let initial_prompt = initial_prompt.unwrap_or_default();
                 let final_response_summary = final_response_summary.unwrap_or_default();
                 let model = model.unwrap_or_default();
@@ -7659,6 +6877,8 @@ async fn handle_recall(
                         "outcome": outcome,
                         "initial_prompt": initial_prompt,
                         "final_response_summary": final_response_summary,
+                        "requested_model": requested_model,
+                        "served_model": served_model,
                         "score": score,
                     }),
                 ))
@@ -7943,6 +7163,7 @@ fn load_degradation_view_from_db(conn: &Connection, session_id: &str) -> Option<
                 "tool_failures": t.failures,
                 "requested_model": t.requested_model.clone(),
                 "actual_model": t.actual_model.clone(),
+                "served_model": t.actual_model.clone(),
                 "flags": flags,
             })
         })
@@ -7984,7 +7205,6 @@ async fn http_server() {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/api/hooks/claude-code", post(handle_claude_code_hook))
-        .route("/api/hooks/codex", post(handle_codex_hook))
         .route("/api/summary", get(handle_summary))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -8005,7 +7225,7 @@ async fn http_server() {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.clone());
-    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/hooks/codex, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -8339,15 +7559,14 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        build_codex_finalization_outcome, build_codex_hook_watch_events,
-        build_diagnosis_response_json, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, canonical_telemetry_name, clean_user_prompt,
-        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
-        codex_watch_event_is_duplicate_or_remember, compact_response_summary, context_fill_percent,
-        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
-        ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601,
-        extract_explicit_skill_refs, extract_header, extract_headers, extract_working_dir,
-        infer_context_window_tokens, load_degradation_view_from_db,
+        build_codex_finalization_outcome, build_diagnosis_response_json,
+        build_session_summary_json, build_sessions_response_json, build_summary_response_json,
+        canonical_telemetry_name, clean_user_prompt, codex_request_headers_from_ext_proc,
+        codex_response_headers_from_ext_proc, codex_watch_event_is_duplicate_or_remember,
+        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
+        derive_display_name, diagnosis, ensure_codex_persistence_columns, ensure_session_columns,
+        epoch_to_iso8601, extract_explicit_skill_refs, extract_header, extract_headers,
+        extract_working_dir, infer_context_window_tokens, load_degradation_view_from_db,
         load_persisted_watch_replay_events, load_turn_snapshots_from_db,
         looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
         now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
@@ -9165,11 +8384,13 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             turn_total_tokens,
             turn_context_utilization,
             turn_context_window_tokens,
-        ): (String, String, String, i64, i64, i64, i64, f64, i64) = conn
+            turn_response_summary,
+        ): (String, String, String, i64, i64, i64, i64, f64, i64, String) = conn
             .query_row(
                 "SELECT request_id, provider, codex_status, cache_read_tokens,
                         codex_cached_input_tokens, codex_reasoning_output_tokens,
-                        codex_total_tokens, context_utilization, context_window_tokens
+                        codex_total_tokens, context_utilization, context_window_tokens,
+                        response_summary
                  FROM turn_snapshots WHERE session_id = 'phase-4c-session-001'",
                 [],
                 |row| {
@@ -9183,6 +8404,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -9198,6 +8420,10 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(
             turn_context_window_tokens,
             STANDARD_CONTEXT_WINDOW_TOKENS as i64
+        );
+        assert_eq!(
+            turn_response_summary,
+            "Workspace packages: coditor-core and coditor-cli."
         );
         assert!(turn_context_utilization < 0.01);
 
@@ -9453,7 +8679,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
-    fn codex_persistence_tool_summaries_are_stored_without_cache_event() {
+    fn codex_persistence_tool_intent_is_source_scoped_without_cache_event() {
         let path = unique_test_db_path("codex-persist-tools");
         let request = parse_codex_fixture_request("phase-4c-session-tools");
         let response = accumulate_codex_fixture_response(
@@ -9489,11 +8715,11 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
             .expect("count tool call rows");
 
-        assert_eq!(tool_names_json, r#"["read_file"]"#);
+        assert_eq!(tool_names_json, "[]");
         assert!(tool_calls_json.contains("ctc_fixture_read_file_001"));
         assert!(tool_calls_json.contains(r#""name":"read_file""#));
         assert_eq!(cache_event, None);
-        assert_eq!(tool_call_rows, 1);
+        assert_eq!(tool_call_rows, 0);
 
         drop(conn);
         cleanup_test_db(&path);
@@ -9827,211 +9053,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(summarize_hook_tool_input(None), None);
     }
 
-    fn codex_hook_fixture(name: &str) -> serde_json::Value {
-        let raw = match name {
-            "prompt_submit" => {
-                include_str!("../../test/fixtures/codex_hook_prompt_submit.json")
-            }
-            "tool_start" => include_str!("../../test/fixtures/codex_hook_tool_start.json"),
-            "tool_finish" => include_str!("../../test/fixtures/codex_hook_tool_finish.json"),
-            "tool_failure" => include_str!("../../test/fixtures/codex_hook_tool_failure.json"),
-            "mcp_tool_finish" => {
-                include_str!("../../test/fixtures/codex_hook_mcp_tool_finish.json")
-            }
-            "malformed_tool" => {
-                include_str!("../../test/fixtures/codex_hook_malformed_tool.json")
-            }
-            other => panic!("unknown Codex hook fixture: {other}"),
-        };
-        serde_json::from_str(raw).expect("parse Codex hook fixture")
-    }
-
     #[test]
-    fn codex_hook_prompt_submit_fixture_produces_session_start_and_correlation() {
-        let payload = codex_hook_fixture("prompt_submit");
-        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:00Z".to_string());
-
-        assert_eq!(built.status, "accepted");
-        assert_eq!(
-            built.hook_session_id.as_deref(),
-            Some("codex-hook-session-001")
-        );
-        assert_eq!(
-            built.proxy_session_id.as_deref(),
-            Some("codex-session-fixture-001")
-        );
-        assert_eq!(
-            built.resolved_session_id.as_deref(),
-            Some("codex-session-fixture-001")
-        );
-        assert!(built.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::SessionStart {
-                    session_id,
-                    display_name,
-                    model,
-                    initial_prompt: Some(prompt),
-                } if session_id == "codex-session-fixture-001"
-                    && display_name == "coditor"
-                    && model == "gpt-codex-fixture"
-                    && prompt.contains("Inspect the Coditor workspace")
-            )
-        }));
-
-        let mut followup = codex_hook_fixture("tool_start");
-        followup
-            .as_object_mut()
-            .expect("object fixture")
-            .remove("proxy_session_id");
-        let followup = build_codex_hook_watch_events(&followup, "2026-04-30T12:00:01Z".to_string());
-        assert_eq!(
-            followup.resolved_session_id.as_deref(),
-            Some("codex-session-fixture-001")
-        );
-    }
-
-    #[test]
-    fn codex_hook_tool_start_and_finish_fixtures_produce_tool_events() {
-        let start = codex_hook_fixture("tool_start");
-        let start = build_codex_hook_watch_events(&start, "2026-04-30T12:00:02Z".to_string());
-        assert_eq!(start.status, "accepted");
-        assert!(start.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::ToolUse {
-                    session_id,
-                    tool_name,
-                    summary,
-                    ..
-                } if session_id == "codex-session-fixture-001"
-                    && tool_name == "read_file"
-                    && summary.contains("Cargo.toml")
-                    && summary.contains("permission=workspace-write")
-            )
-        }));
-
-        let finish = codex_hook_fixture("tool_finish");
-        let finish = build_codex_hook_watch_events(&finish, "2026-04-30T12:00:03Z".to_string());
-        assert_eq!(finish.status, "accepted");
-        assert!(finish.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::ToolResult {
-                    session_id,
-                    tool_name,
-                    outcome,
-                    duration_ms,
-                } if session_id == "codex-session-fixture-001"
-                    && tool_name == "read_file"
-                    && outcome.contains("succeeded")
-                    && duration_ms == &42
-            )
-        }));
-    }
-
-    #[test]
-    fn codex_hook_tool_failure_fixture_produces_failed_tool_result() {
-        let payload = codex_hook_fixture("tool_failure");
-        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:04Z".to_string());
-        assert_eq!(built.status, "accepted");
-        assert!(built.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::ToolResult {
-                    tool_name,
-                    outcome,
-                    duration_ms,
-                    ..
-                } if tool_name == "shell"
-                    && outcome.contains("failed")
-                    && outcome.contains("missing-target")
-                    && duration_ms == &81
-            )
-        }));
-    }
-
-    #[test]
-    fn codex_hook_mcp_fixture_produces_mcp_event() {
-        let payload = codex_hook_fixture("mcp_tool_finish");
-        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:05Z".to_string());
-        assert_eq!(built.status, "accepted");
-        assert!(built.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::McpEvent {
-                    session_id,
-                    server,
-                    tool,
-                    event_type,
-                    source,
-                    ..
-                } if session_id == "codex-session-fixture-001"
-                    && server == "github"
-                    && tool == "get_issue"
-                    && event_type == "succeeded"
-                    && source == "hook"
-            )
-        }));
-    }
-
-    #[test]
-    fn codex_hook_skill_event_produces_skill_watch_event() {
-        let payload = serde_json::json!({
-            "schema": "coditor.codex_hook.v1",
-            "event": "skill_fired",
-            "session_id": "codex-hook-session-001",
-            "proxy_session_id": "codex-session-fixture-001",
-            "skill_name": "openai-docs",
-            "source": "coditor-cli-json",
-            "confidence": 0.8,
-            "outcome": "announced by child json"
-        });
-        let built = build_codex_hook_watch_events(&payload, "2026-04-30T12:00:06Z".to_string());
-        assert_eq!(built.status, "accepted");
-        assert!(built.watch_events.iter().any(|event| {
-            matches!(
-                event,
-                super::watch::WatchEvent::SkillEvent {
-                    session_id,
-                    skill_name,
-                    event_type,
-                    source,
-                    confidence,
-                    detail,
-                    ..
-                } if session_id == "codex-session-fixture-001"
-                    && skill_name == "openai-docs"
-                    && event_type == "fired"
-                    && source == "hook"
-                    && (*confidence - 0.8).abs() < f64::EPSILON
-                    && detail.as_deref().unwrap_or("").contains("announced")
-                    && detail.as_deref().unwrap_or("").contains("source=coditor-cli-json")
-            )
-        }));
-    }
-
-    #[test]
-    fn codex_hook_unknown_and_malformed_payloads_are_ignored_safely() {
-        let unknown = serde_json::json!({
-            "event": "future_hook_event",
-            "session_id": "codex-hook-session-unknown",
-        });
-        let unknown = build_codex_hook_watch_events(&unknown, "2026-04-30T12:00:06Z".to_string());
-        assert_eq!(unknown.status, "ignored");
-        assert_eq!(unknown.reason.as_deref(), Some("unknown_event"));
-        assert!(unknown.watch_events.is_empty());
-
-        let malformed = codex_hook_fixture("malformed_tool");
-        let malformed =
-            build_codex_hook_watch_events(&malformed, "2026-04-30T12:00:07Z".to_string());
-        assert_eq!(malformed.status, "ignored");
-        assert_eq!(malformed.reason.as_deref(), Some("missing_tool_name"));
-        assert!(malformed.watch_events.is_empty());
-    }
-
-    #[test]
-    fn codex_hook_duplicate_tool_events_are_suppressed_by_key() {
+    fn codex_envoy_tool_events_are_suppressed_by_key() {
         let event = super::watch::WatchEvent::ToolUse {
             session_id: "codex-dedupe-session-001".to_string(),
             timestamp: "2026-04-30T12:00:08Z".to_string(),
@@ -10186,7 +9209,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
-    fn codex_diagnosis_loads_hook_tool_and_mcp_failures_from_db() {
+    fn codex_diagnosis_ignores_non_envoy_tool_and_mcp_failures_from_db() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         conn.execute_batch(SCHEMA).expect("create schema");
         ensure_codex_persistence_columns(&conn).expect("ensure codex columns");
@@ -10229,9 +9252,9 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             .map(|cause| cause.cause_type.as_str())
             .collect::<Vec<_>>();
 
-        assert!(report.degraded);
-        assert!(causes.contains(&"codex_repeated_tool_failures"));
-        assert!(causes.contains(&"codex_mcp_tool_failures"));
+        assert!(!report.degraded);
+        assert!(!causes.iter().any(|cause| cause.contains("tool")));
+        assert!(!causes.iter().any(|cause| cause.contains("mcp")));
     }
 
     #[test]
@@ -11226,6 +10249,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "cache_miss_ttl".to_string(),
             0.4,
             Some("claude-sonnet".to_string()),
+            Some("gpt-5.5".to_string()),
+            Some("gpt-5.5".to_string()),
         );
         assert_eq!(
             json.get("estimated_total_cost_dollars")
@@ -11243,6 +10268,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(
             json.get("display_name").and_then(|v| v.as_str()),
             Some("coditor")
+        );
+        assert_eq!(
+            json.get("requested_model").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            json.get("served_model").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
         );
         assert!(json.get("total_cost_dollars").is_none());
     }
@@ -11265,6 +10298,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "cache_miss_ttl".to_string(),
             0.4,
             Some("claude-sonnet".to_string()),
+            None,
+            None,
         )];
         let json = build_sessions_response_json(sessions);
 
