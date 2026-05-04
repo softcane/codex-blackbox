@@ -90,16 +90,14 @@ pub enum WatchEvent {
         idle_secs: u64,
         ttl_secs: u64,
     },
-    /// The served model differed from the user-requested model. Anthropic
-    /// fallback and Codex requested-vs-served changes both use this event.
+    /// The served model differed from the user-requested model.
     ModelFallback {
         session_id: String,
         requested: String,
         actual: String,
     },
     /// Codex-native per-turn accounting summary. This is intentionally separate
-    /// from `CacheEvent`: Codex cached input has no Anthropic TTL/rebuild
-    /// semantics.
+    /// from `CacheEvent`: Codex cached input has no TTL/rebuild semantics.
     CodexTurnSummary {
         session_id: String,
         status: String,
@@ -113,11 +111,9 @@ pub enum WatchEvent {
         reasoning_output_tokens: u64,
         total_tokens: u64,
     },
-    /// Per-turn context-window status. `fill_percent` follows the active
-    /// provider finalization rule: copied Anthropic fallback includes cache
-    /// token fields, while Codex Responses uses input tokens only. The optional
-    /// `context_window_tokens` field makes the denominator explicit for clients
-    /// and debugging.
+    /// Per-turn context-window status. Codex Responses uses input tokens only.
+    /// The optional `context_window_tokens` field makes the denominator
+    /// explicit for clients and debugging.
     ContextStatus {
         session_id: String,
         fill_percent: f64,
@@ -125,10 +121,9 @@ pub enum WatchEvent {
         context_window_tokens: Option<u64>,
         turns_to_compact: Option<u32>,
     },
-    /// Latest quota snapshot for the orchestrator top strip. For Claude Code
-    /// subscription traffic Anthropic does not return `anthropic-ratelimit-*`
-    /// headers, so these fields are synthesized locally by the quota burn
-    /// monitor from our own counters and SQLite history. Global (not
+    /// Latest quota snapshot for the orchestrator top strip. These fields are
+    /// synthesized locally by the quota burn monitor from our own counters and
+    /// SQLite history. Global (not
     /// session-scoped); last-writer-wins so the orchestrator can render a
     /// single top-strip meter.
     RateLimitStatus {

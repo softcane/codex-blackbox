@@ -14,22 +14,73 @@ fn read_repo_file(path: &str) -> String {
     fs::read_to_string(repo_root().join(path)).unwrap_or_else(|err| panic!("read {path}: {err}"))
 }
 
-#[test]
-fn codex_facing_docs_and_dashboard_do_not_use_legacy_provider_branding() {
+fn collect_scanned_files() -> Vec<PathBuf> {
+    fn visit(root: &Path, path: &Path, out: &mut Vec<PathBuf>) {
+        let entries = fs::read_dir(path).unwrap_or_else(|err| panic!("read {path:?}: {err}"));
+        for entry in entries {
+            let entry = entry.expect("read dir entry");
+            let path = entry.path();
+            let relative = path.strip_prefix(root).expect("strip repo root");
+            if relative
+                .components()
+                .any(|part| part.as_os_str() == "target")
+            {
+                continue;
+            }
+            if path.is_dir() {
+                visit(root, &path, out);
+            } else if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("rs" | "md" | "json" | "sh" | "yml" | "yaml" | "toml" | "py")
+            ) {
+                out.push(relative.to_path_buf());
+            }
+        }
+    }
+
+    let root = repo_root();
+    let mut files = vec![PathBuf::from("README.md")];
     for path in [
-        "README.md",
-        "docs/codex-telemetry-without-jsonl-plan.md",
-        "docs/codex-traffic-contract.md",
-        "docs/real-codex-smoke.md",
-        "docs/automated-feedback-testing.md",
-        "docs/remaining-phases.md",
-        "grafana/dashboards/coditor.json",
+        "docs",
+        "grafana",
+        "coditor-cli/src",
+        "coditor-core/src",
+        "coditor-core/tests",
+        "test",
     ] {
-        let body = read_repo_file(path);
-        for forbidden in ["Anthropic", "anthropic", "Claude", "claude"] {
+        visit(&root, &root.join(path), &mut files);
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+#[test]
+fn codex_surface_does_not_use_legacy_provider_branding() {
+    let forbidden_terms = [
+        "Anthropic",
+        "anthropic",
+        "Claude",
+        "claude",
+        "legacy_anthropic",
+        "legacy_claude",
+        "fake-anthropic",
+        "/api/hooks/claude-code",
+        "sonnet",
+        "opus",
+        "haiku",
+    ];
+
+    for path in collect_scanned_files() {
+        if path == PathBuf::from("coditor-core/tests/codex_envoy_only_surface.rs") {
+            continue;
+        }
+        let body = read_repo_file(path.to_str().expect("utf8 relative path"));
+        for forbidden in forbidden_terms {
             assert!(
                 !body.contains(forbidden),
-                "{path} must not expose legacy-provider branding in the Codex surface"
+                "{} must not expose legacy-provider term {forbidden:?} in the Codex surface",
+                path.display()
             );
         }
     }
@@ -72,6 +123,16 @@ fn codex_target_path_does_not_depend_on_local_json_stdout() {
         !dogfood.contains(".jsonl"),
         "dogfood target path must not capture local Codex stdout as JSONL"
     );
+    assert!(
+        dogfood.contains("--no-json"),
+        "dogfood harness must accept the documented no-JSON target-path flag"
+    );
+    for forbidden in ["thread.started", "stdout_session_ids"] {
+        assert!(
+            !dogfood.contains(forbidden),
+            "dogfood harness must not merge local Codex stdout identity source {forbidden}"
+        );
+    }
 
     let fixture_dir = repo_root().join("test/fixtures");
     for entry in fs::read_dir(&fixture_dir).unwrap_or_else(|err| panic!("read fixtures: {err}")) {
@@ -81,6 +142,73 @@ fn codex_target_path_does_not_depend_on_local_json_stdout() {
         assert!(
             !file_name.contains("codex_hook"),
             "Codex hook fixtures must not remain in {fixture_dir:?}: {file_name}"
+        );
+    }
+}
+
+#[test]
+fn core_metrics_register_only_envoy_derived_codex_families() {
+    let metrics = read_repo_file("coditor-core/src/metrics.rs");
+    let allowed_metric_families = [
+        "coditor_requests_total",
+        "coditor_tokens_total",
+        "coditor_sessions_degraded_total",
+        "coditor_codex_response_status_total",
+        "coditor_model_fallback_total",
+        "coditor_tool_calls_total",
+        "coditor_turn_duration_seconds",
+        "coditor_context_fill_percent",
+    ];
+    for metric in allowed_metric_families {
+        assert!(
+            metrics.contains(metric),
+            "Envoy-derived metric family missing from metrics.rs: {metric}"
+        );
+    }
+
+    let forbidden_metric_families = [
+        "coditor_estimated_cost_dollars_total",
+        "coditor_estimated_session_cost_dollars",
+        "coditor_estimated_cache_waste_dollars_total",
+        "coditor_cache_events_total",
+        "coditor_tool_failures_total",
+        "coditor_mcp_tool_calls_total",
+        "coditor_mcp_tool_failures_total",
+        "coditor_mcp_server_calls_total",
+        "coditor_mcp_server_failures_total",
+        "coditor_mcp_events_total",
+        "coditor_skill_events_total",
+        "coditor_active_sessions",
+        "coditor_weekly_tokens_used",
+        "coditor_weekly_tokens_remaining",
+        "coditor_weekly_token_budget",
+        "coditor_projected_exhaustion_seconds",
+        "coditor_history_estimated_spend",
+        "coditor_history_tool_failures",
+        "coditor_history_cache_events",
+        "coditor_history_sessions",
+        "coditor_history_degraded",
+    ];
+    for metric in forbidden_metric_families {
+        assert!(
+            !metrics.contains(metric),
+            "metrics.rs must not register non-Envoy Codex metric family {metric}"
+        );
+    }
+
+    for non_envoy_cause in [
+        "\"cache_miss_ttl\"",
+        "\"cache_miss_thrash\"",
+        "\"context_bloat\"",
+        "\"model_fallback\"",
+        "\"near_compaction\"",
+        "\"tool_failure_streak\"",
+        "\"harness_pressure\"",
+        "\"compaction_suspected\"",
+    ] {
+        assert!(
+            !metrics.contains(non_envoy_cause),
+            "Codex metric labels must not pre-register non-Envoy cause {non_envoy_cause}"
         );
     }
 }

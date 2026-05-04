@@ -214,13 +214,14 @@ cargo check
 cargo test -p coditor-cli
 cargo test --workspace --no-run
 ./test/e2e-openai-responses-full.sh
-./test/dogfood-codex-sessions.sh --mode real --sessions 5 --repos mixed --no-json
+./test/dogfood-codex-sessions.sh --mode real --sessions 4 --repos mixed --no-json
 git diff --check
 git status --short
 ```
 
-The dogfood command is the desired target. If `--no-json` does not exist yet,
-implement it before using that command as validation.
+The dogfood command is the desired target. The `--no-json` flag is accepted so
+the validation target is explicit; the harness must not parse local Codex stdout
+as telemetry.
 
 ## Separate Codex Session Prompt
 

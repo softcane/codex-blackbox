@@ -312,12 +312,6 @@ fn family_for_model(model: &str) -> Option<&'static str> {
         Some("gpt-5.4-mini")
     } else if lower.starts_with("gpt-5.4") {
         Some("gpt-5.4")
-    } else if lower.contains("opus") {
-        Some("opus")
-    } else if lower.contains("haiku") {
-        Some("haiku")
-    } else if lower.contains("sonnet") {
-        Some("sonnet")
     } else {
         None
     }
@@ -355,36 +349,6 @@ fn builtin_pricing(model: &str) -> Option<(ModelPricing, &'static str)> {
             },
             BUILTIN_OPENAI_API_COST_SOURCE,
         ))
-    } else if lower.contains("opus") {
-        Some((
-            ModelPricing {
-                input: 15.0,
-                output: 75.0,
-                cache_read: 1.50,
-                cache_create: 18.75,
-            },
-            BUILTIN_COST_SOURCE,
-        ))
-    } else if lower.contains("haiku") {
-        Some((
-            ModelPricing {
-                input: 0.80,
-                output: 4.0,
-                cache_read: 0.08,
-                cache_create: 1.00,
-            },
-            BUILTIN_COST_SOURCE,
-        ))
-    } else if lower.contains("sonnet") {
-        Some((
-            ModelPricing {
-                input: 3.0,
-                output: 15.0,
-                cache_read: 0.30,
-                cache_create: 3.75,
-            },
-            BUILTIN_COST_SOURCE,
-        ))
     } else {
         None
     }
@@ -394,7 +358,7 @@ fn builtin_pricing(model: &str) -> Option<(ModelPricing, &'static str)> {
 mod tests {
     use super::{
         estimate_cache_rebuild_waste_dollars, estimate_codex_api_cost_dollars,
-        estimate_cost_dollars, PricingCatalog, BUILTIN_COST_SOURCE, BUILTIN_OPENAI_API_COST_SOURCE,
+        estimate_cost_dollars, PricingCatalog, BUILTIN_OPENAI_API_COST_SOURCE,
     };
 
     #[test]
@@ -403,13 +367,13 @@ mod tests {
             r#"
 trusted_for_budget_enforcement = true
 
-[family.sonnet]
+[family."gpt-5.4"]
 input = 2.10
 output = 10.50
 cache_read = 0.21
 cache_create = 2.63
 
-[model."claude-sonnet-4-5-20250929"]
+[model."gpt-5.4-catalog-exact"]
 input = 1.95
 output = 9.75
 cache_read = 0.20
@@ -419,20 +383,20 @@ cache_create = 2.45
         )
         .expect("parse catalog");
 
-        let exact = catalog.resolve("claude-sonnet-4-5-20250929");
+        let exact = catalog.resolve("gpt-5.4-catalog-exact");
         assert_eq!(exact.cost_source, "pricing_file:contract-2026q2");
         assert!(exact.trusted_for_budget_enforcement);
         assert_eq!(exact.pricing.input, 1.95);
 
-        let family = catalog.resolve("claude-sonnet-4-6-20260101");
+        let family = catalog.resolve("gpt-5.4-preview");
         assert_eq!(family.cost_source, "pricing_file:contract-2026q2");
         assert!(family.trusted_for_budget_enforcement);
         assert_eq!(family.pricing.output, 10.50);
 
-        let builtin = catalog.resolve("claude-haiku-4-5-20250929");
-        assert_eq!(builtin.cost_source, BUILTIN_COST_SOURCE);
+        let builtin = catalog.resolve("gpt-5.5");
+        assert_eq!(builtin.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
         assert!(!builtin.trusted_for_budget_enforcement);
-        assert_eq!(builtin.pricing.input, 0.80);
+        assert_eq!(builtin.pricing.input, 5.0);
 
         let gpt = catalog.resolve("gpt-5.5");
         assert_eq!(gpt.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
@@ -444,13 +408,13 @@ cache_create = 2.45
 
     #[test]
     fn estimate_cost_helpers_share_the_same_catalog() {
-        let builtin = estimate_cost_dollars("claude-sonnet-4-5", 1_000_000, 0, 0, 0);
-        assert_eq!(builtin.cost_source, BUILTIN_COST_SOURCE);
-        assert!((builtin.total_cost_dollars - 3.0).abs() < f64::EPSILON);
+        let builtin = estimate_cost_dollars("gpt-5.5", 1_000_000, 0, 0, 0);
+        assert_eq!(builtin.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
+        assert!((builtin.total_cost_dollars - 5.0).abs() < f64::EPSILON);
 
-        let waste = estimate_cache_rebuild_waste_dollars("claude-sonnet-4-5", 1_000_000);
-        assert_eq!(waste.cost_source, BUILTIN_COST_SOURCE);
-        assert!((waste.total_cost_dollars - 3.45).abs() < 1e-9);
+        let waste = estimate_cache_rebuild_waste_dollars("gpt-5.5", 1_000_000);
+        assert_eq!(waste.cost_source, BUILTIN_OPENAI_API_COST_SOURCE);
+        assert!((waste.total_cost_dollars - 4.5).abs() < 1e-9);
     }
 
     #[test]

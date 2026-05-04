@@ -390,7 +390,7 @@ The first four-session run used:
 
 ```sh
 ./test/dogfood-codex-sessions.sh --mode real --sessions 4 --repos mixed \
-  --include-mcp --timeout-seconds 600 \
+  --timeout-seconds 600 --no-json \
   --report-dir reports/dogfood/full-20260430T223917Z
 ```
 

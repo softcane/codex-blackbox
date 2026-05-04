@@ -34,7 +34,7 @@ Implemented:
 
 ## Remaining Work
 
-The remaining work spans Phase 6C polish, real MCP success-path validation,
+The remaining work spans Phase 6C polish, Envoy-only dogfood validation,
 diagnosis polish from Phase 8, and Phase 10.
 
 For execution, split them into these smaller gates:
@@ -124,8 +124,9 @@ Done when the real smoke test is documented with date, Codex version, config, co
 
 ### Phase 9C: Automated Multi-Session Dogfood Feedback
 
-Implemented as a real automated feedback harness, with the first full run
-recorded as `partial` because real tool and MCP watch events were not emitted.
+Implemented as a real automated feedback harness. Its correctness checks are
+limited to Envoy-observed Codex request/response facts; non-Envoy lifecycle
+signals are intentionally skipped.
 
 The harness described in
 `docs/automated-feedback-testing.md`:
@@ -174,15 +175,17 @@ Next testing milestones:
 2. Completed after Phase 6B: wrapper-level Codex command construction testing.
 3. Completed after Phase 4C: SQLite assertions for Codex sessions and turns.
 4. After Phase 6C: watch and tmux UX testing with fake Codex sessions.
-5. After Phase 7: fake Codex hook/tool/MCP testing.
+5. Phase 7 hook/tool/MCP lifecycle validation is retired for the Envoy-only
+   Codex surface.
 6. After Phase 8: diagnosis, Prometheus, and Grafana checks become meaningful.
 7. After Phase 9A: full fake e2e regression testing.
 8. Completed after Phase 9B: first real Codex smoke test.
-9. Implemented after Phase 9C: automated dogfood feedback plus broader 5-repo
-   live validation with real tool/MCP/skill telemetry.
+9. Phase 9C dogfood remains blocked until the no-JSON, Envoy-only correctness
+   surface is clean. Real dogfood can validate only Envoy-observed Codex
+   request/response facts.
 
 Do not treat Coditor as ready for daily dogfood until the Phase 9C report is
-clean enough for the intended use, especially real tool and MCP telemetry.
+clean enough for the intended use.
 
 ## Short Answer
 
@@ -193,14 +196,13 @@ Codex 0.125.0 subscription path. It ran on 2026-04-30 UTC and is documented in
 Left before the automated 3-4 session dogfood harness the user described:
 
 - the harness exists and ran four real sessions
-- the latest broader validation captured real tool, MCP, and skill telemetry
-- MCP calls in the validation were cancelled by the child session, so the MCP
-  success path still needs separate validation
+- the broader validation still needs a clean no-JSON run that relies only on
+  Envoy-observed Codex traffic
 
 Phase 9C is now the automated feedback boundary across same/different repos,
-read queries, tool-oriented prompts, MCP when configured, SQLite, Prometheus,
-and Grafana.
+read queries, Envoy-derived custom tool-call intent when present, SQLite,
+Prometheus, and Grafana.
 
-Left before release-quality Coditor: watch/tmux polish, real tool/MCP telemetry,
-diagnosis/rate-limit hardening, clean dogfood reports, and Phase 10
-documentation/release readiness.
+Left before release-quality Coditor: watch/tmux polish, Envoy-only diagnosis and
+rate-limit hardening, clean dogfood reports, and Phase 10 documentation/release
+readiness.

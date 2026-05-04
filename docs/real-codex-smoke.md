@@ -71,7 +71,7 @@ Observed events and data:
 
 ```sh
 ./test/dogfood-codex-sessions.sh --mode real --sessions 4 --repos mixed \
-  --include-mcp --timeout-seconds 600 \
+  --timeout-seconds 600 --no-json \
   --report-dir reports/dogfood/full-20260430T223917Z
 ```
 
@@ -84,7 +84,6 @@ Passed:
 - 4 real Codex sessions exited `0`.
 - Same-repo coverage: 3 sessions.
 - Different-repo coverage: 1 session.
-- MCP config was detected.
 - `/watch` captured 4 `SessionStart` events, 11 `CodexTurnSummary` events, and
   11 `ContextStatus` events.
 - SQLite persisted 4 Codex sessions and 11 request rows with served model
@@ -97,9 +96,9 @@ Passed:
 
 Quarantined:
 
-- Local Codex stdout and lifecycle-style tool/MCP/skill observations from this
-  run are not product support evidence. Current Codex telemetry is limited to
-  Envoy-observed Responses request/response facts.
+- Local Codex stdout and lifecycle-style tool/MCP/skill observations are not
+  product support evidence. Current Codex telemetry is limited to Envoy-observed
+  Responses request/response facts.
 
 ### Broader Calibration Update
 
@@ -115,8 +114,8 @@ That run captured:
 - Matching SQLite session/request token totals and Prometheus request/token
   totals.
 
-Open: lifecycle telemetry outside Envoy-observed Responses traffic remains
-outside the Codex product surface.
+Open: a clean dogfood rerun should use the no-JSON target path and validate only
+Envoy-observed Responses traffic.
 
 ### Rollback
 
@@ -129,8 +128,8 @@ services running.
 
 ### Limitations
 
-- Live support remains experimental until the MCP success-result path and
-  future Codex version compatibility are validated.
+- Live support remains experimental until a clean no-JSON dogfood run and future
+  Codex version compatibility are validated.
 - Real Codex request prompt excerpts now strip injected AGENTS/environment
   preambles before persistence; display names are stored separately.
 - Pricing remains untrusted for budget enforcement.

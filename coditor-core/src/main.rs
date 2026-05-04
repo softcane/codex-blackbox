@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -59,17 +59,15 @@ pub mod pricing;
 pub mod watch;
 
 use envoy::config::core::v3::{
-    header_value_option::HeaderAppendAction, HeaderValue as ProtoHeaderValue,
-    HeaderValueOption as ProtoHeaderValueOption,
+    HeaderValue as ProtoHeaderValue, HeaderValueOption as ProtoHeaderValueOption,
 };
 use envoy::service::ext_proc::v3::{
-    body_mutation,
     common_response::ResponseStatus,
     external_processor_server::{ExternalProcessor, ExternalProcessorServer},
     processing_request::Request as ExtProcRequest,
     processing_response::Response as ExtProcResponse,
-    BodyMutation, BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, HttpHeaders,
-    ImmediateResponse, ProcessingRequest, ProcessingResponse,
+    BodyResponse, CommonResponse, HeaderMutation, HeadersResponse, HttpHeaders, ImmediateResponse,
+    ProcessingRequest, ProcessingResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -887,12 +885,12 @@ fn repair_session_diagnosis_degradation_turns(conn: &Connection) -> rusqlite::Re
 
 fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
     metrics::ensure_tool_metric_labels("unknown");
-    metrics::ensure_skill_metric_labels("unknown", "fired", "hook");
 
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT tool_name FROM tool_calls \
-         UNION \
-         SELECT DISTINCT tool_name FROM tool_outcomes",
+        "SELECT DISTINCT tc.tool_name \
+         FROM tool_calls tc \
+         INNER JOIN requests r ON r.request_id = tc.request_id \
+         WHERE r.provider = 'codex_responses'",
     )?;
     let tool_names = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -901,41 +899,6 @@ fn seed_live_metric_labels_from_db(conn: &Connection) -> rusqlite::Result<()> {
 
     for tool_name in tool_names {
         metrics::ensure_tool_metric_labels(&tool_name);
-    }
-
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT skill_name, event_type, source FROM skill_events")?;
-    let skill_events = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .filter_map(|row| row.ok())
-        .collect::<Vec<_>>();
-
-    for (skill_name, event_type, source) in skill_events {
-        metrics::ensure_skill_metric_labels(&skill_name, &event_type, &source);
-    }
-
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT server, tool, event_type, source FROM mcp_events")?;
-    let mcp_events = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .filter_map(|row| row.ok())
-        .collect::<Vec<_>>();
-
-    for (server, tool, event_type, source) in mcp_events {
-        metrics::ensure_mcp_event_metric_labels(&server, &tool, &event_type, &source);
     }
 
     Ok(())
@@ -2100,325 +2063,10 @@ fn query_historical_metrics(
 }
 
 // ---------------------------------------------------------------------------
-// Cache intelligence tracker
-// ---------------------------------------------------------------------------
-struct CacheTracker {
-    consecutive_misses: u64,
-    last_request_time: Option<Instant>,
-}
-
-impl CacheTracker {
-    fn new() -> Self {
-        Self {
-            consecutive_misses: 0,
-            last_request_time: None,
-        }
-    }
-}
-
-static CACHE_TRACKERS: LazyLock<DashMap<String, CacheTracker>> = LazyLock::new(DashMap::new);
-const CACHE_TTL_SECS: u64 = 300;
-const THRASH_THRESHOLD: u64 = 3;
-
-/// Returns cache event type: "hit", "partial", "cold_start", "miss_ttl",
-/// "miss_thrash", or "none".
-fn update_cache_intelligence(session_id: &str, cache_read: u64, cache_create: u64) -> &'static str {
-    let mut t = CACHE_TRACKERS
-        .entry(session_id.to_string())
-        .or_insert_with(CacheTracker::new);
-    let now = Instant::now();
-
-    let is_full_miss = cache_create > 0 && cache_read == 0;
-    let is_first = t.last_request_time.is_none();
-    let gap = t
-        .last_request_time
-        .map(|p| now.duration_since(p).as_secs())
-        .unwrap_or(0);
-    let is_ttl = is_full_miss && gap > CACHE_TTL_SECS;
-
-    let event = if cache_read == 0 && cache_create == 0 {
-        "none"
-    } else if is_full_miss {
-        if is_first {
-            t.consecutive_misses = 0;
-            "cold_start"
-        } else if is_ttl {
-            t.consecutive_misses = 0;
-            info!(gap, cache_create, "cache miss attributed to TTL expiry");
-            "miss_ttl"
-        } else {
-            t.consecutive_misses += 1;
-            if t.consecutive_misses >= THRASH_THRESHOLD {
-                warn!(
-                    session_id,
-                    consecutive_misses = t.consecutive_misses,
-                    "cache thrashing detected within a single session"
-                );
-            }
-            "miss_thrash"
-        }
-    } else if cache_create > 0 {
-        t.consecutive_misses = 0;
-        "partial"
-    } else {
-        t.consecutive_misses = 0;
-        "hit"
-    };
-    t.last_request_time = Some(now);
-    event
-}
-
-// ---------------------------------------------------------------------------
 // Estimated pricing
 // ---------------------------------------------------------------------------
 pub fn token_cost(tokens: u64, price_per_mtok: f64) -> f64 {
     pricing::token_cost(tokens, price_per_mtok)
-}
-
-// ---------------------------------------------------------------------------
-// SSE response accumulator
-// ---------------------------------------------------------------------------
-// Frustration signal patterns — compiled once at startup.
-struct FrustrationPattern {
-    regex: regex::Regex,
-    signal_type: &'static str,
-}
-
-static FRUSTRATION_PATTERNS: LazyLock<Vec<FrustrationPattern>> = LazyLock::new(|| {
-    vec![
-        FrustrationPattern {
-            regex: regex::Regex::new(r"(?i)burning too many tokens").unwrap(),
-            signal_type: "token_pressure",
-        },
-        FrustrationPattern {
-            regex: regex::Regex::new(r"(?i)this has taken too many turns").unwrap(),
-            signal_type: "early_stop",
-        },
-        FrustrationPattern {
-            regex: regex::Regex::new(r"(?i)let me wrap up").unwrap(),
-            signal_type: "early_stop",
-        },
-        FrustrationPattern {
-            regex: regex::Regex::new(r"(?i)simplest (?:fix|solution)").unwrap(),
-            signal_type: "simplest_fix",
-        },
-        FrustrationPattern {
-            regex: regex::Regex::new(r"(?i)context (?:is|getting) (?:large|full)").unwrap(),
-            signal_type: "context_pressure",
-        },
-    ]
-});
-
-/// Track what type of content block we're currently inside.
-#[derive(Clone, PartialEq)]
-enum ContentBlockType {
-    Text,
-    ToolUse,
-    Other,
-}
-
-struct ResponseAccumulator {
-    sse_buffer: Vec<u8>,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-    tool_calls: Vec<String>,
-    is_sse: bool,
-    http_status: u32,
-    error_body: Vec<u8>,
-    /// Model Anthropic reported in `message_start` — may differ from what the
-    /// client requested when a quota fallback silently routes the request.
-    response_model: Option<String>,
-    /// Concatenated assistant text from this response, used for compact
-    /// session-end recall summaries.
-    response_text: String,
-    // Phase 1: text delta accumulation for frustration detection.
-    text_buffer: String,
-    // Phase 1: tool input JSON accumulation for summary extraction.
-    tool_input_buffer: String,
-    // Track current content block type.
-    current_block_type: ContentBlockType,
-    // Phase 2: count frustration signals detected in this response.
-    frustration_signal_count: u32,
-    // Deferred watch events — broadcast after session start in finalize_response.
-    deferred_watch_events: Vec<watch::WatchEvent>,
-}
-
-impl ResponseAccumulator {
-    fn new() -> Self {
-        Self {
-            sse_buffer: Vec::with_capacity(4096),
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            tool_calls: Vec::new(),
-            is_sse: false,
-            http_status: 0,
-            error_body: Vec::new(),
-            response_model: None,
-            response_text: String::new(),
-            text_buffer: String::new(),
-            tool_input_buffer: String::new(),
-            current_block_type: ContentBlockType::Other,
-            frustration_signal_count: 0,
-            deferred_watch_events: Vec::new(),
-        }
-    }
-
-    fn process_chunk(&mut self, chunk: &[u8]) {
-        self.sse_buffer.extend_from_slice(chunk);
-        loop {
-            let Some(pos) = self.sse_buffer.iter().position(|&b| b == b'\n') else {
-                break;
-            };
-            let line = String::from_utf8_lossy(&self.sse_buffer[..pos]);
-            let line = line.trim_end_matches('\r');
-            if let Some(data) = line.strip_prefix("data: ") {
-                if data != "[DONE]" {
-                    if let Ok(v) = serde_json::from_str::<Value>(data) {
-                        self.process_event(&v);
-                    }
-                }
-            }
-            self.sse_buffer.drain(..=pos);
-        }
-    }
-
-    fn process_event(&mut self, v: &Value) {
-        match v.get("type").and_then(|t| t.as_str()) {
-            Some("message_start") => {
-                if let Some(u) = v.pointer("/message/usage") {
-                    self.input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    self.cache_read_tokens = u
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    self.cache_creation_tokens = u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                }
-                // Capture the model Anthropic actually routed to. If it differs
-                // from what the user requested we surface a silent-fallback
-                // alert in `finalize_response`.
-                if let Some(m) = v.pointer("/message/model").and_then(|m| m.as_str()) {
-                    self.response_model = Some(m.to_string());
-                }
-            }
-            Some("content_block_start") => {
-                if let Some(b) = v.get("content_block") {
-                    let block_type = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match block_type {
-                        "tool_use" => {
-                            self.current_block_type = ContentBlockType::ToolUse;
-                            self.tool_input_buffer.clear();
-                            if let Some(n) = b.get("name").and_then(|n| n.as_str()) {
-                                self.tool_calls.push(n.to_string());
-                            }
-                        }
-                        "text" => {
-                            self.current_block_type = ContentBlockType::Text;
-                            self.text_buffer.clear();
-                        }
-                        _ => {
-                            self.current_block_type = ContentBlockType::Other;
-                        }
-                    }
-                }
-            }
-            Some("content_block_delta") => {
-                if let Some(delta) = v.get("delta") {
-                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match delta_type {
-                        "text_delta" => {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                self.text_buffer.push_str(text);
-                            }
-                        }
-                        "input_json_delta" => {
-                            if let Some(partial) =
-                                delta.get("partial_json").and_then(|p| p.as_str())
-                            {
-                                self.tool_input_buffer.push_str(partial);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some("content_block_stop") => {
-                match self.current_block_type {
-                    ContentBlockType::Text => {
-                        // Run frustration detection on completed text block.
-                        for pattern in FRUSTRATION_PATTERNS.iter() {
-                            if pattern.regex.is_match(&self.text_buffer) {
-                                self.frustration_signal_count += 1;
-                                self.deferred_watch_events.push(
-                                    watch::WatchEvent::FrustrationSignal {
-                                        session_id: String::new(), // Filled in finalize_response.
-                                        signal_type: pattern.signal_type.to_string(),
-                                    },
-                                );
-                            }
-                        }
-                        let trimmed = self.text_buffer.trim();
-                        if !trimmed.is_empty() {
-                            if !self.response_text.is_empty() {
-                                self.response_text.push('\n');
-                            }
-                            self.response_text.push_str(trimmed);
-                        }
-                        self.text_buffer.clear();
-                    }
-                    ContentBlockType::ToolUse => {
-                        // Defer ToolUse event — broadcast after session start in finalize_response.
-                        if let Some(tool_name) = self.tool_calls.last() {
-                            let summary =
-                                watch::extract_summary(tool_name, &self.tool_input_buffer);
-                            self.deferred_watch_events.push(watch::WatchEvent::ToolUse {
-                                session_id: String::new(), // Filled in finalize_response.
-                                timestamp: now_iso8601(),
-                                tool_name: tool_name.clone(),
-                                summary,
-                            });
-                            if tool_name.eq_ignore_ascii_case("Skill") {
-                                if let Some(skill_name) =
-                                    skill_name_from_tool_input_json(&self.tool_input_buffer)
-                                {
-                                    self.deferred_watch_events.push(
-                                        watch::WatchEvent::SkillEvent {
-                                            session_id: String::new(), // Filled in finalize_response.
-                                            timestamp: now_iso8601(),
-                                            skill_name,
-                                            event_type: "fired".to_string(),
-                                            source: "proxy".to_string(),
-                                            confidence: 0.65,
-                                            detail: Some(
-                                                "inferred from Skill tool_use".to_string(),
-                                            ),
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        self.tool_input_buffer.clear();
-                    }
-                    ContentBlockType::Other => {}
-                }
-                self.current_block_type = ContentBlockType::Other;
-            }
-            Some("message_delta") => {
-                if let Some(u) = v.get("usage") {
-                    if let Some(o) = u.get("output_tokens").and_then(|v| v.as_u64()) {
-                        self.output_tokens = o;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 enum SelectedResponseAccumulator {
@@ -2426,24 +2074,14 @@ enum SelectedResponseAccumulator {
         accumulator: codex_response::CodexResponsesAccumulator,
         is_sse: bool,
     },
-    TemporaryUnportedAnthropicFallback(ResponseAccumulator),
 }
 
 impl SelectedResponseAccumulator {
-    fn for_request_source(source: RequestMetadataSource) -> Self {
-        match source {
-            RequestMetadataSource::CodexResponses => Self::CodexResponses {
-                accumulator: codex_response::CodexResponsesAccumulator::new(),
-                is_sse: false,
-            },
-            RequestMetadataSource::TemporaryUnportedAnthropicFallback => {
-                Self::temporary_unported_anthropic_fallback()
-            }
+    fn for_request_source(_source: RequestMetadataSource) -> Self {
+        Self::CodexResponses {
+            accumulator: codex_response::CodexResponsesAccumulator::new(),
+            is_sse: false,
         }
-    }
-
-    fn temporary_unported_anthropic_fallback() -> Self {
-        Self::TemporaryUnportedAnthropicFallback(ResponseAccumulator::new())
     }
 
     fn apply_response_headers(&mut self, headers: &codex_response::CodexResponseHeaders) {
@@ -2455,18 +2093,12 @@ impl SelectedResponseAccumulator {
                 *is_sse = headers.http_status == Some(200);
                 accumulator.apply_headers(headers);
             }
-            Self::TemporaryUnportedAnthropicFallback(accumulator) => {
-                let status = headers.http_status.unwrap_or(0);
-                accumulator.http_status = status;
-                accumulator.is_sse = status == 200;
-            }
         }
     }
 
     fn is_sse(&self) -> bool {
         match self {
             Self::CodexResponses { is_sse, .. } => *is_sse,
-            Self::TemporaryUnportedAnthropicFallback(accumulator) => accumulator.is_sse,
         }
     }
 
@@ -2476,28 +2108,13 @@ impl SelectedResponseAccumulator {
     ) -> Result<(), codex_response::CodexResponseParseError> {
         match self {
             Self::CodexResponses { accumulator, .. } => accumulator.process_chunk(chunk),
-            Self::TemporaryUnportedAnthropicFallback(accumulator) => {
-                accumulator.process_chunk(chunk);
-                Ok(())
-            }
         }
-    }
-
-    fn capture_error_body(&mut self, chunk: &[u8]) {
-        let Self::TemporaryUnportedAnthropicFallback(accumulator) = self else {
-            return;
-        };
-        let remaining = 1024usize.saturating_sub(accumulator.error_body.len());
-        accumulator
-            .error_body
-            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
     }
 }
 
 #[derive(Clone, Debug)]
 enum SelectedFinalizationOutcome {
     Codex(CodexFinalizationOutcome),
-    TemporaryUnportedAnthropicFallback,
 }
 
 #[derive(Clone, Debug)]
@@ -2514,31 +2131,12 @@ struct CodexFinalizationOutcome {
 // ---------------------------------------------------------------------------
 // Finalize: metrics + DB persistence
 // ---------------------------------------------------------------------------
-/// Claude Code can expose 1M context as a UI model suffix even though the
-/// Anthropic API expects a normal model id plus an anthropic-beta header.
-fn strip_model_1m_alias(model: &str) -> Option<&str> {
-    let lower = model.to_ascii_lowercase();
-    lower
-        .ends_with("[1m]")
-        .then(|| &model[..model.len().saturating_sub("[1m]".len())])
-        .filter(|model| !model.is_empty())
-}
-
-/// Relaxed model equivalence check: "claude-opus-4-7" and
-/// "claude-opus-4-7-20260410" should be considered the same model. We treat
-/// two strings as matching if either contains the other as a prefix.
-fn normalize_model_for_match(model: &str) -> &str {
-    strip_model_1m_alias(model).unwrap_or(model)
-}
-
 pub(crate) fn model_matches(requested: &str, actual: &str) -> bool {
-    let requested = normalize_model_for_match(requested);
-    let actual = normalize_model_for_match(actual);
-    requested == actual || requested.starts_with(actual) || actual.starts_with(requested)
+    requested == actual
 }
 
-/// Linear extrapolation: estimate how many turns remain before Claude Code
-/// auto-compacts at ~85% of the resolved context window.
+/// Linear extrapolation: estimate how many turns remain before the configured
+/// context-pressure threshold.
 pub(crate) fn project_turns_until_compaction(
     prev_fill_percent: f64,
     current_fill_percent: f64,
@@ -2555,528 +2153,6 @@ pub(crate) fn project_turns_until_compaction(
     Some((remaining / delta).ceil().max(1.0) as u32)
 }
 
-/// Linear extrapolation: look at the last two turns' fill % and project how
-/// many turns until we cross 85%. Returns None if we don't have two turns yet
-/// or the trajectory is flat / decreasing.
-fn project_turns_to_compact(session_id: &str, current_fill_percent: f64) -> Option<u32> {
-    let turns = diagnosis::SESSION_TURNS.get(session_id)?;
-    let prev = turns.last()?;
-    let prev_fill = context_fill_percent(
-        prev.input_tokens as u64,
-        prev.cache_read_tokens as u64,
-        prev.cache_creation_tokens as u64,
-        prev.context_window_tokens,
-    );
-    project_turns_until_compaction(prev_fill, current_fill_percent)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finalize_response(
-    acc: &ResponseAccumulator,
-    request_id: &str,
-    model: &str,
-    started_at: &Instant,
-    tool_results: &[ParsedToolResult],
-    sys_prompt_hash: u64,
-    working_dir_str: &str,
-    user_prompt_excerpt: &str,
-    context_window_tokens: u64,
-) {
-    let duration = started_at.elapsed();
-    let duration_secs = duration.as_secs_f64();
-    let duration_ms = duration.as_millis() as u64;
-    let tool_failures = tool_results.iter().filter(|result| result.is_error).count() as u32;
-
-    // Look up or create the per-terminal session by system prompt hash.
-    // Use get_mut first (cheap read lock), then entry() only if truly new.
-    let session_id = if let Some(mut existing) = diagnosis::SESSIONS.get_mut(&sys_prompt_hash) {
-        existing.last_activity = Instant::now();
-        existing.cache_warning_sent = false;
-        existing.session_id.clone()
-    } else {
-        // Derive display name BEFORE taking the entry lock to avoid deadlock
-        // (derive_display_name iterates SESSIONS to check for name collisions).
-        let name = derive_display_name(working_dir_str, model, sys_prompt_hash);
-        let ts = now_epoch_secs();
-        let hash_suffix = &format!("{:x}", sys_prompt_hash)[..4];
-        let sid = format!("session_{ts}_{hash_suffix}");
-        let sid_clone = sid.clone();
-        diagnosis::SESSIONS.insert(
-            sys_prompt_hash,
-            diagnosis::SessionState {
-                session_id: sid,
-                display_name: name,
-                model: model.to_string(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-                created_at: Instant::now(),
-                last_activity: Instant::now(),
-                session_inserted: false,
-                cache_warning_sent: false,
-            },
-        );
-        sid_clone
-    };
-
-    let billing_model = acc.response_model.as_deref().unwrap_or(model);
-    let estimated_cost = pricing::estimate_cost_dollars(
-        billing_model,
-        acc.input_tokens,
-        acc.output_tokens,
-        acc.cache_read_tokens,
-        acc.cache_creation_tokens,
-    );
-    let total_cost = estimated_cost.total_cost_dollars;
-
-    metrics::record_request(
-        billing_model,
-        acc.input_tokens,
-        acc.output_tokens,
-        acc.cache_read_tokens,
-        acc.cache_creation_tokens,
-        total_cost,
-        duration_secs,
-    );
-
-    // Skip requests that can't be attributed to a terminal:
-    // - Haiku title-generation requests
-    // - Any request with empty system prompt (e.g., Opus/Sonnet title-generation requests
-    //   which have system_prompt_length=0 and no working directory)
-    // These still get budget tracking, DB recording, and logging below.
-    let is_title_request = model.contains("haiku") || working_dir_str.is_empty();
-
-    let cache_event = if is_title_request {
-        "none"
-    } else {
-        update_cache_intelligence(
-            &session_id,
-            acc.cache_read_tokens,
-            acc.cache_creation_tokens,
-        )
-    };
-
-    // Phase 7: update budget state.
-    {
-        let mut runtime = RUNTIME_STATE.lock().unwrap();
-        runtime.total_spend += total_cost;
-        runtime.total_tokens += acc.input_tokens
-            + acc.output_tokens
-            + acc.cache_read_tokens
-            + acc.cache_creation_tokens;
-        runtime.request_count += 1;
-    }
-
-    let estimated_cache_waste_dollars = if matches!(cache_event, "miss_ttl" | "miss_thrash") {
-        Some(
-            pricing::estimate_cache_rebuild_waste_dollars(billing_model, acc.cache_creation_tokens)
-                .total_cost_dollars,
-        )
-    } else {
-        None
-    };
-    {
-        let mut entry = SESSION_BUDGETS.entry(session_id.clone()).or_default();
-        entry.total_spend += total_cost;
-        entry.total_tokens += acc.input_tokens
-            + acc.output_tokens
-            + acc.cache_read_tokens
-            + acc.cache_creation_tokens;
-        entry.request_count += 1;
-        if let Some(waste) = estimated_cache_waste_dollars {
-            entry.estimated_cache_waste_dollars += waste;
-        }
-    }
-
-    if !is_title_request {
-        // Ensure session row exists (uses the primary model, not haiku).
-        let insert_info = {
-            let mut entry = diagnosis::SESSIONS.get_mut(&sys_prompt_hash);
-            if let Some(ref mut e) = entry {
-                if !e.session_inserted {
-                    e.session_inserted = true;
-                    Some(e.display_name.clone())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        if let Some(display_name) = insert_info {
-            let _ = DB_TX.send(DbCommand::InsertSession {
-                session_id: session_id.clone(),
-                started_at: now_iso8601(),
-                model: model.to_string(),
-                display_name: display_name.clone(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-            });
-            watch::BROADCASTER.broadcast(watch::WatchEvent::SessionStart {
-                session_id: session_id.clone(),
-                display_name,
-                model: model.to_string(),
-                initial_prompt: if user_prompt_excerpt.is_empty() {
-                    None
-                } else {
-                    Some(user_prompt_excerpt.to_string())
-                },
-            });
-            metrics::set_active_sessions(active_session_count());
-        }
-
-        for tool_result in tool_results {
-            if tool_result.is_error {
-                metrics::record_tool_failures(&tool_result.tool_name, 1);
-                if let Some((server, tool)) = metrics::mcp_tool_labels(&tool_result.tool_name) {
-                    watch::BROADCASTER.broadcast(watch::WatchEvent::McpEvent {
-                        session_id: session_id.clone(),
-                        timestamp: now_iso8601(),
-                        server,
-                        tool,
-                        event_type: "failed".to_string(),
-                        source: "proxy".to_string(),
-                        detail: Some(tool_result.outcome.clone()),
-                    });
-                }
-                if tool_result.tool_name.eq_ignore_ascii_case("Skill") {
-                    let skill_name = canonical_telemetry_name(&tool_result.input_summary)
-                        .unwrap_or_else(|| "unknown".to_string());
-                    emit_skill_event(SkillTelemetryEvent {
-                        session_id: session_id.clone(),
-                        timestamp: now_iso8601(),
-                        skill_name,
-                        event_type: "failed".to_string(),
-                        source: "proxy".to_string(),
-                        confidence: 0.65,
-                        detail: Some(tool_result.outcome.clone()),
-                    });
-                }
-            } else if let Some((server, tool)) = metrics::mcp_tool_labels(&tool_result.tool_name) {
-                emit_mcp_event(McpTelemetryEvent {
-                    session_id: session_id.clone(),
-                    timestamp: now_iso8601(),
-                    server,
-                    tool,
-                    event_type: "succeeded".to_string(),
-                    source: "proxy".to_string(),
-                    detail: Some(tool_result.outcome.clone()),
-                });
-            }
-            watch::BROADCASTER.broadcast(watch::WatchEvent::ToolResult {
-                session_id: session_id.clone(),
-                tool_name: tool_result.tool_name.clone(),
-                outcome: tool_result.outcome.clone(),
-                duration_ms: tool_result.duration_ms,
-            });
-        }
-
-        // Broadcast all cache events except "none" — hits confirm the stream is alive.
-        if cache_event != "none" {
-            let resolved = pricing::resolve_pricing(billing_model);
-            let prompt_size_tokens =
-                acc.input_tokens + acc.cache_read_tokens + acc.cache_creation_tokens;
-            let rebuild_cost = token_cost(prompt_size_tokens, resolved.pricing.cache_create);
-            let expires_at = now_epoch_secs() + CACHE_TTL_SECS;
-            metrics::record_cache_event(billing_model, cache_event, estimated_cache_waste_dollars);
-            watch::BROADCASTER.broadcast(watch::WatchEvent::CacheEvent {
-                session_id: session_id.clone(),
-                event_type: cache_event.to_string(),
-                cache_expires_at_epoch: Some(expires_at),
-                estimated_rebuild_cost_dollars: Some(rebuild_cost),
-            });
-        }
-
-        // Flush deferred watch events (tool use, frustration signals) — inject session_id.
-        for event in &acc.deferred_watch_events {
-            let mut event = event.clone();
-            match &mut event {
-                watch::WatchEvent::ToolUse {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::FrustrationSignal {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::SkillEvent {
-                    session_id: sid, ..
-                }
-                | watch::WatchEvent::McpEvent {
-                    session_id: sid, ..
-                } => {
-                    *sid = session_id.clone();
-                }
-                _ => {}
-            }
-            match event {
-                watch::WatchEvent::ToolUse { ref tool_name, .. } => {
-                    metrics::record_tool_call(tool_name);
-                    watch::BROADCASTER.broadcast(event);
-                }
-                watch::WatchEvent::SkillEvent {
-                    session_id,
-                    timestamp,
-                    skill_name,
-                    event_type,
-                    source,
-                    confidence,
-                    detail,
-                } => {
-                    emit_skill_event(SkillTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        skill_name,
-                        event_type,
-                        source,
-                        confidence,
-                        detail,
-                    });
-                }
-                watch::WatchEvent::McpEvent {
-                    session_id,
-                    timestamp,
-                    server,
-                    tool,
-                    event_type,
-                    source,
-                    detail,
-                } => {
-                    emit_mcp_event(McpTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        server,
-                        tool,
-                        event_type,
-                        source,
-                        detail,
-                    });
-                }
-                other => watch::BROADCASTER.broadcast(other),
-            }
-        }
-
-        // Silent-fallback detector: Anthropic sometimes routes a request to a
-        // different model than the client asked for (e.g. Opus→Sonnet when
-        // the Opus quota is drained). We emit a one-shot alert whenever the
-        // `message.model` we saw in the SSE doesn't match the requested model.
-        // Matching is a contains-check so minor version suffix drift
-        // (`claude-opus-4-7` vs `claude-opus-4-7-20260410`) doesn't misfire.
-        if let Some(actual) = acc.response_model.as_ref() {
-            if !model_matches(model, actual) {
-                metrics::record_model_fallback(model, actual);
-                watch::BROADCASTER.broadcast(watch::WatchEvent::ModelFallback {
-                    session_id: session_id.clone(),
-                    requested: model.to_string(),
-                    actual: actual.clone(),
-                });
-            }
-        }
-
-        // Compaction runway: broadcast current context fill + projected turns
-        // until Claude Code auto-compacts (~85% of the resolved context
-        // window). If we have <2 turns of history we don't project — the
-        // slope is meaningless.
-        let fill_percent = context_fill_percent(
-            acc.input_tokens,
-            acc.cache_read_tokens,
-            acc.cache_creation_tokens,
-            context_window_tokens,
-        );
-        let turns_to_compact = project_turns_to_compact(&session_id, fill_percent);
-        metrics::record_context_status(turns_to_compact);
-        watch::BROADCASTER.broadcast(watch::WatchEvent::ContextStatus {
-            session_id: session_id.clone(),
-            fill_percent,
-            context_window_tokens: Some(context_window_tokens),
-            turns_to_compact,
-        });
-
-        // Build and store TurnSnapshot.
-        let (turn_number, compaction_loop_signal) = {
-            let mut entry = diagnosis::SESSION_TURNS
-                .entry(session_id.clone())
-                .or_default();
-            let n = entry.len() as u32 + 1;
-            let gap = if let Some(prev) = entry.last() {
-                started_at.duration_since(prev.timestamp).as_secs_f64()
-            } else {
-                0.0
-            };
-            let response_summary = compact_response_summary(&acc.response_text, tool_results);
-            let snapshot = diagnosis::TurnSnapshot {
-                turn_number: n,
-                timestamp: *started_at,
-                provider: None,
-                input_tokens: acc.input_tokens as u32,
-                cache_read_tokens: acc.cache_read_tokens as u32,
-                cache_creation_tokens: acc.cache_creation_tokens as u32,
-                output_tokens: acc.output_tokens as u32,
-                codex_status: None,
-                codex_cached_input_tokens: 0,
-                codex_uncached_input_tokens: 0,
-                codex_reasoning_output_tokens: 0,
-                codex_accounting_anomaly_count: 0,
-                ttft_ms: duration_ms,
-                tool_calls: acc.tool_calls.clone(),
-                tool_results_failed: tool_failures,
-                mcp_tool_failures: 0,
-                gap_from_prev_secs: gap,
-                context_utilization: context_fill_ratio(
-                    acc.input_tokens,
-                    acc.cache_read_tokens,
-                    acc.cache_creation_tokens,
-                    context_window_tokens,
-                ),
-                context_window_tokens,
-                frustration_signals: acc.frustration_signal_count,
-                requested_model: Some(model.to_string()),
-                actual_model: acc.response_model.clone(),
-                response_summary: response_summary.clone(),
-            };
-            entry.push(snapshot);
-            let signal = diagnosis::compaction_loop_signal_ending_at(
-                entry.as_slice(),
-                entry.len().saturating_sub(1),
-            );
-            (n, signal)
-        };
-
-        if let Some(signal) = compaction_loop_signal {
-            // Emit once when the heuristic first crosses the detection threshold.
-            if signal.consecutive_turns == 3 {
-                watch::BROADCASTER.broadcast(watch::WatchEvent::CompactionLoop {
-                    session_id: session_id.clone(),
-                    consecutive: signal.consecutive_turns,
-                    wasted_tokens: signal.wasted_tokens,
-                });
-            }
-        }
-
-        // Persist turn snapshot to SQLite (async).
-        let snap_session = session_id.clone();
-        let snap_ts = now_iso8601();
-        let snap_tools = serde_json::to_string(&acc.tool_calls).unwrap_or_default();
-        let snap_input = acc.input_tokens;
-        let snap_output = acc.output_tokens;
-        let snap_cache_read = acc.cache_read_tokens;
-        let snap_cache_create = acc.cache_creation_tokens;
-        let snap_ttft = duration_ms;
-        let snap_failures = tool_failures;
-        let snap_gap = {
-            let entry = diagnosis::SESSION_TURNS.get(&session_id);
-            entry
-                .as_ref()
-                .and_then(|turns| turns.last())
-                .map(|t| t.gap_from_prev_secs)
-                .unwrap_or(0.0)
-        };
-        let snap_ctx = context_fill_ratio(
-            acc.input_tokens,
-            acc.cache_read_tokens,
-            acc.cache_creation_tokens,
-            context_window_tokens,
-        );
-        let snap_frust = acc.frustration_signal_count;
-        let snap_requested_model = Some(model.to_string());
-        let snap_actual_model = acc.response_model.clone();
-        let snap_response_summary = compact_response_summary(&acc.response_text, tool_results);
-        let _ = DB_TX.send(DbCommand::WriteTurnSnapshot {
-            session_id: snap_session,
-            turn_number,
-            timestamp: snap_ts.clone(),
-            input_tokens: snap_input,
-            cache_read_tokens: snap_cache_read,
-            cache_creation_tokens: snap_cache_create,
-            output_tokens: snap_output,
-            ttft_ms: snap_ttft,
-            tool_calls_json: snap_tools,
-            tool_failures: snap_failures,
-            gap_from_prev_secs: snap_gap,
-            context_utilization: snap_ctx,
-            context_window_tokens,
-            frustration_signals: snap_frust,
-            requested_model: snap_requested_model,
-            actual_model: snap_actual_model,
-            response_summary: snap_response_summary,
-        });
-
-        for tool_result in tool_results {
-            let _ = DB_TX.send(DbCommand::WriteToolOutcome {
-                session_id: session_id.clone(),
-                turn_number,
-                timestamp: snap_ts.clone(),
-                tool_name: tool_result.tool_name.clone(),
-                input_summary: tool_result.input_summary.clone(),
-                outcome: tool_result.outcome.clone(),
-                duration_ms: tool_result.duration_ms,
-            });
-        }
-    }
-
-    // Persist request (always — including title requests for estimated-cost tracking).
-    let ts = now_iso8601();
-    let tool_calls_json = serde_json::to_string(&acc.tool_calls).unwrap_or_default();
-    let tool_calls_list: Vec<(String, String)> = acc
-        .tool_calls
-        .iter()
-        .map(|n| (n.clone(), ts.clone()))
-        .collect();
-    let _ = DB_TX.send(DbCommand::RecordRequest {
-        request_id: request_id.to_string(),
-        session_id: session_id.clone(),
-        timestamp: ts,
-        model: billing_model.to_string(),
-        input_tokens: acc.input_tokens,
-        output_tokens: acc.output_tokens,
-        cache_read_tokens: acc.cache_read_tokens,
-        cache_creation_tokens: acc.cache_creation_tokens,
-        cost_dollars: total_cost,
-        cost_source: estimated_cost.cost_source.clone(),
-        trusted_for_budget_enforcement: estimated_cost.trusted_for_budget_enforcement,
-        duration_ms,
-        tool_calls_json,
-        tool_calls_list,
-        cache_event: cache_event.to_string(),
-    });
-
-    if acc.http_status >= 400 && !acc.error_body.is_empty() {
-        let error_text = String::from_utf8_lossy(&acc.error_body);
-        warn!(request_id, model, http_status = acc.http_status,
-            error = %error_text, duration_s = format!("{:.2}", duration_secs),
-            "request failed");
-    } else {
-        info!(
-            request_id,
-            model,
-            http_status = acc.http_status,
-            input_tokens = acc.input_tokens,
-            output_tokens = acc.output_tokens,
-            cache_read = acc.cache_read_tokens,
-            cache_create = acc.cache_creation_tokens,
-            context_window_tokens,
-            fill_percent = format!(
-                "{:.1}",
-                context_fill_percent(
-                    acc.input_tokens,
-                    acc.cache_read_tokens,
-                    acc.cache_creation_tokens,
-                    context_window_tokens
-                )
-            ),
-            estimated_cost = format!("${:.6}", total_cost),
-            duration_s = format!("{:.2}", duration_secs),
-            tools = acc.tool_calls.len(),
-            cache_event,
-            billed_as = billing_model,
-            "request complete"
-        );
-    }
-}
-
 fn build_codex_finalization_outcome(
     request_id: &str,
     request: &codex_request::ParsedCodexRequest,
@@ -3085,7 +2161,7 @@ fn build_codex_finalization_outcome(
     context_window_tokens: u64,
 ) -> CodexFinalizationOutcome {
     let accounting = codex_accounting::summarize_codex_turn(request, response);
-    let response_summary = compact_response_summary(&response.output_text, &[]);
+    let response_summary = compact_response_summary(&response.output_text);
     let context_fill_percent =
         context_fill_percent(accounting.input_tokens, 0, 0, context_window_tokens);
     let mut watch_events = Vec::new();
@@ -3202,6 +2278,9 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
         metric_model,
         outcome.context_fill_percent,
     );
+    for tool in &outcome.accounting.tool_calls {
+        metrics::record_tool_call(&codex_tool_name(tool));
+    }
 
     for event in &outcome.watch_events {
         match event {
@@ -3221,7 +2300,7 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
             watch::WatchEvent::ContextStatus {
                 turns_to_compact, ..
             } => {
-                metrics::record_context_status(*turns_to_compact);
+                let _ = turns_to_compact;
                 watch::BROADCASTER.broadcast(event.clone());
             }
             _ => watch::BROADCASTER.broadcast(event.clone()),
@@ -3336,7 +2415,7 @@ fn summarize_codex_tool_input(tool: &codex_response::CodexToolCallSummary) -> St
         return tool.id.clone();
     }
     if let Ok(value) = serde_json::from_str::<Value>(input) {
-        return summarize_hook_tool_input(Some(&value))
+        return summarize_structured_tool_input(&value)
             .unwrap_or_else(|| truncate_detail(input, 100));
     }
     truncate_detail(input, 100)
@@ -3560,10 +2639,6 @@ fn finalize_selected_response(
     request_id: &str,
     model: &str,
     started_at: &Instant,
-    tool_results: &[ParsedToolResult],
-    sys_prompt_hash: u64,
-    working_dir_str: &str,
-    user_prompt_excerpt: &str,
     context_window_tokens: u64,
 ) -> Option<SelectedFinalizationOutcome> {
     match acc {
@@ -3588,20 +2663,6 @@ fn finalize_selected_response(
                 started_at,
                 context_window_tokens,
             )))
-        }
-        SelectedResponseAccumulator::TemporaryUnportedAnthropicFallback(accumulator) => {
-            finalize_response(
-                accumulator,
-                request_id,
-                model,
-                started_at,
-                tool_results,
-                sys_prompt_hash,
-                working_dir_str,
-                user_prompt_excerpt,
-                context_window_tokens,
-            );
-            Some(SelectedFinalizationOutcome::TemporaryUnportedAnthropicFallback)
         }
     }
 }
@@ -4180,9 +3241,8 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
 }
 
 /// End a session: run diagnosis, broadcast SessionEnd, persist to DB, clean up.
-fn end_session(session_id: &str, session_model: Option<String>, initial_prompt: Option<String>) {
+fn end_session(session_id: &str, _session_model: Option<String>, initial_prompt: Option<String>) {
     SESSION_BUDGETS.remove(session_id);
-    CACHE_TRACKERS.remove(session_id);
     if let Some((_, turns)) = diagnosis::SESSION_TURNS.remove(session_id) {
         if turns.is_empty() {
             // No turns collected — still broadcast session end.
@@ -4202,20 +3262,9 @@ fn end_session(session_id: &str, session_model: Option<String>, initial_prompt: 
             total_tokens: report.total_tokens,
             total_turns: report.total_turns,
         });
-        metrics::record_session_end(
-            &report.outcome,
-            session_model.as_deref(),
-            report.estimated_total_cost_dollars,
-            report.total_turns,
-        );
-
         if report.degraded {
-            metrics::record_degraded_session();
             for cause in &report.causes {
                 metrics::record_degraded_cause(&cause.cause_type);
-                if cause.cause_type == "compaction_suspected" {
-                    metrics::record_compaction_suspected();
-                }
             }
             watch::BROADCASTER.broadcast(watch::WatchEvent::Diagnosis {
                 session_id: session_id.to_string(),
@@ -4270,7 +3319,7 @@ fn derive_display_name(working_dir: &str, model: &str, sys_prompt_hash: u64) -> 
             .unwrap_or(working_dir)
             .to_string()
     } else {
-        let short_model = model.replace("claude-", "").replace("-20250514", "");
+        let short_model = model.to_string();
         let tod = now_epoch_secs() % 86400;
         format!(
             "{}\u{00b7}{:02}:{:02}",
@@ -4329,8 +3378,6 @@ fn extract_headers(h: &HttpHeaders, name: &str) -> Vec<String> {
 
 const STANDARD_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 const EXTENDED_CONTEXT_WINDOW_TOKENS: u64 = 1_000_000;
-const CONTEXT_1M_BETA: &str = "context-1m-2025-08-07";
-const CONTEXT_1M_BETA_PREFIX: &str = "context-1m-";
 
 fn configured_context_window_tokens() -> Option<u64> {
     let value = std::env::var("CODITOR_CONTEXT_WINDOW_TOKENS").ok()?;
@@ -4342,80 +3389,19 @@ fn configured_context_window_tokens() -> Option<u64> {
     }
 }
 
-fn model_requests_1m_context(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("[1m]")
-}
-
-fn beta_values_use_1m_context(values: &[String]) -> bool {
-    values
-        .iter()
-        .flat_map(|value| value.split(','))
-        .map(|beta| beta.trim().to_ascii_lowercase())
-        .any(|beta| beta.starts_with(CONTEXT_1M_BETA_PREFIX))
-}
-
-fn request_uses_1m_context(headers: &HttpHeaders) -> bool {
-    beta_values_use_1m_context(&extract_headers(headers, "anthropic-beta"))
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct UpstreamRequestAdjustment {
-    body: Option<Vec<u8>>,
-    anthropic_beta: Option<String>,
-}
-
-fn anthropic_beta_with_1m_context(beta_values: &[String]) -> String {
-    if beta_values.is_empty() {
-        CONTEXT_1M_BETA.to_string()
-    } else {
-        format!("{}, {}", beta_values.join(", "), CONTEXT_1M_BETA)
-    }
-}
-
-fn upstream_request_adjustment_for_body(
-    beta_values: &[String],
-    body: &[u8],
-) -> UpstreamRequestAdjustment {
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
-        return UpstreamRequestAdjustment::default();
-    };
-
-    let Some(model) = value.get("model").and_then(|model| model.as_str()) else {
-        return UpstreamRequestAdjustment::default();
-    };
-    let Some(upstream_model) = strip_model_1m_alias(model) else {
-        return UpstreamRequestAdjustment::default();
-    };
-
-    value["model"] = Value::String(upstream_model.to_string());
-    UpstreamRequestAdjustment {
-        body: serde_json::to_vec(&value).ok(),
-        anthropic_beta: (!beta_values_use_1m_context(beta_values))
-            .then(|| anthropic_beta_with_1m_context(beta_values)),
-    }
-}
-
-fn resolve_context_window_tokens(header_hint: Option<u64>, model: &str) -> u64 {
-    configured_context_window_tokens()
-        .or(header_hint)
-        .or_else(|| model_requests_1m_context(model).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS))
-        .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
+fn resolve_context_window_tokens() -> u64 {
+    configured_context_window_tokens().unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS)
 }
 
 fn infer_context_window_tokens(
-    requested_model: Option<&str>,
-    actual_model: Option<&str>,
+    _requested_model: Option<&str>,
+    _actual_model: Option<&str>,
     input_tokens: u64,
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
 ) -> u64 {
     if let Some(configured) = configured_context_window_tokens() {
         return configured;
-    }
-
-    let model = actual_model.or(requested_model).unwrap_or("");
-    if model_requests_1m_context(model) {
-        return EXTENDED_CONTEXT_WINDOW_TOKENS;
     }
 
     let total_input_tokens = input_tokens + cache_read_tokens + cache_creation_tokens;
@@ -4450,12 +3436,12 @@ fn context_fill_percent(
     ) * 100.0
 }
 
-/// Local quota-burn tracker. Anthropic does not expose rate-limit headers to
-/// Claude Code (OAuth) traffic, so instead we track our own token counters
-/// and project burn from the delta over a sliding window. The user supplies
-/// their subscription-tier weekly budget via `CODITOR_WEEKLY_TOKEN_BUDGET`
-/// (tokens); without it we still broadcast burn rate but skip the
-/// "remaining" and "projected exhaustion" fields.
+/// Local quota-burn tracker. The Envoy-observed Responses stream does not
+/// include subscription quota headers, so we track local token counters and
+/// project burn from the delta over a sliding window. The user supplies a
+/// weekly budget via `CODITOR_WEEKLY_TOKEN_BUDGET` (tokens); without it we
+/// still broadcast burn rate but skip the "remaining" and "projected
+/// exhaustion" fields.
 struct BurnTracker {
     /// (timestamp, cumulative_tokens_seen) samples. Bounded ring.
     samples: VecDeque<(Instant, u64)>,
@@ -4604,12 +3590,9 @@ fn auto_weekly_budget_suggestion() -> Option<AutoWeeklyBudget> {
     suggestion
 }
 
-type ParsedRequestBody = (String, usize, bool, usize, usize, u64, String, String);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestMetadataSource {
     CodexResponses,
-    TemporaryUnportedAnthropicFallback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4631,23 +3614,13 @@ fn parse_request_body_metadata(
     body: &[u8],
     headers: &codex_request::CodexRequestHeaders,
 ) -> Option<RequestBodyMetadata> {
-    match codex_request::parse_codex_responses_request(body, headers.clone()) {
-        Ok(parsed) => Some(request_metadata_from_codex(body.len(), parsed)),
-        Err(codex_error) => {
-            // TEMPORARY/UNPORTED: keep the copied Anthropic parser as a fallback
-            // so Phase 0A smoke/build harnesses keep compiling while Coditor's
-            // intended request path moves to OpenAI Responses.
-            parse_request_body(body).map(|parsed| {
-                let metadata =
-                    request_metadata_from_temporary_unported_anthropic(body.len(), parsed);
-                debug!(
-                    error = %codex_error,
-                    "falling back to temporary unported Anthropic request parser"
-                );
-                metadata
-            })
-        }
-    }
+    codex_request::parse_codex_responses_request(body, headers.clone())
+        .map(|parsed| request_metadata_from_codex(body.len(), parsed))
+        .map_err(|err| {
+            debug!(error = %err, "skipping non-Responses request body");
+            err
+        })
+        .ok()
 }
 
 fn should_skip_chatgpt_auxiliary_request_body(path: &str) -> bool {
@@ -4676,35 +3649,6 @@ fn request_metadata_from_codex(
         session_id: parsed.session.id,
         working_dir: parsed.cwd.unwrap_or_default(),
         user_prompt_excerpt: prompt_excerpt_from_codex_input(parsed.first_user_input.as_deref()),
-    }
-}
-
-fn request_metadata_from_temporary_unported_anthropic(
-    _body_len: usize,
-    parsed: ParsedRequestBody,
-) -> RequestBodyMetadata {
-    let (
-        model,
-        message_count,
-        has_tools,
-        system_prompt_length,
-        estimated_input_tokens,
-        session_hash,
-        working_dir,
-        user_prompt_excerpt,
-    ) = parsed;
-    RequestBodyMetadata {
-        source: RequestMetadataSource::TemporaryUnportedAnthropicFallback,
-        codex_request: None,
-        model,
-        message_count,
-        has_tools,
-        system_prompt_length,
-        estimated_input_tokens,
-        session_hash,
-        session_id: String::new(),
-        working_dir,
-        user_prompt_excerpt,
     }
 }
 
@@ -4757,162 +3701,6 @@ fn codex_response_headers_from_ext_proc(h: &HttpHeaders) -> codex_response::Code
     codex_response::CodexResponseHeaders::from_pairs(pairs)
 }
 
-/// Returns (model, message_count, has_tools, system_prompt_length, estimated_input_tokens, sys_prompt_hash, working_dir).
-/// sys_prompt_hash: stable per-terminal session key derived from working directory.
-/// working_dir: extracted working directory path — used for session naming.
-/// user_prompt_excerpt: cleaned text of the first user message (no Claude Code preamble), for display.
-fn parse_request_body(body: &[u8]) -> Option<ParsedRequestBody> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    let model = v.get("model")?.as_str()?.to_string();
-    let mc = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let ht = v
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-
-    let sl = match v.get("system") {
-        Some(Value::String(s)) => s.len(),
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
-            .map(|s| s.len())
-            .sum(),
-        _ => 0,
-    };
-
-    // Search system blocks for the "Primary working directory:" line.
-    // This is stable across requests from the same terminal and different across terminals.
-    let mut working_dir = String::new();
-    match v.get("system") {
-        Some(Value::String(s)) => {
-            if let Some(dir) = extract_working_dir(s) {
-                working_dir = dir;
-            }
-        }
-        Some(Value::Array(a)) => {
-            for item in a {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    if working_dir.is_empty() {
-                        if let Some(dir) = extract_working_dir(text) {
-                            working_dir = dir;
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    // Hash: working_directory + full first user message.
-    // Two Claude sessions in the same dir have different initial prompts, so
-    // including the first user message distinguishes them. Within a single
-    // session, messages[0] is stable across turns (history is appended).
-    // We hash the whole message because Claude Code prepends a multi-KB
-    // boilerplate preamble; a short prefix would collide across sessions.
-    // Concatenate every text block in messages[0].content. Claude Code
-    // packs the user's actual prompt into a LATER text block after preamble
-    // blocks (system-reminders, command outputs, etc.), so taking only
-    // the first block used to lose the user text entirely.
-    let first_user_message = v
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|a| a.first())
-        .and_then(|msg| match msg.get("content") {
-            Some(Value::String(s)) => Some(s.as_str().to_string()),
-            Some(Value::Array(arr)) => Some(
-                arr.iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let sys_prompt_hash = {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        working_dir.hash(&mut hasher);
-        first_user_message.hash(&mut hasher);
-        hasher.finish()
-    };
-
-    let user_prompt_excerpt = clean_user_prompt(&first_user_message);
-
-    Some((
-        model,
-        mc,
-        ht,
-        sl,
-        body.len() / 4,
-        sys_prompt_hash,
-        working_dir,
-        user_prompt_excerpt,
-    ))
-}
-
-/// Strip Claude Code's injected preamble (`<system-reminder>...`,
-/// `<command-name>...`, etc.) from the first user message and return a short
-/// excerpt of what the human actually typed. Best-effort heuristic — failures
-/// degrade to an empty string, which renders as "no prompt captured" rather
-/// than wrong text.
-///
-/// Rust's `regex` crate doesn't support backreferences, so we strip each
-/// known Claude Code preamble tag explicitly rather than via a single
-/// backreferencing pattern.
-fn clean_user_prompt(raw: &str) -> String {
-    // (?s) makes `.` match newlines; `.*?` is non-greedy so nested / repeated
-    // blocks collapse one at a time.
-    static PREAMBLE_TAGS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
-        [
-            r"(?s)<system-reminder\b[^>]*>.*?</system-reminder>",
-            r"(?s)<command-name\b[^>]*>.*?</command-name>",
-            r"(?s)<command-message\b[^>]*>.*?</command-message>",
-            r"(?s)<command-args\b[^>]*>.*?</command-args>",
-            r"(?s)<local-command-stdout\b[^>]*>.*?</local-command-stdout>",
-            r"(?s)<local-command-stderr\b[^>]*>.*?</local-command-stderr>",
-        ]
-        .iter()
-        .filter_map(|p| regex::Regex::new(p).ok())
-        .collect()
-    });
-
-    let mut cleaned = raw.to_string();
-    // Collapse repeatedly because removing an outer tag can expose another.
-    for _ in 0..4 {
-        let mut changed = false;
-        for re in PREAMBLE_TAGS.iter() {
-            let next = re.replace_all(&cleaned, "").to_string();
-            if next != cleaned {
-                cleaned = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let trimmed: String = cleaned
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    const MAX_LEN: usize = 320;
-    if trimmed.chars().count() <= MAX_LEN {
-        trimmed
-    } else {
-        let mut out: String = trimmed.chars().take(MAX_LEN).collect();
-        out.push('…');
-        out
-    }
-}
-
 fn looks_like_machine_recall_line(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -4935,36 +3723,7 @@ fn looks_like_machine_recall_line(line: &str) -> bool {
     trimmed.starts_with('<') && trimmed.ends_with('>') && !trimmed.contains(' ')
 }
 
-fn tool_recall_context(tool_results: &[ParsedToolResult]) -> Option<String> {
-    let mut seen = HashSet::new();
-    let mut parts = Vec::new();
-
-    for result in tool_results {
-        let mut detail = result.tool_name.clone();
-        let input_summary = result.input_summary.trim();
-        if !input_summary.is_empty() {
-            detail.push(' ');
-            detail.push_str(input_summary);
-        }
-        if result.is_error {
-            detail.push_str(" (error)");
-        }
-        if seen.insert(detail.clone()) {
-            parts.push(detail);
-        }
-        if parts.len() >= 3 {
-            break;
-        }
-    }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(format!("Tools: {}", parts.join("; ")))
-    }
-}
-
-fn compact_response_summary(raw: &str, tool_results: &[ParsedToolResult]) -> Option<String> {
+fn compact_response_summary(raw: &str) -> Option<String> {
     let trimmed = raw
         .lines()
         .map(|l| l.trim())
@@ -4972,158 +3731,17 @@ fn compact_response_summary(raw: &str, tool_results: &[ParsedToolResult]) -> Opt
         .filter(|l| !looks_like_machine_recall_line(l))
         .collect::<Vec<_>>()
         .join(" ");
-    let summary = if trimmed.is_empty() {
-        tool_recall_context(tool_results)?
-    } else {
-        trimmed
-    };
-    const MAX_LEN: usize = 360;
-    if summary.chars().count() <= MAX_LEN {
-        Some(summary)
-    } else {
-        let mut out: String = summary.chars().take(MAX_LEN).collect();
-        out.push('…');
-        Some(out)
-    }
-}
-
-/// Extract the working directory path from a system prompt text block.
-fn extract_working_dir(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        // Match "- Primary working directory: /path/to/dir" or "Primary working directory: /path"
-        if let Some(rest) = trimmed.strip_prefix("- Primary working directory:") {
-            let path = rest.trim();
-            if !path.is_empty() {
-                return Some(path.to_string());
-            }
-        }
-        if let Some(rest) = trimmed.strip_prefix("Primary working directory:") {
-            let path = rest.trim();
-            if !path.is_empty() {
-                return Some(path.to_string());
-            }
-        }
-    }
-    None
-}
-
-#[derive(Clone, Debug)]
-struct ParsedToolResult {
-    tool_name: String,
-    input_summary: String,
-    outcome: String,
-    duration_ms: u64,
-    is_error: bool,
-}
-
-#[derive(Clone, Debug)]
-struct SkillTelemetryEvent {
-    session_id: String,
-    timestamp: String,
-    skill_name: String,
-    event_type: String,
-    source: String,
-    confidence: f64,
-    detail: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct McpTelemetryEvent {
-    session_id: String,
-    timestamp: String,
-    server: String,
-    tool: String,
-    event_type: String,
-    source: String,
-    detail: Option<String>,
-}
-
-#[derive(Default)]
-struct SkillTurnState {
-    expected: HashSet<String>,
-    fired: HashSet<String>,
-}
-
-static HOOK_SKILL_TURNS: LazyLock<Mutex<HashMap<String, SkillTurnState>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn canonical_telemetry_name(raw: &str) -> Option<String> {
-    let trimmed = raw
-        .trim()
-        .trim_matches(|ch| matches!(ch, '"' | '\'' | '`' | '/' | '$'));
     if trimmed.is_empty() {
         return None;
     }
-
-    if trimmed.ends_with("SKILL.md")
-        || trimmed.ends_with("Skill.md")
-        || trimmed.ends_with("skill.md")
-    {
-        let path = Path::new(trimmed);
-        if let Some(parent_name) = path
-            .parent()
-            .and_then(|parent| parent.file_name())
-            .and_then(|name| name.to_str())
-        {
-            return canonical_telemetry_name(parent_name);
-        }
-    }
-
-    let mut out = String::with_capacity(trimmed.len());
-    let mut last_was_sep = false;
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_was_sep = false;
-        } else if matches!(ch, '-' | '_' | '.' | ':') {
-            out.push(ch);
-            last_was_sep = false;
-        } else if ch.is_ascii_whitespace() && !last_was_sep && !out.is_empty() {
-            out.push('-');
-            last_was_sep = true;
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        None
+    const MAX_LEN: usize = 360;
+    if trimmed.chars().count() <= MAX_LEN {
+        Some(trimmed)
     } else {
+        let mut out: String = trimmed.chars().take(MAX_LEN).collect();
+        out.push('…');
         Some(out)
     }
-}
-
-fn skill_name_from_tool_input_value(value: &Value) -> Option<String> {
-    if let Some(raw) = value.as_str() {
-        return canonical_telemetry_name(raw);
-    }
-
-    let fields = [
-        "skill_name",
-        "skill",
-        "command_name",
-        "command",
-        "name",
-        "id",
-        "path",
-        "file_path",
-    ];
-    for field in fields {
-        if let Some(raw) = value.get(field).and_then(|value| value.as_str()) {
-            if let Some(name) = canonical_telemetry_name(raw) {
-                if name != "skill" {
-                    return Some(name);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn skill_name_from_tool_input_json(raw: &str) -> Option<String> {
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .and_then(|value| skill_name_from_tool_input_value(&value))
 }
 
 fn truncate_detail(raw: &str, max: usize) -> String {
@@ -5134,19 +3752,18 @@ fn truncate_detail(raw: &str, max: usize) -> String {
     }
 }
 
-fn summarize_hook_tool_input(value: Option<&Value>) -> Option<String> {
-    let value = value?;
-    if let Some(command) = value.get("command").and_then(|value| value.as_str()) {
+fn summarize_structured_tool_input(value: &Value) -> Option<String> {
+    if let Some(command) = value.get("command").and_then(Value::as_str) {
         return Some(truncate_detail(command, 100));
     }
     if let Some(path) = value
         .get("file_path")
         .or_else(|| value.get("path"))
-        .and_then(|value| value.as_str())
+        .and_then(Value::as_str)
     {
         return Some(truncate_detail(path, 100));
     }
-    if let Some(query) = value.get("query").and_then(|value| value.as_str()) {
+    if let Some(query) = value.get("query").and_then(Value::as_str) {
         return Some(truncate_detail(query, 100));
     }
     serde_json::to_string(value)
@@ -5211,465 +3828,6 @@ fn codex_watch_event_is_duplicate_or_remember(event: &watch::WatchEvent) -> bool
     false
 }
 
-fn remember_skill_turn_event(event: &SkillTelemetryEvent) {
-    if event.session_id.trim().is_empty() || event.session_id == "unknown" {
-        return;
-    }
-    let mut states = HOOK_SKILL_TURNS.lock().unwrap();
-    let state = states.entry(event.session_id.clone()).or_default();
-    match event.event_type.as_str() {
-        "expected" => {
-            state.expected.insert(event.skill_name.clone());
-        }
-        "fired" | "failed" => {
-            state.fired.insert(event.skill_name.clone());
-        }
-        _ => {}
-    }
-}
-
-fn emit_skill_event(event: SkillTelemetryEvent) {
-    remember_skill_turn_event(&event);
-    metrics::record_skill_event(&event.skill_name, &event.event_type, &event.source);
-    let _ = DB_TX.send(DbCommand::WriteSkillEvent {
-        session_id: event.session_id.clone(),
-        timestamp: event.timestamp.clone(),
-        skill_name: event.skill_name.clone(),
-        event_type: event.event_type.clone(),
-        confidence: event.confidence,
-        source: event.source.clone(),
-        detail: event.detail.clone(),
-    });
-    watch::BROADCASTER.broadcast(watch::WatchEvent::SkillEvent {
-        session_id: event.session_id,
-        timestamp: event.timestamp,
-        skill_name: event.skill_name,
-        event_type: event.event_type,
-        source: event.source,
-        confidence: event.confidence,
-        detail: event.detail,
-    });
-}
-
-fn emit_mcp_event(event: McpTelemetryEvent) {
-    metrics::record_mcp_event(&event.server, &event.tool, &event.event_type, &event.source);
-    let _ = DB_TX.send(DbCommand::WriteMcpEvent {
-        session_id: event.session_id.clone(),
-        timestamp: event.timestamp.clone(),
-        server: event.server.clone(),
-        tool: event.tool.clone(),
-        event_type: event.event_type.clone(),
-        source: event.source.clone(),
-        detail: event.detail.clone(),
-    });
-    watch::BROADCASTER.broadcast(watch::WatchEvent::McpEvent {
-        session_id: event.session_id,
-        timestamp: event.timestamp,
-        server: event.server,
-        tool: event.tool,
-        event_type: event.event_type,
-        source: event.source,
-        detail: event.detail,
-    });
-}
-
-fn extract_explicit_skill_refs(prompt: &str) -> HashSet<String> {
-    let mut refs = HashSet::new();
-    let mut chars = prompt.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        if !matches!(ch, '/' | '$') {
-            continue;
-        }
-        let marker_at_token_boundary = prompt[..idx]
-            .chars()
-            .next_back()
-            .is_none_or(|prev| prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | ','));
-        if !marker_at_token_boundary {
-            continue;
-        }
-        let mut raw = String::new();
-        while let Some((_, next)) = chars.peek().copied() {
-            if next.is_ascii_alphanumeric() || matches!(next, '-' | '_' | '.' | ':') {
-                raw.push(next);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        if ch == '/'
-            && !raw
-                .chars()
-                .next()
-                .is_some_and(|first| first.is_ascii_lowercase())
-        {
-            continue;
-        }
-        if let Some(name) = canonical_telemetry_name(&raw) {
-            refs.insert(name);
-        }
-    }
-    refs
-}
-
-fn normalize_phrase_for_match(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut last_space = true;
-    for ch in raw.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-            last_space = false;
-        } else if !last_space {
-            out.push(' ');
-            last_space = true;
-        }
-    }
-    out.trim().to_string()
-}
-
-fn skill_name_from_skill_file(path: &Path, content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    if lines.next()?.trim() == "---" {
-        for line in lines {
-            let trimmed = line.trim();
-            if trimmed == "---" {
-                break;
-            }
-            if let Some(raw) = trimmed.strip_prefix("name:") {
-                return canonical_telemetry_name(raw);
-            }
-        }
-    }
-    path.parent()
-        .and_then(|parent| parent.file_name())
-        .and_then(|name| name.to_str())
-        .and_then(canonical_telemetry_name)
-}
-
-fn discover_skill_names(cwd: Option<&str>) -> HashSet<String> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(cwd) = cwd {
-        dirs.push(Path::new(cwd).join(".claude/skills"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(Path::new(&home).join(".claude/skills"));
-    }
-
-    let mut names = HashSet::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let skill_path = entry.path().join("SKILL.md");
-            let Ok(content) = std::fs::read_to_string(&skill_path) else {
-                continue;
-            };
-            if let Some(name) = skill_name_from_skill_file(&skill_path, &content) {
-                names.insert(name);
-            }
-        }
-    }
-    names
-}
-
-fn expected_skill_names_from_prompt(prompt: &str, cwd: Option<&str>) -> HashSet<String> {
-    let mut expected = extract_explicit_skill_refs(prompt);
-    let known_skills = discover_skill_names(cwd);
-    if known_skills.is_empty() {
-        return expected;
-    }
-
-    let prompt_norm = normalize_phrase_for_match(prompt);
-    for skill in known_skills {
-        let skill_phrase = normalize_phrase_for_match(&skill.replace(['-', '_', ':'], " "));
-        if skill_phrase.is_empty() {
-            continue;
-        }
-        if prompt_norm.contains(&format!("use {skill_phrase}"))
-            || prompt_norm.contains(&format!("use the {skill_phrase}"))
-            || prompt_norm.contains(&format!("use the {skill_phrase} skill"))
-            || prompt_norm.contains(&format!("{skill_phrase} skill"))
-        {
-            expected.insert(skill);
-        }
-    }
-    expected
-}
-
-fn finalize_hook_skill_turn(session_id: &str, timestamp: &str) {
-    let state = {
-        let mut states = HOOK_SKILL_TURNS.lock().unwrap();
-        states.remove(session_id).unwrap_or_default()
-    };
-
-    for skill_name in state.expected.difference(&state.fired) {
-        emit_skill_event(SkillTelemetryEvent {
-            session_id: session_id.to_string(),
-            timestamp: timestamp.to_string(),
-            skill_name: skill_name.clone(),
-            event_type: "missed".to_string(),
-            source: "heuristic".to_string(),
-            confidence: 0.9,
-            detail: Some("expected skill did not fire before Stop".to_string()),
-        });
-    }
-
-    for skill_name in state.fired.difference(&state.expected) {
-        emit_skill_event(SkillTelemetryEvent {
-            session_id: session_id.to_string(),
-            timestamp: timestamp.to_string(),
-            skill_name: skill_name.clone(),
-            event_type: "misfired".to_string(),
-            source: "heuristic".to_string(),
-            confidence: 0.4,
-            detail: Some("skill fired without an explicit expected signal".to_string()),
-        });
-    }
-}
-
-fn hook_session_id(payload: &Value) -> String {
-    payload
-        .get("session_id")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn process_claude_code_hook_payload(payload: &Value, timestamp: String) {
-    let session_id = hook_session_id(payload);
-    let hook_event_name = payload
-        .get("hook_event_name")
-        .and_then(|value| value.as_str())
-        .unwrap_or("");
-
-    match hook_event_name {
-        "UserPromptSubmit" => {
-            let prompt = payload
-                .get("prompt")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let cwd = payload.get("cwd").and_then(|value| value.as_str());
-            for skill_name in expected_skill_names_from_prompt(prompt, cwd) {
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    skill_name,
-                    event_type: "expected".to_string(),
-                    source: "heuristic".to_string(),
-                    confidence: 0.8,
-                    detail: Some("prompt matched explicit skill trigger".to_string()),
-                });
-            }
-        }
-        "UserPromptExpansion" => {
-            if payload
-                .get("expansion_type")
-                .and_then(|value| value.as_str())
-                == Some("slash_command")
-            {
-                let Some(skill_name) = payload
-                    .get("command_name")
-                    .and_then(|value| value.as_str())
-                    .and_then(canonical_telemetry_name)
-                else {
-                    return;
-                };
-                let detail = payload
-                    .get("command_args")
-                    .and_then(|value| value.as_str())
-                    .filter(|value| !value.is_empty())
-                    .map(|value| truncate_detail(value, 100));
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id: session_id.clone(),
-                    timestamp: timestamp.clone(),
-                    skill_name: skill_name.clone(),
-                    event_type: "expected".to_string(),
-                    source: "hook".to_string(),
-                    confidence: 1.0,
-                    detail: Some("direct slash command expansion".to_string()),
-                });
-                emit_skill_event(SkillTelemetryEvent {
-                    session_id,
-                    timestamp,
-                    skill_name,
-                    event_type: "fired".to_string(),
-                    source: "hook".to_string(),
-                    confidence: 1.0,
-                    detail,
-                });
-            }
-        }
-        "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionDenied" => {
-            let tool_name = payload
-                .get("tool_name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let tool_input = payload.get("tool_input");
-            if tool_name.eq_ignore_ascii_case("Skill") {
-                let skill_name = tool_input
-                    .and_then(skill_name_from_tool_input_value)
-                    .unwrap_or_else(|| "unknown".to_string());
-                let (event_type, confidence) = match hook_event_name {
-                    "PostToolUseFailure" => ("failed", 1.0),
-                    "PermissionDenied" => ("failed", 0.9),
-                    _ => ("fired", 1.0),
-                };
-                if hook_event_name != "PostToolUse" {
-                    emit_skill_event(SkillTelemetryEvent {
-                        session_id,
-                        timestamp,
-                        skill_name,
-                        event_type: event_type.to_string(),
-                        source: "hook".to_string(),
-                        confidence,
-                        detail: summarize_hook_tool_input(tool_input),
-                    });
-                }
-            } else if let Some((server, tool)) = metrics::mcp_tool_labels(tool_name) {
-                let event_type = match hook_event_name {
-                    "PostToolUse" => "succeeded",
-                    "PostToolUseFailure" => "failed",
-                    "PermissionDenied" => "denied",
-                    _ => "called",
-                };
-                emit_mcp_event(McpTelemetryEvent {
-                    session_id,
-                    timestamp,
-                    server,
-                    tool,
-                    event_type: event_type.to_string(),
-                    source: "hook".to_string(),
-                    detail: summarize_hook_tool_input(tool_input),
-                });
-            }
-        }
-        "Stop" | "StopFailure" => {
-            finalize_hook_skill_turn(&session_id, &timestamp);
-        }
-        _ => {}
-    }
-}
-
-/// Reconstruct the latest turn's tool results by pairing user `tool_result`
-/// blocks with prior assistant `tool_use` blocks via `tool_use_id`.
-fn parse_latest_tool_results(body: &[u8]) -> Vec<ParsedToolResult> {
-    let v: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    let messages = match v.get("messages").and_then(|m| m.as_array()) {
-        Some(msgs) => msgs,
-        None => return Vec::new(),
-    };
-
-    let Some(last_user_idx) = messages
-        .iter()
-        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-    else {
-        return Vec::new();
-    };
-    let Some(content) = messages[last_user_idx]
-        .get("content")
-        .and_then(|c| c.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut raw_results = Vec::new();
-    let mut referenced_tool_ids = HashSet::new();
-    for block in content {
-        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
-            continue;
-        }
-        let tool_use_id = block
-            .get("tool_use_id")
-            .and_then(|id| id.as_str())
-            .map(ToString::to_string);
-        if let Some(tool_use_id) = tool_use_id.as_ref() {
-            referenced_tool_ids.insert(tool_use_id.clone());
-        }
-        let is_error = block
-            .get("is_error")
-            .and_then(|e| e.as_bool())
-            .unwrap_or(false);
-        let outcome = match block.get("is_error").and_then(|e| e.as_bool()) {
-            Some(true) => "error".to_string(),
-            Some(false) => "success".to_string(),
-            None => "unknown".to_string(),
-        };
-        let duration_ms = block
-            .get("duration_ms")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        raw_results.push((tool_use_id, outcome, duration_ms, is_error));
-    }
-
-    if raw_results.is_empty() {
-        return Vec::new();
-    }
-
-    let mut tool_uses_by_id: HashMap<String, (String, String)> = HashMap::new();
-    for msg in messages[..last_user_idx].iter().rev() {
-        if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
-            continue;
-        }
-        let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        for block in content.iter().rev() {
-            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
-                continue;
-            }
-            let Some(tool_use_id) = block.get("id").and_then(|id| id.as_str()) else {
-                continue;
-            };
-            if !referenced_tool_ids.is_empty() && !referenced_tool_ids.contains(tool_use_id) {
-                continue;
-            }
-            if tool_uses_by_id.contains_key(tool_use_id) {
-                continue;
-            }
-            let tool_name = block
-                .get("name")
-                .and_then(|name| name.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let input_json = block
-                .get("input")
-                .map(|input| serde_json::to_string(input).unwrap_or_default())
-                .unwrap_or_default();
-            let input_summary = watch::extract_summary(&tool_name, &input_json);
-            tool_uses_by_id.insert(tool_use_id.to_string(), (tool_name, input_summary));
-        }
-        if !referenced_tool_ids.is_empty()
-            && referenced_tool_ids
-                .iter()
-                .all(|tool_use_id| tool_uses_by_id.contains_key(tool_use_id))
-        {
-            break;
-        }
-    }
-
-    raw_results
-        .into_iter()
-        .map(|(tool_use_id, outcome, duration_ms, is_error)| {
-            let (tool_name, input_summary) = tool_use_id
-                .as_deref()
-                .and_then(|id| tool_uses_by_id.get(id))
-                .cloned()
-                .unwrap_or_else(|| ("unknown".to_string(), String::new()));
-            ParsedToolResult {
-                tool_name,
-                input_summary,
-                outcome,
-                duration_ms,
-                is_error,
-            }
-        })
-        .collect()
-}
-
 fn headers_continue() -> HeadersResponse {
     HeadersResponse {
         response: Some(CommonResponse {
@@ -5685,52 +3843,6 @@ fn body_continue() -> BodyResponse {
             ..Default::default()
         }),
     }
-}
-fn body_continue_with_upstream_adjustment(adjustment: UpstreamRequestAdjustment) -> BodyResponse {
-    let mut set_headers = Vec::new();
-    if let Some(value) = adjustment.anthropic_beta {
-        set_headers.push(ProtoHeaderValueOption {
-            header: Some(ProtoHeaderValue {
-                key: "anthropic-beta".to_string(),
-                value,
-                raw_value: Vec::new(),
-            }),
-            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
-            ..Default::default()
-        });
-    }
-    if let Some(body) = adjustment.body.as_ref() {
-        set_headers.push(ProtoHeaderValueOption {
-            header: Some(ProtoHeaderValue {
-                key: "content-length".to_string(),
-                value: body.len().to_string(),
-                raw_value: Vec::new(),
-            }),
-            append_action: HeaderAppendAction::OverwriteIfExistsOrAdd.into(),
-            ..Default::default()
-        });
-    }
-
-    BodyResponse {
-        response: Some(CommonResponse {
-            status: ResponseStatus::Continue.into(),
-            header_mutation: (!set_headers.is_empty()).then_some(HeaderMutation {
-                set_headers,
-                ..Default::default()
-            }),
-            body_mutation: adjustment.body.map(|body| BodyMutation {
-                mutation: Some(body_mutation::Mutation::Body(body)),
-            }),
-            ..Default::default()
-        }),
-    }
-}
-
-fn active_session_count() -> usize {
-    diagnosis::SESSIONS
-        .iter()
-        .filter(|entry| entry.session_inserted)
-        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -5753,14 +3865,9 @@ impl ExternalProcessor for CoditorProcessor {
             let mut request_id = String::new();
             let mut model = String::new();
             let mut started_at = Instant::now();
-            let mut response_accumulator =
-                SelectedResponseAccumulator::temporary_unported_anthropic_fallback();
-            let mut tool_results: Vec<ParsedToolResult> = Vec::new();
-            let mut sys_prompt_hash: u64 = 0;
-            let mut working_dir_str = String::new();
-            let mut user_prompt_excerpt_buf = String::new();
-            let mut request_context_window_hint: Option<u64> = None;
-            let mut request_anthropic_beta_values: Vec<String> = Vec::new();
+            let mut response_accumulator = SelectedResponseAccumulator::for_request_source(
+                RequestMetadataSource::CodexResponses,
+            );
             let mut codex_request_headers = codex_request::CodexRequestHeaders::default();
             let mut codex_observed_model_header: Option<String> = None;
             let mut current_codex_request: Option<codex_request::ParsedCodexRequest> = None;
@@ -5780,10 +3887,6 @@ impl ExternalProcessor for CoditorProcessor {
                                 &request_id,
                                 &model,
                                 &started_at,
-                                &tool_results,
-                                sys_prompt_hash,
-                                &working_dir_str,
-                                &user_prompt_excerpt_buf,
                                 context_window_tokens,
                             );
                             observe_selected_finalization_outcome(&outcome);
@@ -5800,10 +3903,6 @@ impl ExternalProcessor for CoditorProcessor {
                                 &request_id,
                                 &model,
                                 &started_at,
-                                &tool_results,
-                                sys_prompt_hash,
-                                &working_dir_str,
-                                &user_prompt_excerpt_buf,
                                 context_window_tokens,
                             );
                             observe_selected_finalization_outcome(&outcome);
@@ -5818,7 +3917,6 @@ impl ExternalProcessor for CoditorProcessor {
                         started_at = Instant::now();
                         request_id = extract_header(h, "x-request-id")
                             .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
-                        request_anthropic_beta_values = extract_headers(h, "anthropic-beta");
                         codex_request_headers = codex_request_headers_from_ext_proc(h);
                         request_path = extract_header(h, ":path").unwrap_or_default();
                         codex_observed_model_header = extract_header(h, "openai-model")
@@ -5826,8 +3924,6 @@ impl ExternalProcessor for CoditorProcessor {
                         if let Some(header_model) = codex_observed_model_header.as_deref() {
                             debug!(request_id = %request_id, header_model, "observed Codex/OpenAI model header on request");
                         }
-                        request_context_window_hint =
-                            request_uses_1m_context(h).then_some(EXTENDED_CONTEXT_WINDOW_TOKENS);
                         context_window_tokens = configured_context_window_tokens()
                             .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
 
@@ -5861,9 +3957,6 @@ impl ExternalProcessor for CoditorProcessor {
                     Some(ExtProcRequest::RequestBody(ref b)) => {
                         let parse_start = Instant::now();
 
-                        // Reconstruct tool_result blocks for the latest turn.
-                        tool_results = parse_latest_tool_results(&b.body);
-
                         let mut blocked = false;
                         if should_skip_chatgpt_auxiliary_request_body(&request_path) {
                             debug!(
@@ -5880,16 +3973,10 @@ impl ExternalProcessor for CoditorProcessor {
                                             request_metadata.source,
                                         );
                                     current_codex_request = request_metadata.codex_request.clone();
-                                    let request_source = match request_metadata.source {
-                                    RequestMetadataSource::CodexResponses => "codex_responses",
-                                    RequestMetadataSource::TemporaryUnportedAnthropicFallback => {
-                                        "temporary_unported_anthropic_fallback"
-                                    }
-                                };
                                     info!(
                                         phase = "request_body",
                                         request_id = %request_id,
-                                        request_source,
+                                        request_source = "codex_responses",
                                         model = %request_metadata.model,
                                         message_count = request_metadata.message_count,
                                         has_tools = request_metadata.has_tools,
@@ -5913,22 +4000,8 @@ impl ExternalProcessor for CoditorProcessor {
                                         }
                                         blocked = true;
                                     }
-                                    sys_prompt_hash = request_metadata.session_hash;
-                                    working_dir_str = request_metadata.working_dir.clone();
-                                    // Only first turn carries a meaningful "initial prompt"; for mc>1
-                                    // messages[0] is still the original, but we only register the
-                                    // session once (see SESSIONS.get_mut in finalize_response), so
-                                    // passing the excerpt every time is harmless and first-write-wins.
-                                    user_prompt_excerpt_buf =
-                                        request_metadata.user_prompt_excerpt.clone();
                                     if !blocked {
-                                        context_window_tokens = resolve_context_window_tokens(
-                                            request_context_window_hint,
-                                            &request_metadata.model,
-                                        );
-                                        // Codex request identities are available here; the
-                                        // copied Anthropic fallback still resolves session
-                                        // ids later in finalize_response.
+                                        context_window_tokens = resolve_context_window_tokens();
                                         REQUEST_STATE.insert(
                                             request_id.clone(),
                                             RequestMeta {
@@ -5957,14 +4030,8 @@ impl ExternalProcessor for CoditorProcessor {
                             continue;
                         }
 
-                        let upstream_adjustment = upstream_request_adjustment_for_body(
-                            &request_anthropic_beta_values,
-                            &b.body,
-                        );
                         let response = ProcessingResponse {
-                            response: Some(ExtProcResponse::RequestBody(
-                                body_continue_with_upstream_adjustment(upstream_adjustment),
-                            )),
+                            response: Some(ExtProcResponse::RequestBody(body_continue())),
                             ..Default::default()
                         };
                         if tx.send(Ok(response)).await.is_err() {
@@ -5997,12 +4064,6 @@ impl ExternalProcessor for CoditorProcessor {
                                 "observed Codex/OpenAI model header on response"
                             );
                         }
-
-                        // NOTE: Anthropic does not return anthropic-ratelimit-*
-                        // headers on Claude Code subscription (OAuth) traffic —
-                        // verified empirically. Quota burn is broadcast from a
-                        // background task (`quota_burn_monitor`) using our own
-                        // token counters instead.
 
                         // Phase 7: circuit breaker — only track errors from real API requests
                         // (ones where we parsed a model). Ignores envoy DPE/protocol errors.
@@ -6065,9 +4126,6 @@ impl ExternalProcessor for CoditorProcessor {
                             if chunk_ms > 10 {
                                 warn!(request_id=%request_id, chunk_ms, bytes=b.body.len(), "response_body chunk parse exceeded 10ms");
                             }
-                        } else if !response_accumulator.is_sse() && !b.body.is_empty() {
-                            // Capture error response body (capped at 1KB).
-                            response_accumulator.capture_error_body(&b.body);
                         }
                         if b.end_of_stream {
                             if !model.is_empty() {
@@ -6077,10 +4135,6 @@ impl ExternalProcessor for CoditorProcessor {
                                     &request_id,
                                     &model,
                                     &started_at,
-                                    &tool_results,
-                                    sys_prompt_hash,
-                                    &working_dir_str,
-                                    &user_prompt_excerpt_buf,
                                     context_window_tokens,
                                 );
                                 observe_selected_finalization_outcome(&outcome);
@@ -6118,7 +4172,6 @@ async fn handle_health() -> &'static str {
 }
 
 async fn handle_metrics() -> impl IntoResponse {
-    metrics::set_active_sessions(active_session_count());
     match metrics::render() {
         Ok((content_type, body)) => {
             let mut headers = axum::http::HeaderMap::new();
@@ -6129,11 +4182,6 @@ async fn handle_metrics() -> impl IntoResponse {
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
-}
-
-async fn handle_claude_code_hook(Json(payload): Json<Value>) -> impl IntoResponse {
-    process_claude_code_hook_payload(&payload, now_iso8601());
-    StatusCode::NO_CONTENT
 }
 
 async fn handle_summary() -> impl IntoResponse {
@@ -7204,7 +5252,6 @@ async fn http_server() {
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/api/hooks/claude-code", post(handle_claude_code_hook))
         .route("/api/summary", get(handle_summary))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -7225,7 +5272,7 @@ async fn http_server() {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.clone());
-    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/hooks/claude-code, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/cache-rebuilds, /api/degradation, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -7247,9 +5294,8 @@ async fn cleanup_stale_requests() {
 
 /// Sample quota burn every 30s so the burn-rate projection and Prometheus
 /// gauges stay fresh, but only broadcast the user-facing watch snapshot every
-/// five minutes unless the exhaustion alarm flips state. Anthropic does not
-/// return rate-limit headers on subscription (OAuth) traffic, so this is
-/// computed entirely from our own counters. If the user sets
+/// five minutes unless the exhaustion alarm flips state. This is computed
+/// entirely from Envoy-derived local counters. If the user sets
 /// `CODITOR_WEEKLY_TOKEN_BUDGET` we can also surface remaining + projected
 /// exhaustion; otherwise we auto-suggest a weekly cap from the last four
 /// completed weeks of SQLite history.
@@ -7285,14 +5331,6 @@ async fn quota_burn_monitor() {
             (Some(r), Some(rate)) if rate > 0.0 && r > 0 => Some((r as f64 / rate).round() as u64),
             _ => None,
         };
-
-        metrics::update_weekly_budget_gauges(
-            used_this_week,
-            remaining,
-            tokens_limit,
-            budget_source.as_deref(),
-            projected_exhaustion_secs,
-        );
 
         // Skip watch broadcast until we've actually seen traffic — no point
         // telling the orchestrator "0 tokens, 0 burn" before the first turn.
@@ -7360,8 +5398,7 @@ async fn historical_metrics_monitor() {
 }
 
 /// Sum of tokens spent this week. Reads from SQLite so we don't lose history
-/// across core restarts. Weeks start Monday 00:00 UTC — matches the rhythm
-/// of Anthropic's publicized weekly caps.
+/// across core restarts. Weeks start Monday 00:00 UTC.
 fn this_week_tokens_used() -> u64 {
     let week_start = start_of_week_iso();
     tokio::task::block_in_place(|| {
@@ -7430,7 +5467,7 @@ async fn data_retention_cleanup() {
 // ---------------------------------------------------------------------------
 async fn cache_expiry_warning_monitor() {
     let warning_secs = env_u64("CODITOR_CACHE_WARNING_SECS", 240);
-    let ttl_secs: u64 = 300; // Anthropic prompt cache TTL
+    let ttl_secs: u64 = 300;
     let check_interval = Duration::from_secs(30);
 
     loop {
@@ -7477,7 +5514,6 @@ async fn session_inactivity_monitor() {
 
         for (hash, sid) in expired {
             if let Some((_, state)) = diagnosis::SESSIONS.remove(&hash) {
-                metrics::set_active_sessions(active_session_count());
                 info!(session_id = %sid, timeout_mins, "session ended (inactivity timeout)");
                 end_session(
                     &sid,
@@ -7526,7 +5562,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize the event broadcaster.
     let _ = &*watch::BROADCASTER;
     metrics::init();
-    metrics::set_active_sessions(active_session_count());
 
     tokio::spawn(http_server());
     tokio::spawn(cleanup_stale_requests());
@@ -7561,30 +5596,24 @@ mod tests {
     use super::{
         build_codex_finalization_outcome, build_diagnosis_response_json,
         build_session_summary_json, build_sessions_response_json, build_summary_response_json,
-        canonical_telemetry_name, clean_user_prompt, codex_request_headers_from_ext_proc,
-        codex_response_headers_from_ext_proc, codex_watch_event_is_duplicate_or_remember,
-        compact_response_summary, context_fill_percent, context_fill_ratio, db_writer_loop,
-        derive_display_name, diagnosis, ensure_codex_persistence_columns, ensure_session_columns,
-        epoch_to_iso8601, extract_explicit_skill_refs, extract_header, extract_headers,
-        extract_working_dir, infer_context_window_tokens, load_degradation_view_from_db,
+        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
+        codex_watch_event_is_duplicate_or_remember, compact_response_summary, context_fill_percent,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
+        ensure_codex_persistence_columns, ensure_session_columns, epoch_to_iso8601, extract_header,
+        extract_headers, infer_context_window_tokens, load_degradation_view_from_db,
         load_persisted_watch_replay_events, load_turn_snapshots_from_db,
-        looks_like_machine_recall_line, metrics, model_requests_1m_context, normalize_search_text,
-        now_epoch_secs, parse_latest_tool_results, parse_request_body, parse_request_body_metadata,
-        persist_billing_reconciliation, persisted_session_display_name, pricing,
-        query_historical_metrics, query_summary, record_codex_turn_command,
-        repair_persisted_session_artifacts, repair_turn_snapshot_context_windows,
-        repo_name_from_codex_initial_prompt, request_uses_1m_context,
-        resolve_context_window_tokens, score_recall_doc, seed_live_metric_labels_from_db,
-        session_timeout_secs, should_broadcast_quota_snapshot,
-        should_skip_chatgpt_auxiliary_request_body, skill_name_from_skill_file,
-        skill_name_from_tool_input_json, strip_model_1m_alias, summarize_hook_tool_input,
-        table_columns, tokenize_search_text, tool_recall_context,
-        upstream_request_adjustment_for_body, BillingReconciliationInput,
-        BillingReconciliationWriteError, DbCommand, HttpHeaders, ParsedToolResult,
-        ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
-        SelectedResponseAccumulator, SummaryWindowData, CONTEXT_1M_BETA, ESTIMATED_COST_SOURCE,
-        EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL, SCHEMA,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        looks_like_machine_recall_line, metrics, normalize_search_text, now_epoch_secs,
+        parse_request_body_metadata, persist_billing_reconciliation,
+        persisted_session_display_name, pricing, query_historical_metrics, query_summary,
+        record_codex_turn_command, repair_persisted_session_artifacts,
+        repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
+        score_recall_doc, seed_live_metric_labels_from_db, session_timeout_secs,
+        should_broadcast_quota_snapshot, should_skip_chatgpt_auxiliary_request_body, table_columns,
+        tokenize_search_text, BillingReconciliationInput, BillingReconciliationWriteError,
+        DbCommand, HttpHeaders, ProtoHeaderValue, RequestMetadataSource,
+        SelectedFinalizationOutcome, SelectedResponseAccumulator, SummaryWindowData,
+        ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, QUOTA_WATCH_BROADCAST_INTERVAL,
+        SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -7675,14 +5704,6 @@ mod tests {
         conn
     }
 
-    fn metric_line_has(body: &str, metric: &str, labels: &[&str], value: &str) -> bool {
-        body.lines().any(|line| {
-            line.starts_with(metric)
-                && labels.iter().all(|label| line.contains(label))
-                && line.ends_with(value)
-        })
-    }
-
     #[test]
     fn epoch_and_week_formatting_are_utc_stable() {
         assert_eq!(epoch_to_iso8601(0), "1970-01-01T00:00:00Z");
@@ -7691,52 +5712,6 @@ mod tests {
         assert_eq!(
             super::start_of_week_iso_at(1_619_827_200),
             "2021-04-26T00:00:00Z"
-        );
-    }
-
-    #[test]
-    fn request_body_parser_extracts_session_identity_inputs() {
-        let body = br#"{
-          "model": "claude-sonnet-4-5[1m]",
-          "system": [
-            { "type": "text", "text": "irrelevant" },
-            { "type": "text", "text": "- Primary working directory: /tmp/coditor-demo" }
-          ],
-          "tools": [{ "name": "Read" }],
-          "messages": [
-            {
-              "role": "user",
-              "content": [
-                { "type": "text", "text": "<system-reminder>noise</system-reminder>" },
-                { "type": "text", "text": "Please inspect the auth cache." }
-              ]
-            },
-            { "role": "assistant", "content": "ok" }
-          ]
-        }"#;
-
-        let (
-            model,
-            message_count,
-            has_tools,
-            system_len,
-            estimated_tokens,
-            hash,
-            working_dir,
-            prompt,
-        ) = parse_request_body(body).expect("parse body");
-
-        assert_eq!(model, "claude-sonnet-4-5[1m]");
-        assert_eq!(message_count, 2);
-        assert!(has_tools);
-        assert!(system_len > 0);
-        assert_eq!(estimated_tokens, body.len() / 4);
-        assert_ne!(hash, 0);
-        assert_eq!(working_dir, "/tmp/coditor-demo");
-        assert_eq!(prompt, "Please inspect the auth cache.");
-        assert_eq!(
-            extract_working_dir("Primary working directory: /tmp/demo").as_deref(),
-            Some("/tmp/demo")
         );
     }
 
@@ -7840,32 +5815,6 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_request_metadata_fallback_is_temporary_unported() {
-        let body = br#"{
-          "model": "claude-sonnet-4-5[1m]",
-          "system": "- Primary working directory: /tmp/coditor-anthropic-fallback",
-          "messages": [
-            { "role": "user", "content": "Keep copied smoke tests alive." }
-          ]
-        }"#;
-
-        let metadata = parse_request_body_metadata(
-            body,
-            &super::codex_request::CodexRequestHeaders::default(),
-        )
-        .expect("temporary Anthropic fallback parses copied request");
-
-        assert_eq!(
-            metadata.source,
-            RequestMetadataSource::TemporaryUnportedAnthropicFallback
-        );
-        assert_eq!(metadata.model, "claude-sonnet-4-5[1m]");
-        assert_eq!(metadata.message_count, 1);
-        assert_eq!(metadata.working_dir, "/tmp/coditor-anthropic-fallback");
-        assert_eq!(metadata.session_id, "");
-    }
-
-    #[test]
     fn response_parser_selection_uses_codex_for_codex_request_metadata() {
         let body = include_bytes!("../../test/fixtures/openai_responses_minimal_text_request.json");
         let metadata = parse_request_body_metadata(
@@ -7908,9 +5857,6 @@ mod tests {
                     Some("gpt-codex-fixture-served-from-header")
                 );
             }
-            SelectedResponseAccumulator::TemporaryUnportedAnthropicFallback(_) => {
-                panic!("expected Codex Responses accumulator")
-            }
         }
     }
 
@@ -7948,54 +5894,6 @@ mod tests {
                     summary.served_model.as_deref(),
                     Some("gpt-codex-fixture-served-from-header")
                 );
-            }
-            SelectedResponseAccumulator::TemporaryUnportedAnthropicFallback(_) => {
-                panic!("expected Codex Responses accumulator")
-            }
-        }
-    }
-
-    #[test]
-    fn anthropic_fallback_still_uses_unported_response_accumulator() {
-        let body = br#"{
-          "model": "claude-sonnet-4-5[1m]",
-          "system": "- Primary working directory: /tmp/coditor-anthropic-fallback",
-          "messages": [
-            { "role": "user", "content": "Keep copied smoke tests alive." }
-          ]
-        }"#;
-        let metadata = parse_request_body_metadata(
-            body,
-            &super::codex_request::CodexRequestHeaders::default(),
-        )
-        .expect("temporary Anthropic fallback parses copied request");
-        let headers = make_http_headers(&[(":status", "200")]);
-        let parsed_headers = codex_response_headers_from_ext_proc(&headers);
-        let stream = br#"data: {"type":"message_start","message":{"model":"claude-sonnet-fixture","usage":{"input_tokens":11,"cache_read_input_tokens":2,"cache_creation_input_tokens":3}}}
-data: {"type":"message_delta","usage":{"output_tokens":5}}
-"#;
-        let mut accumulator = SelectedResponseAccumulator::for_request_source(metadata.source);
-
-        accumulator.apply_response_headers(&parsed_headers);
-        accumulator
-            .process_chunk(stream)
-            .expect("process Anthropic fallback stream");
-
-        match accumulator {
-            SelectedResponseAccumulator::TemporaryUnportedAnthropicFallback(accumulator) => {
-                assert!(accumulator.is_sse);
-                assert_eq!(accumulator.http_status, 200);
-                assert_eq!(accumulator.input_tokens, 11);
-                assert_eq!(accumulator.cache_read_tokens, 2);
-                assert_eq!(accumulator.cache_creation_tokens, 3);
-                assert_eq!(accumulator.output_tokens, 5);
-                assert_eq!(
-                    accumulator.response_model.as_deref(),
-                    Some("claude-sonnet-fixture")
-                );
-            }
-            SelectedResponseAccumulator::CodexResponses { .. } => {
-                panic!("expected temporary Anthropic fallback accumulator")
             }
         }
     }
@@ -8177,18 +6075,11 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-phase-4b-005",
             "gpt-codex-fixture",
             &Instant::now(),
-            &[],
-            0,
-            "",
-            "",
             STANDARD_CONTEXT_WINDOW_TOKENS,
         );
 
         let SelectedFinalizationOutcome::Codex(outcome) =
-            outcome.expect("codex finalization outcome")
-        else {
-            panic!("expected Codex finalization outcome");
-        };
+            outcome.expect("codex finalization outcome");
         assert_eq!(
             outcome.accounting.identity.session_id,
             "phase-4b-session-005"
@@ -8726,143 +6617,9 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
-    fn codex_persistence_leaves_anthropic_fallback_request_mapping_unchanged() {
-        let path = unique_test_db_path("codex-persist-anthropic-fallback");
-
-        run_db_writer_commands(
-            &path,
-            vec![
-                DbCommand::InsertSession {
-                    session_id: "session-anthropic-legacy".to_string(),
-                    started_at: "2026-04-30T12:00:07Z".to_string(),
-                    model: "claude-sonnet-fixture".to_string(),
-                    display_name: "legacy".to_string(),
-                    initial_prompt: Some("legacy fallback prompt".to_string()),
-                },
-                DbCommand::RecordRequest {
-                    request_id: "req-anthropic-legacy".to_string(),
-                    session_id: "session-anthropic-legacy".to_string(),
-                    timestamp: "2026-04-30T12:00:08Z".to_string(),
-                    model: "claude-sonnet-fixture".to_string(),
-                    input_tokens: 100,
-                    output_tokens: 20,
-                    cache_read_tokens: 7,
-                    cache_creation_tokens: 9,
-                    cost_dollars: 0.01,
-                    cost_source: ESTIMATED_COST_SOURCE.to_string(),
-                    trusted_for_budget_enforcement: false,
-                    duration_ms: 123,
-                    tool_calls_json: r#"["Read"]"#.to_string(),
-                    tool_calls_list: vec![("Read".to_string(), "2026-04-30T12:00:08Z".to_string())],
-                    cache_event: "hit".to_string(),
-                },
-            ],
-        );
-
-        let conn = Connection::open(&path).expect("open persisted db");
-        let (cache_read_tokens, cache_creation_tokens, provider, codex_cached_input_tokens): (
-            i64,
-            i64,
-            Option<String>,
-            i64,
-        ) = conn
-            .query_row(
-                "SELECT cache_read_tokens, cache_creation_tokens, provider,
-                        codex_cached_input_tokens
-                 FROM requests WHERE request_id = 'req-anthropic-legacy'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("load fallback request");
-        let (session_cache_read, session_request_count): (i64, i64) = conn
-            .query_row(
-                "SELECT total_cache_read_tokens, request_count
-                 FROM sessions WHERE session_id = 'session-anthropic-legacy'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("load fallback session totals");
-
-        assert_eq!(cache_read_tokens, 7);
-        assert_eq!(cache_creation_tokens, 9);
-        assert_eq!(provider, None);
-        assert_eq!(codex_cached_input_tokens, 0);
-        assert_eq!(session_cache_read, 7);
-        assert_eq!(session_request_count, 1);
-
-        drop(conn);
-        cleanup_test_db(&path);
-    }
-
-    #[test]
-    fn upstream_adjustment_strips_1m_model_alias_and_adds_beta_header() {
-        let body = br#"{
-          "model": "claude-opus-4-7[1m]",
-          "max_tokens": 10,
-          "messages": [{ "role": "user", "content": "hello" }]
-        }"#;
-
-        let adjustment = upstream_request_adjustment_for_body(&[], body);
-        let rewritten: serde_json::Value =
-            serde_json::from_slice(&adjustment.body.expect("rewritten body"))
-                .expect("valid rewritten json");
-
-        assert_eq!(rewritten["model"], "claude-opus-4-7");
-        assert_eq!(adjustment.anthropic_beta.as_deref(), Some(CONTEXT_1M_BETA));
-        assert_eq!(
-            strip_model_1m_alias("claude-opus-4-7[1M]"),
-            Some("claude-opus-4-7")
-        );
-    }
-
-    #[test]
-    fn upstream_adjustment_preserves_existing_betas_without_duplicate_context_header() {
-        let body = br#"{"model":"claude-sonnet-4-6[1m]","messages":[]}"#;
-        let existing = vec!["prompt-tools-2025-04-02".to_string()];
-
-        let adjustment = upstream_request_adjustment_for_body(&existing, body);
-
-        assert_eq!(
-            adjustment.anthropic_beta.as_deref(),
-            Some("prompt-tools-2025-04-02, context-1m-2025-08-07")
-        );
-
-        let already_has_context =
-            vec!["prompt-tools-2025-04-02, context-1m-2025-08-07".to_string()];
-        let adjustment = upstream_request_adjustment_for_body(&already_has_context, body);
-
-        assert!(adjustment.anthropic_beta.is_none());
-        assert!(adjustment.body.is_some());
-    }
-
-    #[test]
-    fn upstream_adjustment_leaves_normal_models_untouched() {
-        let body = br#"{"model":"claude-sonnet-4-6","messages":[]}"#;
-        let adjustment = upstream_request_adjustment_for_body(&[], body);
-
-        assert_eq!(adjustment, super::UpstreamRequestAdjustment::default());
-    }
-
-    #[test]
-    fn clean_user_prompt_strips_preamble_and_truncates_long_text() {
-        let cleaned = clean_user_prompt(
-            r#"
-            <system-reminder>Ignore this</system-reminder>
-            <command-name>review</command-name>
-            Please review the cache module.
-            "#,
-        );
-        assert_eq!(cleaned, "Please review the cache module.");
-
-        let long = clean_user_prompt(&"x".repeat(400));
-        assert_eq!(long.chars().count(), 321);
-        assert!(long.ends_with('\u{2026}'));
-    }
-
-    #[test]
     fn headers_and_context_helpers_handle_common_variants() {
         let mut headers = make_http_headers(&[
-            ("Anthropic-Beta", "context-1m-2025-08-07, other"),
+            ("openai-model", "gpt-5.5"),
             ("X-Context-Window-Tokens", "123456"),
         ]);
         headers
@@ -8877,22 +6634,20 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             });
 
         assert_eq!(
-            extract_header(&headers, "anthropic-beta").as_deref(),
-            Some("context-1m-2025-08-07, other")
+            extract_header(&headers, "OPENAI-MODEL").as_deref(),
+            Some("gpt-5.5")
         );
         assert_eq!(
             extract_header(&headers, "X-RAW").as_deref(),
             Some("raw-value")
         );
         assert_eq!(extract_headers(&headers, "missing"), Vec::<String>::new());
-        assert!(request_uses_1m_context(&headers));
-        assert!(model_requests_1m_context("claude-sonnet[1m]"));
         assert_eq!(
-            infer_context_window_tokens(Some("sonnet"), None, 200_001, 0, 0),
+            infer_context_window_tokens(Some("gpt-5.5"), None, 200_001, 0, 0),
             EXTENDED_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(
-            infer_context_window_tokens(Some("sonnet"), None, 100, 50, 25),
+            infer_context_window_tokens(Some("gpt-5.5"), None, 100, 50, 25),
             STANDARD_CONTEXT_WINDOW_TOKENS
         );
         assert_eq!(context_fill_ratio(100, 50, 50, 200), 1.0);
@@ -8902,7 +6657,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     #[test]
     fn display_names_use_workdir_and_collision_suffix() {
         assert_eq!(
-            derive_display_name("/Users/pradeep/code/coditor", "claude-sonnet", 0xabc),
+            derive_display_name("/Users/pradeep/code/coditor", "gpt-5.5", 0xabc),
             "coditor"
         );
 
@@ -8912,7 +6667,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             diagnosis::SessionState {
                 session_id: "session_existing".to_string(),
                 display_name: "coditor".to_string(),
-                model: "claude-sonnet".to_string(),
+                model: "gpt-5.5".to_string(),
                 initial_prompt: None,
                 created_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -8920,7 +6675,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 cache_warning_sent: false,
             },
         );
-        let display = derive_display_name("/tmp/coditor", "claude-sonnet", hash);
+        let display = derive_display_name("/tmp/coditor", "gpt-5.5", hash);
         let _ = diagnosis::SESSIONS.remove(&hash);
         assert_eq!(display, "coditor-abc");
     }
@@ -8963,27 +6718,6 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "Fixed the auth cache warm path."
         ));
 
-        let results = vec![
-            ParsedToolResult {
-                tool_name: "Read".to_string(),
-                input_summary: "src/main.rs".to_string(),
-                outcome: "success".to_string(),
-                is_error: false,
-                duration_ms: 12,
-            },
-            ParsedToolResult {
-                tool_name: "Bash".to_string(),
-                input_summary: "cargo test".to_string(),
-                outcome: "error".to_string(),
-                is_error: true,
-                duration_ms: 34,
-            },
-        ];
-        assert_eq!(
-            tool_recall_context(&results).as_deref(),
-            Some("Tools: Read src/main.rs; Bash cargo test (error)")
-        );
-
         assert_eq!(normalize_search_text("Auth-cache!!"), "auth cache");
         let terms = tokenize_search_text("auth cache x");
         assert_eq!(terms, vec!["auth", "cache"]);
@@ -8992,65 +6726,11 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             &terms,
             "Investigate auth cache",
             "Fixed cache warm path",
-            "claude-sonnet",
+            "gpt-5.5",
         )
         .expect("score");
         assert!(score > 80);
-        assert!(score_recall_doc("billing", &["billing".to_string()], "", "", "sonnet").is_none());
-    }
-
-    #[test]
-    fn skill_discovery_helpers_accept_frontmatter_and_paths() {
-        let dir = std::env::temp_dir().join(format!(
-            "coditor-skill-test-{}-{}",
-            std::process::id(),
-            now_epoch_secs()
-        ));
-        let skill_dir = dir.join(".claude/skills/test-skill");
-        fs::create_dir_all(&skill_dir).expect("create skill dir");
-        let skill_file = skill_dir.join("SKILL.md");
-        fs::write(
-            &skill_file,
-            "---\nname: Fancy Skill\n---\nUse this for fancy work.\n",
-        )
-        .expect("write skill");
-
-        assert_eq!(
-            skill_name_from_skill_file(&skill_file, &fs::read_to_string(&skill_file).unwrap())
-                .as_deref(),
-            Some("fancy-skill")
-        );
-        let expected = super::expected_skill_names_from_prompt(
-            "Please use the fancy skill for this.",
-            Some(dir.to_str().expect("utf8 temp dir")),
-        );
-        assert!(expected.contains("fancy-skill"));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn hook_tool_input_summaries_cover_common_shapes() {
-        assert_eq!(
-            summarize_hook_tool_input(Some(&serde_json::json!({"command": "cargo test"})))
-                .as_deref(),
-            Some("cargo test")
-        );
-        assert_eq!(
-            summarize_hook_tool_input(Some(&serde_json::json!({"file_path": "/tmp/demo.rs"})))
-                .as_deref(),
-            Some("/tmp/demo.rs")
-        );
-        assert_eq!(
-            summarize_hook_tool_input(Some(&serde_json::json!({"query": "auth cache"}))).as_deref(),
-            Some("auth cache")
-        );
-        assert!(
-            summarize_hook_tool_input(Some(&serde_json::json!({"other": "value"})))
-                .expect("json summary")
-                .contains("\"other\"")
-        );
-        assert_eq!(summarize_hook_tool_input(None), None);
+        assert!(score_recall_doc("billing", &["billing".to_string()], "", "", "gpt-5").is_none());
     }
 
     #[test]
@@ -9442,8 +7122,8 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 ttft_ms,
                 gap_from_prev_secs,
                 context_utilization,
-                "claude-sonnet",
-                "claude-sonnet",
+                "gpt-5.5",
+                "gpt-5.5",
                 response_summary,
             ],
         )
@@ -9506,81 +7186,6 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
-    fn parses_latest_tool_results_with_tool_names() {
-        let body = br#"{
-          "messages": [
-            {
-              "role": "assistant",
-              "content": [
-                {
-                  "type": "tool_use",
-                  "id": "toolu_read",
-                  "name": "Read",
-                  "input": { "file_path": "/tmp/demo.txt" }
-                },
-                {
-                  "type": "tool_use",
-                  "id": "toolu_bash",
-                  "name": "Bash",
-                  "input": { "command": "cargo test --lib" }
-                }
-              ]
-            },
-            {
-              "role": "user",
-              "content": [
-                {
-                  "type": "tool_result",
-                  "tool_use_id": "toolu_read",
-                  "is_error": false
-                },
-                {
-                  "type": "tool_result",
-                  "tool_use_id": "toolu_bash",
-                  "is_error": true
-                }
-              ]
-            }
-          ]
-        }"#;
-
-        let results = parse_latest_tool_results(body);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].tool_name, "Read");
-        assert_eq!(results[0].input_summary, "/tmp/demo.txt");
-        assert_eq!(results[0].outcome, "success");
-        assert!(!results[0].is_error);
-        assert_eq!(results[1].tool_name, "Bash");
-        assert_eq!(results[1].input_summary, "cargo test --lib");
-        assert_eq!(results[1].outcome, "error");
-        assert!(results[1].is_error);
-    }
-
-    #[test]
-    fn unknown_tool_result_stays_unknown_when_mapping_is_missing() {
-        let body = br#"{
-          "messages": [
-            {
-              "role": "user",
-              "content": [
-                {
-                  "type": "tool_result",
-                  "tool_use_id": "toolu_missing",
-                  "is_error": true
-                }
-              ]
-            }
-          ]
-        }"#;
-
-        let results = parse_latest_tool_results(body);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].tool_name, "unknown");
-        assert_eq!(results[0].outcome, "error");
-        assert!(results[0].is_error);
-    }
-
-    #[test]
     fn compact_response_summary_strips_machine_noise() {
         let raw = r#"
             ```json
@@ -9589,27 +7194,11 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             Fixed the auth middleware ordering and reran the targeted tests.
         "#;
 
-        let summary = compact_response_summary(raw, &[]).expect("summary");
+        let summary = compact_response_summary(raw).expect("summary");
         assert_eq!(
             summary,
             "Fixed the auth middleware ordering and reran the targeted tests."
         );
-    }
-
-    #[test]
-    fn compact_response_summary_falls_back_to_tool_context() {
-        let tool_results = vec![ParsedToolResult {
-            tool_name: "Bash".to_string(),
-            input_summary: "cargo test auth_middleware".to_string(),
-            outcome: "success".to_string(),
-            duration_ms: 1200,
-            is_error: false,
-        }];
-
-        let summary =
-            compact_response_summary("```json\n{\"tool_use\": \"Bash\"}\n```", &tool_results)
-                .expect("summary");
-        assert_eq!(summary, "Tools: Bash cargo test auth_middleware");
     }
 
     #[test]
@@ -9643,7 +7232,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-old",
             "session-old",
             &two_days_ago,
-            "claude-haiku",
+            "gpt-5.4",
             1_000_000,
             0,
             40,
@@ -9654,7 +7243,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-old",
             &two_days_ago,
             Some(&two_days_ago),
-            "claude-haiku",
+            "gpt-5.4",
             None,
         );
         insert_diagnosis(
@@ -9662,7 +7251,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-old",
             &two_days_ago,
             true,
-            r#"[{"cause_type":"context_bloat"}]"#,
+            r#"[{"cause_type":"codex_high_context_fill"}]"#,
         );
 
         let windows = query_historical_metrics(&conn, now).expect("query history");
@@ -9677,15 +7266,16 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(seven_day.sessions, 1);
         assert_eq!(seven_day.degraded_sessions, 1);
         let expected =
-            pricing::estimate_cost_dollars("claude-haiku", 1_000_000, 0, 40, 10).total_cost_dollars;
+            pricing::estimate_cost_dollars("gpt-5.4", 1_000_000, 0, 40, 10).total_cost_dollars;
         assert!((seven_day.estimated_spend_dollars - expected).abs() < 1e-9);
         assert_eq!(
-            seven_day
-                .estimated_spend_dollars_by_model
-                .get("legacy_claude"),
+            seven_day.estimated_spend_dollars_by_model.get("gpt-5.4"),
             Some(&expected)
         );
-        assert_eq!(seven_day.degraded_causes.get("context_bloat"), Some(&1));
+        assert_eq!(
+            seven_day.degraded_causes.get("codex_high_context_fill"),
+            Some(&1)
+        );
     }
 
     #[test]
@@ -9701,7 +7291,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-a",
             "session-a",
             &one_hour_ago,
-            "claude-sonnet",
+            "gpt-5.5",
             500_000,
             0,
             20,
@@ -9712,7 +7302,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-a",
             &one_hour_ago,
             Some(&one_hour_ago),
-            "claude-sonnet",
+            "gpt-5.5",
             None,
         );
         insert_request(
@@ -9720,7 +7310,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-b",
             "session-b",
             &two_hours_ago,
-            "claude-haiku",
+            "gpt-5.4",
             625_000,
             0,
             0,
@@ -9731,7 +7321,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-b",
             &two_hours_ago,
             Some(&two_hours_ago),
-            "claude-haiku",
+            "gpt-5.4",
             None,
         );
         insert_request(
@@ -9739,7 +7329,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-c",
             "session-c",
             &three_hours_ago,
-            "claude-sonnet",
+            "gpt-5.5",
             666_666,
             0,
             10,
@@ -9750,7 +7340,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-c",
             &three_hours_ago,
             Some(&three_hours_ago),
-            "claude-sonnet",
+            "gpt-5.5",
             None,
         );
 
@@ -9759,14 +7349,14 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-a",
             &one_hour_ago,
             true,
-            r#"[{"cause_type":"cache_miss_thrash"},{"cause_type":"context_bloat"}]"#,
+            r#"[{"cause_type":"codex_response_failed"},{"cause_type":"codex_high_context_fill"}]"#,
         );
         insert_diagnosis(
             &conn,
             "session-b",
             &two_hours_ago,
             true,
-            r#"[{"cause_type":"cache_miss_thrash"}]"#,
+            r#"[{"cause_type":"codex_response_failed"}]"#,
         );
         insert_diagnosis(&conn, "session-c", &three_hours_ago, false, "[]");
 
@@ -9775,43 +7365,49 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
 
         assert_eq!(one_day.sessions, 3);
         assert_eq!(one_day.degraded_sessions, 2);
-        let expected = pricing::estimate_cost_dollars("claude-sonnet", 500_000, 0, 20, 10)
+        let expected = pricing::estimate_cost_dollars("gpt-5.5", 500_000, 0, 20, 10)
             .total_cost_dollars
-            + pricing::estimate_cost_dollars("claude-haiku", 625_000, 0, 0, 30).total_cost_dollars
-            + pricing::estimate_cost_dollars("claude-sonnet", 666_666, 0, 10, 10)
-                .total_cost_dollars;
+            + pricing::estimate_cost_dollars("gpt-5.4", 625_000, 0, 0, 30).total_cost_dollars
+            + pricing::estimate_cost_dollars("gpt-5.5", 666_666, 0, 10, 10).total_cost_dollars;
         assert!((one_day.estimated_spend_dollars - expected).abs() < 1e-9);
-        let sonnet_expected = pricing::estimate_cost_dollars("claude-sonnet", 500_000, 0, 20, 10)
+        let gpt55_expected = pricing::estimate_cost_dollars("gpt-5.5", 500_000, 0, 20, 10)
             .total_cost_dollars
-            + pricing::estimate_cost_dollars("claude-sonnet", 666_666, 0, 10, 10)
-                .total_cost_dollars;
-        let haiku_expected =
-            pricing::estimate_cost_dollars("claude-haiku", 625_000, 0, 0, 30).total_cost_dollars;
+            + pricing::estimate_cost_dollars("gpt-5.5", 666_666, 0, 10, 10).total_cost_dollars;
+        let gpt54_expected =
+            pricing::estimate_cost_dollars("gpt-5.4", 625_000, 0, 0, 30).total_cost_dollars;
         assert_eq!(
-            one_day
-                .estimated_spend_dollars_by_model
-                .get("legacy_claude"),
-            Some(&(sonnet_expected + haiku_expected))
+            one_day.estimated_spend_dollars_by_model.get("gpt-5.5"),
+            Some(&gpt55_expected)
+        );
+        assert_eq!(
+            one_day.estimated_spend_dollars_by_model.get("gpt-5.4"),
+            Some(&gpt54_expected)
         );
         assert_eq!(
             one_day
                 .avg_estimated_session_cost_dollars_by_model
-                .get("legacy_claude"),
+                .get("gpt-5.5"),
             Some(&1.0)
         );
         assert!((one_day.cache_hit_ratio - 0.375).abs() < 1e-9);
         assert!((one_day.degraded_session_ratio - (2.0 / 3.0)).abs() < 1e-9);
-        assert_eq!(one_day.degraded_causes.get("cache_miss_thrash"), Some(&2));
-        assert_eq!(one_day.degraded_causes.get("context_bloat"), Some(&1));
+        assert_eq!(
+            one_day.degraded_causes.get("codex_response_failed"),
+            Some(&2)
+        );
+        assert_eq!(
+            one_day.degraded_causes.get("codex_high_context_fill"),
+            Some(&1)
+        );
     }
 
     #[test]
-    fn historical_metrics_render_exposes_new_metrics() {
+    fn historical_metrics_render_keeps_non_envoy_surfaces_out_of_prometheus() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         metrics::init();
 
         let mut causes = std::collections::BTreeMap::new();
-        causes.insert("context_bloat", 3);
+        causes.insert("codex_high_context_fill", 3);
         metrics::update_historical_gauges(
             &[metrics::HistoricalWindowMetrics {
                 window: "7d",
@@ -9838,60 +7434,27 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         );
 
         let (_, body) = metrics::render().expect("render metrics");
-        assert!(body.contains("coditor_history_sessions"));
-        assert!(body.contains("coditor_history_estimated_spend_dollars"));
-        assert!(body.contains("coditor_history_estimated_spend_dollars_by_model"));
-        assert!(body.contains("coditor_history_avg_estimated_session_cost_dollars"));
-        assert!(body.contains("coditor_history_cache_hit_ratio"));
-        assert!(body.contains("coditor_history_degraded_sessions"));
-        assert!(body.contains("coditor_history_degraded_session_ratio"));
-        assert!(body.contains("coditor_history_degraded_causes"));
-        assert!(body.contains("coditor_history_estimated_cache_waste_dollars"));
-        assert!(body.contains("coditor_history_cache_events"));
-        assert!(body.contains("coditor_history_model_fallbacks"));
-        assert!(body.contains("coditor_history_tool_failures"));
-        assert!(body.contains("coditor_history_refresh_timestamp_seconds 1776700000"));
-        assert!(body.contains("window=\"7d\""));
-        assert!(body.contains("cause_type=\"context_bloat\""));
-        assert!(body.contains("event_type=\"miss_thrash\""));
-        assert!(body.contains("requested=\"gpt-5.4\""));
-        assert!(body.contains("actual=\"gpt-5.5\""));
-        assert!(body.contains("tool=\"bash\""));
-        assert!(body
-            .contains("coditor_cache_events_total{event_type=\"miss_thrash\",model=\"gpt-5.5\"}"));
-        assert!(body.contains("coditor_estimated_cache_waste_dollars_total{model=\"gpt-5.5\"}"));
         assert!(body
             .contains("coditor_model_fallback_total{actual=\"gpt-5.5\",requested=\"gpt-5.4\"} 0"));
-        assert!(body.contains("coditor_tool_failures_total{tool=\"unknown\"} 0"));
-        assert!(
-            body.contains("coditor_mcp_tool_calls_total{server=\"unknown\",tool=\"unknown\"} 0")
-        );
-        assert!(body.contains("coditor_mcp_server_calls_total{server=\"unknown\"} 0"));
-        assert!(metric_line_has(
-            &body,
-            "coditor_mcp_events_total",
-            &[
-                "server=\"unknown\"",
-                "tool=\"unknown\"",
-                "event_type=\"called\"",
-                "source=\"hook\""
-            ],
-            " 0"
-        ));
-        assert!(metric_line_has(
-            &body,
+        for dropped_metric in [
+            "coditor_history_",
+            "coditor_cache_events_total",
+            "coditor_estimated_",
+            "coditor_tool_failures_total",
+            "coditor_mcp_",
             "coditor_skill_events_total",
-            &[
-                "skill=\"unknown\"",
-                "event_type=\"fired\"",
-                "source=\"hook\""
-            ],
-            " 0"
-        ));
+            "coditor_active_sessions",
+            "coditor_weekly_tokens",
+        ] {
+            assert!(
+                !body.contains(dropped_metric),
+                "non-Envoy Codex metric family remained exposed: {dropped_metric}"
+            );
+        }
     }
 
     #[test]
-    fn seed_live_metric_labels_from_db_precreates_known_tool_series() {
+    fn seed_live_metric_labels_from_db_precreates_envoy_tool_intent_series_only() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         metrics::init();
 
@@ -9899,16 +7462,18 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         conn.execute_batch(SCHEMA).expect("create schema");
         conn.execute(
             "INSERT INTO sessions (session_id, started_at, model) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["session_1", "2026-01-01T00:00:00Z", "claude-sonnet-4-6"],
+            rusqlite::params!["session_1", "2026-01-01T00:00:00Z", "gpt-5.5"],
         )
         .expect("insert session");
         conn.execute(
-            "INSERT INTO requests (request_id, session_id, timestamp, model) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO requests (request_id, session_id, timestamp, model, provider) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 "req_1",
                 "session_1",
                 "2026-01-01T00:00:00Z",
-                "claude-sonnet-4-6"
+                "gpt-5.5",
+                "codex_responses"
             ],
         )
         .expect("insert request");
@@ -9928,7 +7493,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 "success"
             ],
         )
-        .expect("insert tool outcome");
+        .expect("insert non-Envoy tool outcome");
         conn.execute(
             "INSERT INTO tool_calls (request_id, timestamp, tool_name) VALUES (?1, ?2, ?3)",
             rusqlite::params!["req_1", "2026-01-01T00:00:01Z", "mcp__github__get_issue"],
@@ -9946,7 +7511,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 "hook"
             ],
         )
-        .expect("insert skill event");
+        .expect("insert non-Envoy skill event");
         conn.execute(
             "INSERT INTO mcp_events (session_id, timestamp, server, tool, event_type, source) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -9959,100 +7524,49 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
                 "hook"
             ],
         )
-        .expect("insert mcp event");
+        .expect("insert non-Envoy MCP event");
 
         seed_live_metric_labels_from_db(&conn).expect("seed tool labels");
 
         let (_, body) = metrics::render().expect("render metrics");
         assert!(body.contains("coditor_tool_calls_total{tool=\"bash\"} 0"));
-        assert!(body.contains("coditor_tool_failures_total{tool=\"bash\"} 0"));
-        assert!(body.contains("coditor_tool_calls_total{tool=\"read_file\"} 0"));
-        assert!(body.contains("coditor_tool_failures_total{tool=\"read_file\"} 0"));
-        assert!(
-            body.contains("coditor_mcp_tool_calls_total{server=\"github\",tool=\"get_issue\"} 0")
-        );
-        assert!(body
-            .contains("coditor_mcp_tool_failures_total{server=\"github\",tool=\"get_issue\"} 0"));
-        assert!(body.contains("coditor_mcp_server_calls_total{server=\"github\"} 0"));
-        assert!(body.contains("coditor_mcp_server_failures_total{server=\"github\"} 0"));
-        assert!(metric_line_has(
-            &body,
+        assert!(body.contains("coditor_tool_calls_total{tool=\"mcp__github__get_issue\"} 0"));
+        assert!(!body.contains("coditor_tool_calls_total{tool=\"read_file\"}"));
+        for dropped_metric in [
+            "coditor_tool_failures_total",
+            "coditor_mcp_",
             "coditor_skill_events_total",
-            &[
-                "skill=\"openai-docs\"",
-                "event_type=\"fired\"",
-                "source=\"hook\""
-            ],
-            " 0"
-        ));
-        assert!(metric_line_has(
-            &body,
-            "coditor_mcp_events_total",
-            &[
-                "server=\"github\"",
-                "tool=\"get_issue\"",
-                "event_type=\"called\"",
-                "source=\"hook\""
-            ],
-            " 0"
-        ));
+        ] {
+            assert!(
+                !body.contains(dropped_metric),
+                "non-Envoy lifecycle metric remained exposed: {dropped_metric}"
+            );
+        }
     }
 
     #[test]
-    fn tool_metric_path_records_mcp_breakdowns() {
+    fn tool_metric_path_records_only_custom_tool_intent() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         metrics::init();
 
         let tool_name = "mcp__metricstest_server__lookup_widget";
         metrics::record_tool_call(tool_name);
-        metrics::record_tool_failures(tool_name, 2);
 
         let (_, body) = metrics::render().expect("render metrics");
         assert!(body.contains(
             "coditor_tool_calls_total{tool=\"mcp__metricstest_server__lookup_widget\"} 1"
         ));
-        assert!(body.contains(
-            "coditor_tool_failures_total{tool=\"mcp__metricstest_server__lookup_widget\"} 2"
-        ));
-        assert!(body.contains(
-            "coditor_mcp_tool_calls_total{server=\"metricstest_server\",tool=\"lookup_widget\"} 1"
-        ));
-        assert!(body.contains(
-            "coditor_mcp_tool_failures_total{server=\"metricstest_server\",tool=\"lookup_widget\"} 2"
-        ));
-        assert!(body.contains("coditor_mcp_server_calls_total{server=\"metricstest_server\"} 1"));
-        assert!(body.contains("coditor_mcp_server_failures_total{server=\"metricstest_server\"} 2"));
-        assert!(metric_line_has(
-            &body,
-            "coditor_mcp_events_total",
-            &[
-                "server=\"metricstest_server\"",
-                "tool=\"lookup_widget\"",
-                "event_type=\"called\"",
-                "source=\"proxy\""
-            ],
-            " 1"
-        ));
-        assert!(metric_line_has(
-            &body,
-            "coditor_mcp_events_total",
-            &[
-                "server=\"metricstest_server\"",
-                "tool=\"lookup_widget\"",
-                "event_type=\"failed\"",
-                "source=\"proxy\""
-            ],
-            " 2"
-        ));
+        assert!(!body.contains("coditor_tool_failures_total"));
+        assert!(!body.contains("coditor_mcp_"));
     }
 
     #[test]
-    fn historical_gauges_zero_stale_causes_on_refresh() {
+    fn historical_gauge_refresh_does_not_reintroduce_dropped_metric_families() {
         let _guard = METRICS_TEST_LOCK.lock().unwrap();
         metrics::init();
 
         let mut causes = std::collections::BTreeMap::new();
-        causes.insert("cache_miss_thrash", 2);
+        causes.insert("codex_response_failed", 2);
         metrics::update_historical_gauges(
             &[metrics::HistoricalWindowMetrics {
                 window: "7d",
@@ -10098,33 +7612,10 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         );
 
         let (_, body) = metrics::render().expect("render metrics");
-        let stale_line = body
-            .lines()
-            .find(|line| {
-                line.starts_with("coditor_history_degraded_causes{")
-                    && line.contains("window=\"7d\"")
-                    && line.contains("cause_type=\"cache_miss_thrash\"")
-            })
-            .expect("stale cause line");
-        assert!(stale_line.ends_with(" 0"));
-        let stale_avg_line = body
-            .lines()
-            .find(|line| {
-                line.starts_with("coditor_history_avg_estimated_session_cost_dollars{")
-                    && line.contains("window=\"7d\"")
-                    && line.contains("model=\"gpt-5.5\"")
-            })
-            .expect("stale avg line");
-        assert!(stale_avg_line.ends_with(" 0"));
-        let stale_spend_line = body
-            .lines()
-            .find(|line| {
-                line.starts_with("coditor_history_estimated_spend_dollars_by_model{")
-                    && line.contains("window=\"7d\"")
-                    && line.contains("model=\"gpt-5.5\"")
-            })
-            .expect("stale spend line");
-        assert!(stale_spend_line.ends_with(" 0"));
+        assert!(!body.contains("coditor_history_"));
+        assert!(!body.contains("coditor_estimated_"));
+        assert!(!body.contains("coditor_cache_events_total"));
+        assert!(!body.contains("coditor_tool_failures_total"));
     }
 
     #[test]
@@ -10248,7 +7739,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             Some("2026-01-02T00:00:00Z".to_string()),
             "cache_miss_ttl".to_string(),
             0.4,
-            Some("claude-sonnet".to_string()),
+            Some("gpt-5.5".to_string()),
             Some("gpt-5.5".to_string()),
             Some("gpt-5.5".to_string()),
         );
@@ -10297,7 +7788,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             Some("2026-01-02T00:00:00Z".to_string()),
             "cache_miss_ttl".to_string(),
             0.4,
-            Some("claude-sonnet".to_string()),
+            Some("gpt-5.5".to_string()),
             None,
             None,
         )];
@@ -10332,7 +7823,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-a",
             &one_hour_ago,
             Some(&one_hour_ago),
-            "claude-sonnet",
+            "gpt-5.5",
             None,
         );
         insert_session(
@@ -10340,7 +7831,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-b",
             &one_hour_ago,
             Some(&one_hour_ago),
-            "claude-haiku",
+            "gpt-5.4",
             None,
         );
         insert_request(
@@ -10348,7 +7839,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-a",
             "session-a",
             &one_hour_ago,
-            "claude-sonnet",
+            "gpt-5.5",
             1_000_000,
             0,
             0,
@@ -10359,7 +7850,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-b",
             "session-b",
             &one_hour_ago,
-            "claude-haiku",
+            "gpt-5.4",
             500_000,
             0,
             0,
@@ -10391,7 +7882,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         assert_eq!(summary.sessions, 2);
         assert_eq!(summary.billed_sessions, 2);
         assert_eq!(summary.billed_cost_dollars, Some(3.75));
-        assert!((summary.estimated_cost_dollars - 3.4).abs() < 1e-9);
+        assert!((summary.estimated_cost_dollars - 6.25).abs() < 1e-9);
     }
 
     #[test]
@@ -10404,7 +7895,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-real",
             &one_hour_ago,
             Some(&one_hour_ago),
-            "claude-sonnet",
+            "gpt-5.5",
             None,
         );
         insert_request(
@@ -10412,7 +7903,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-real",
             "session-real",
             &one_hour_ago,
-            "claude-sonnet",
+            "gpt-5.5",
             1_000_000,
             0,
             0,
@@ -10423,7 +7914,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "req-title",
             "session-internal",
             &one_hour_ago,
-            "claude-haiku",
+            "gpt-5.4",
             500_000,
             0,
             0,
@@ -10443,7 +7934,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         for idx in 0..205u64 {
             let ts = epoch_to_iso8601(cutoff_base.saturating_sub(205 - idx));
             let session_id = format!("session-{idx:03}");
-            insert_session(&conn, &session_id, &ts, Some(&ts), "claude-sonnet", None);
+            insert_session(&conn, &session_id, &ts, Some(&ts), "gpt-5.5", None);
             insert_turn_snapshot(&conn, &session_id, 1, &ts, 0, 1000, 1000, 0.0, 0.10, None);
         }
 
@@ -10465,92 +7956,6 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
     }
 
     #[test]
-    fn request_uses_1m_context_detects_anthropic_beta_header() {
-        let headers = make_http_headers(&[(
-            "anthropic-beta",
-            "prompt-tools-2025-04-02, context-1m-2025-08-07",
-        )]);
-
-        assert!(request_uses_1m_context(&headers));
-        assert_eq!(
-            resolve_context_window_tokens(
-                Some(EXTENDED_CONTEXT_WINDOW_TOKENS),
-                "claude-sonnet-4-6"
-            ),
-            EXTENDED_CONTEXT_WINDOW_TOKENS
-        );
-    }
-
-    #[test]
-    fn resolve_context_window_tokens_accepts_model_suffix() {
-        assert_eq!(
-            resolve_context_window_tokens(None, "claude-sonnet-4-6[1m]"),
-            EXTENDED_CONTEXT_WINDOW_TOKENS
-        );
-        assert_eq!(
-            resolve_context_window_tokens(None, "claude-sonnet-4-6"),
-            STANDARD_CONTEXT_WINDOW_TOKENS
-        );
-    }
-
-    #[test]
-    fn model_matches_ignores_1m_suffix() {
-        assert!(super::model_matches(
-            "claude-sonnet-4-6[1m]",
-            "claude-sonnet-4-6"
-        ));
-        assert!(super::model_matches(
-            "claude-opus-4-7",
-            "claude-opus-4-7[1m]"
-        ));
-    }
-
-    #[test]
-    fn canonical_skill_names_are_metric_friendly() {
-        assert_eq!(
-            canonical_telemetry_name("/OpenAI Docs"),
-            Some("openai-docs".to_string())
-        );
-        assert_eq!(
-            canonical_telemetry_name("/tmp/project/.claude/skills/review/SKILL.md"),
-            Some("review".to_string())
-        );
-        assert_eq!(canonical_telemetry_name("   "), None);
-    }
-
-    #[test]
-    fn skill_tool_input_extracts_name_variants() {
-        assert_eq!(
-            skill_name_from_tool_input_json(r#"{"skill_name":"openai-docs"}"#),
-            Some("openai-docs".to_string())
-        );
-        assert_eq!(
-            skill_name_from_tool_input_json(
-                r#"{"file_path":"/tmp/.claude/skills/browser-use/SKILL.md"}"#
-            ),
-            Some("browser-use".to_string())
-        );
-    }
-
-    #[test]
-    fn explicit_skill_refs_detect_slash_and_dollar_mentions() {
-        let refs = extract_explicit_skill_refs("Use /openai-docs and $browser-use:browser here");
-        assert!(refs.contains("openai-docs"));
-        assert!(refs.contains("browser-use:browser"));
-    }
-
-    #[test]
-    fn explicit_skill_refs_ignore_inline_slashes_and_absolute_paths() {
-        let refs = extract_explicit_skill_refs(
-            "Use read/list/search tools in /Users/pradeep/code, then /base-gke-readonly",
-        );
-        assert!(refs.contains("base-gke-readonly"));
-        assert!(!refs.contains("list"));
-        assert!(!refs.contains("search"));
-        assert!(!refs.contains("users"));
-    }
-
-    #[test]
     fn repair_turn_snapshot_context_windows_backfills_oversized_turns_as_1m() {
         let conn = create_full_test_db();
         insert_session(
@@ -10558,7 +7963,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-long",
             "2026-04-23T06:00:00Z",
             Some("2026-04-23T06:00:00Z"),
-            "claude-sonnet-4-6",
+            "gpt-5.5",
             None,
         );
         insert_turn_snapshot(
@@ -10599,7 +8004,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-ttl",
             &ended_at,
             Some(&ended_at),
-            "claude-sonnet",
+            "gpt-5.5",
             Some("keep auth cache warm"),
         );
         insert_turn_snapshot(
@@ -10658,7 +8063,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
             "session-ok",
             &ended_at,
             Some(&ended_at),
-            "claude-sonnet",
+            "gpt-5.5",
             Some("ship the fix"),
         );
         conn.execute(
@@ -10716,7 +8121,7 @@ data: {"type":"message_delta","usage":{"output_tokens":5}}
         tx.send(DbCommand::InsertSession {
             session_id: "session-test".to_string(),
             started_at: "2026-01-01T00:00:00Z".to_string(),
-            model: "claude-sonnet".to_string(),
+            model: "gpt-5.5".to_string(),
             display_name: "session-test".to_string(),
             initial_prompt: None,
         })

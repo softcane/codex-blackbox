@@ -206,26 +206,17 @@ fn is_codex_model_name(model: &str) -> bool {
         || lower.starts_with("o4")
 }
 
-fn is_legacy_model_name(model: &str) -> bool {
-    model.to_ascii_lowercase().starts_with("claude-")
-}
-
 fn pane_model_label(model: &str) -> String {
     if is_codex_model_name(model) {
         format!("CODEX \u{00b7} {model}")
-    } else if is_legacy_model_name(model) {
-        format!("LEGACY MODEL \u{00b7} {model}")
     } else {
         model.to_string()
     }
 }
 
 fn model_change_hint_label(requested: &str, actual: &str) -> &'static str {
-    if is_legacy_model_name(requested) || is_legacy_model_name(actual) {
-        "legacy model change"
-    } else {
-        "model change"
-    }
+    let _ = (requested, actual);
+    "model change"
 }
 
 fn context_window_label(context_window_tokens: Option<u64>) -> String {
@@ -1192,7 +1183,7 @@ mod tests {
             pane_id: "%1".to_string(),
             session_id: "session_test".to_string(),
             display_name: "test".to_string(),
-            model: "sonnet".to_string(),
+            model: "gpt-5.4".to_string(),
             observed_tool_calls: 0,
             ended,
             last_activity,
@@ -1254,8 +1245,8 @@ mod tests {
             "CODEX \u{00b7} gpt-codex-fixture"
         );
         assert_eq!(
-            pane_model_label("claude-sonnet-fixture"),
-            "LEGACY MODEL \u{00b7} claude-sonnet-fixture"
+            pane_model_label("unknown-model-fixture"),
+            "unknown-model-fixture"
         );
         assert_eq!(
             model_change_hint_label("gpt-codex-fixture", "gpt-codex-served"),
@@ -1352,7 +1343,7 @@ mod tests {
             &WatchEvent::SessionStart {
                 session_id: "session_new".to_string(),
                 display_name: "api".to_string(),
-                model: "sonnet".to_string(),
+                model: "gpt-5.4".to_string(),
                 initial_prompt: Some("hello".to_string()),
             },
             &cleanup,
@@ -1374,14 +1365,14 @@ mod tests {
             &WatchEvent::SessionStart {
                 session_id: "session_a".to_string(),
                 display_name: "api".to_string(),
-                model: "sonnet".to_string(),
+                model: "gpt-5.4".to_string(),
                 initial_prompt: Some("hello".to_string()),
             },
             &cleanup,
         );
         let pane = orchestrator.panes.get("session_a").expect("pane");
         assert_eq!(pane.display_name, "api");
-        assert_eq!(pane.model, "sonnet");
+        assert_eq!(pane.model, "gpt-5.4");
 
         orchestrator.handle_event(
             &WatchEvent::ToolUse {
@@ -1431,8 +1422,8 @@ mod tests {
         orchestrator.handle_event(
             &WatchEvent::ModelFallback {
                 session_id: "session_a".to_string(),
-                requested: "opus".to_string(),
-                actual: "sonnet".to_string(),
+                requested: "gpt-5.5".to_string(),
+                actual: "gpt-5.4".to_string(),
             },
             &cleanup,
         );
@@ -1442,7 +1433,7 @@ mod tests {
                 .get("session_a")
                 .expect("pane")
                 .model_fallback,
-            Some(("opus".to_string(), "sonnet".to_string()))
+            Some(("gpt-5.5".to_string(), "gpt-5.4".to_string()))
         );
 
         orchestrator.handle_event(

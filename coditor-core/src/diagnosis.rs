@@ -8,7 +8,7 @@ use serde::Serialize;
 // ---------------------------------------------------------------------------
 // Per-terminal session registry — keyed by hash of (working_directory,
 // first_user_message_prefix). Working directory alone collides when multiple
-// Claude sessions run in the same repo in parallel; mixing in the first user
+// Codex sessions run in the same repo in parallel; mixing in the first user
 // message (stable across turns within a session, different across fresh
 // invocations) keeps parallel sessions distinct.
 // ---------------------------------------------------------------------------
@@ -394,7 +394,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
             .unwrap_or(if turn.is_codex() {
                 "codex_unknown"
             } else {
-                "claude-sonnet"
+                "gpt-5.5"
             });
         let breakdown = if turn.is_codex() {
             crate::pricing::estimate_codex_api_cost_dollars(
@@ -484,7 +484,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                     .actual_model
                     .as_deref()
                     .or(turn.requested_model.as_deref())
-                    .unwrap_or("sonnet");
+                    .unwrap_or("gpt-5.5");
                 causes.push(DegradationCause {
                 turn_first_noticed: turn.turn_number,
                 cause_type: "cache_miss_ttl".to_string(),
@@ -535,18 +535,17 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 {
                     if !crate::model_matches(requested, actual) {
                         causes.push(DegradationCause {
-                        turn_first_noticed: turn.turn_number,
-                        cause_type: "model_fallback".to_string(),
-                        detail: format!(
-                            "UNPORTED copied Anthropic baseline routed this from {} to {} at turn {}. \
-                             This usually means the requested tier was unavailable.",
-                            requested, actual, turn.turn_number
-                        ),
-                        estimated_cost: 0.0,
-                        is_heuristic: false,
-                        requested_model: Some(requested.clone()),
-                        actual_model: Some(actual.clone()),
-                    });
+                            turn_first_noticed: turn.turn_number,
+                            cause_type: "model_fallback".to_string(),
+                            detail: format!(
+                                "Envoy observed served model {} for requested model {} at turn {}.",
+                                actual, requested, turn.turn_number
+                            ),
+                            estimated_cost: 0.0,
+                            is_heuristic: false,
+                            requested_model: Some(requested.clone()),
+                            actual_model: Some(actual.clone()),
+                        });
                         set_degradation(turn.turn_number);
                     }
                 }
@@ -597,18 +596,18 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                 let total_signals: u32 = turns.iter().map(|t| t.frustration_signals).sum();
                 if total_signals >= 2 {
                     causes.push(DegradationCause {
-                    turn_first_noticed: turn.turn_number,
-                    cause_type: "harness_pressure".to_string(),
-                    detail: format!(
-                        "{} early-stop or token-pressure signals detected in the copied Claude baseline output. \
+                        turn_first_noticed: turn.turn_number,
+                        cause_type: "harness_pressure".to_string(),
+                        detail: format!(
+                        "{} early-stop or token-pressure signals detected in the assistant output. \
                          This suggests the harness was constraining response quality.",
                         total_signals
                     ),
-                    estimated_cost: 0.0,
-                    is_heuristic: true,
-                    requested_model: None,
-                    actual_model: None,
-                });
+                        estimated_cost: 0.0,
+                        is_heuristic: true,
+                        requested_model: None,
+                        actual_model: None,
+                    });
                     set_degradation(turn.turn_number);
                 }
             }
@@ -649,7 +648,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                                     .actual_model
                                     .as_deref()
                                     .or(t.requested_model.as_deref())
-                                    .unwrap_or("sonnet");
+                                    .unwrap_or("gpt-5.5");
                                 crate::pricing::estimate_cache_rebuild_waste_dollars(
                                     thrash_model,
                                     t.cache_creation_tokens as u64,
@@ -662,7 +661,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                             cause_type: "cache_miss_thrash".to_string(),
                             detail: format!(
                                 "{} consecutive cache rebuilds (turns {}\u{2013}{}) within TTL. \
-                             ~{}K tokens wasted. Check if CLAUDE.md, hooks, or MCP config changed.",
+                             ~{}K tokens wasted. Check if session configuration changed.",
                                 consecutive_misses,
                                 thrash_start,
                                 turn.turn_number,
@@ -682,7 +681,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
         }
 
         // CAUSE: tool_failure_streak — 5+ consecutive turns where >50% of tool calls
-        // failed, after turn 6. Threshold is high because Claude Code routinely gets
+        // failed, after turn 6. Threshold is high because the Codex CLI can report
         // is_error:true from exploratory commands (missing files, failed builds, etc.)
         // that are normal workflow, not degradation.
         let mut consecutive_failures = 0u32;
@@ -707,7 +706,7 @@ pub fn analyze_session(session_id: &str, turns: &[TurnSnapshot]) -> DiagnosisRep
                         cause_type: "tool_failure_streak".to_string(),
                         detail: format!(
                             "Tool calls failed in {} consecutive turns ({}\u{2013}{}). \
-                         The copied Claude baseline may have been retrying a broken approach.",
+                         The session may have been retrying a broken approach.",
                             consecutive_failures, streak_start, turn.turn_number
                         ),
                         estimated_cost: 0.0,
@@ -887,8 +886,8 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
             "Codex cached-input reuse is low across repeated turns. Keep cache-affinity metadata stable once real traffic confirms it.".to_string()
         }
         "cache_miss_ttl" => "Cache expired from idle gap > 5 min. Send a message before the TTL to keep it warm.".to_string(),
-        "cache_miss_thrash" => "UNPORTED copied baseline: full cache rebuilds within 5 min. Check if CLAUDE.md, hooks, or MCP config changed mid-session.".to_string(),
-        "context_bloat" => "UNPORTED copied baseline: point the model at specific functions, not whole files.".to_string(),
+        "cache_miss_thrash" => "Cache rebuilds were observed within 5 min. Check whether session inputs changed mid-session.".to_string(),
+        "context_bloat" => "Point Codex at specific functions, not whole files.".to_string(),
         "model_fallback" => {
             let actual = cause
                 .actual_model
@@ -896,13 +895,13 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
                 .map(friendly_model_name)
                 .unwrap_or_else(|| "a fallback model".to_string());
             format!(
-                "UNPORTED copied Anthropic baseline routed this to {} at turn {}. Check the copied baseline quota source and retry when your preferred tier resets.",
+                "Envoy observed served model {} at turn {}. Check requested-vs-served model behavior before relying on model-specific claims.",
                 actual,
                 cause.turn_first_noticed
             )
         }
         "near_compaction" => "Context was close to auto-compaction. Start a fresh session or narrow the next turn to specific files or functions.".to_string(),
-        "compaction_suspected" => "UNPORTED copied baseline: kill and restart if the model seems stuck. Ctrl+C, then start fresh.".to_string(),
+        "compaction_suspected" => "If the session seems stuck, interrupt and restart with a narrower prompt.".to_string(),
         "tool_failure_streak" => "If tools fail 5 turns in a row, interrupt and redirect.".to_string(),
         "harness_pressure" => "Shorter, more focused tasks perform better than long open-ended ones.".to_string(),
         _ => String::new(),
@@ -910,16 +909,7 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
 }
 
 fn friendly_model_name(model: &str) -> String {
-    let lower = model.to_ascii_lowercase();
-    if lower.contains("opus") {
-        "Opus".to_string()
-    } else if lower.contains("sonnet") {
-        "Sonnet".to_string()
-    } else if lower.contains("haiku") {
-        "Haiku".to_string()
-    } else {
-        model.to_string()
-    }
+    model.to_string()
 }
 
 #[cfg(test)]
@@ -1136,8 +1126,8 @@ mod tests {
         ];
         turns[0].tool_calls = vec!["Edit".to_string()];
         turns[1].tool_calls = vec!["Bash".to_string()];
-        turns[1].requested_model = Some("claude-opus-4-5".to_string());
-        turns[1].actual_model = Some("claude-sonnet-4-5".to_string());
+        turns[1].requested_model = Some("gpt-5.5".to_string());
+        turns[1].actual_model = Some("gpt-5.4".to_string());
         turns[2].tool_calls = vec!["Bash".to_string()];
 
         let report = analyze_session("session-model-fallback", &turns);
@@ -1149,9 +1139,12 @@ mod tests {
             .iter()
             .find(|cause| cause.cause_type == "model_fallback")
             .expect("model fallback cause");
-        assert_eq!(cause.requested_model.as_deref(), Some("claude-opus-4-5"));
-        assert_eq!(cause.actual_model.as_deref(), Some("claude-sonnet-4-5"));
-        assert!(report.advice.iter().any(|advice| advice.contains("Sonnet")));
+        assert_eq!(cause.requested_model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cause.actual_model.as_deref(), Some("gpt-5.4"));
+        assert!(report
+            .advice
+            .iter()
+            .any(|advice| advice.contains("gpt-5.4")));
     }
 
     #[test]

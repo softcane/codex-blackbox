@@ -100,55 +100,9 @@ launching a Codex turn:
 cargo run -q -p coditor-cli -- preflight codex-subscription -- codex exec \
   --cd /Users/pradeepsingh/code/coditor \
   --sandbox read-only \
-  --json \
   "Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
 ```
 
-Do not run the printed live command until explicitly approved. The first
-ChatGPT-auth Codex smoke for Codex 0.125.0 is documented in
-`docs/real-codex-smoke.md`; future Codex versions and broader behavior still
-need revalidation.
-
-After explicit approval and a passing Phase 9A fake gate, run the smallest real
-smoke through the Phase 9C harness with one session:
-
-```sh
-./test/dogfood-codex-sessions.sh --mode real --sessions 1 --repos same \
-  --report-dir reports/dogfood/smoke-$(date -u +%Y%m%dT%H%M%SZ)
-```
-
-The report directory includes the Codex version, exact commands, `/watch`
-capture, SQLite snapshot, metrics, Grafana checks, Compose logs, and a
-`summary.json`/`summary.md` that names passed, failed, skipped, and missing
-capabilities.
-
-The first recorded smoke ran on 2026-04-30 UTC / 2026-05-01 Europe/Stockholm
-and observed real `provider="codex_responses"` traffic, `SessionStart`,
-`CodexTurnSummary`, `ContextStatus`, served model `gpt-5.5`, and no Codex
-`CacheEvent`.
-
-## Phase 9C Real Multi-Session Dogfood Harness
-
-`test/dogfood-codex-sessions.sh` launches real `codex exec` sessions through
-`coditor run -- codex ...` after running the subscription preflight. It is the
-automated dogfood feedback harness; it can contact `chatgpt.com` through the
-local proxy and uses the existing Codex ChatGPT login.
-
-Full dogfood command:
-
-```sh
-./test/dogfood-codex-sessions.sh --mode real --sessions 4 --repos mixed --include-mcp
-```
-
-The harness covers same-repo and different-repo sessions, read-only and
-tool-oriented prompts, MCP prompts when configured, `/watch`, SQLite,
-Prometheus, and Grafana. Missing real telemetry is reported as `missing` or
-`skipped` rather than being silently treated as support proof.
-Each child Codex invocation redirects stdin from `/dev/null`; this protects the
-manifest loops even if a future wrapper regresses to inherited stdin.
-
-The first four-session run completed all child Codex sessions and passed
-session/watch/SQLite/Prometheus/Grafana checks. Later 5-repo validation added
-real Codex JSONL-derived `ToolUse`/`ToolResult`, `McpEvent`, and `SkillEvent`
-coverage. MCP calls in that run were cancelled by the child session, so the MCP
-success-result path is still a separate validation target.
+Do not run the printed live command until explicitly approved. This preflight
+stops before a model turn and does not validate live Codex subscription support.
+Real multi-session dogfood is outside the Envoy-only cleanup gate.

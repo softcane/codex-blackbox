@@ -48,6 +48,7 @@ Options:
   --other-repo PATH        repo/path for mixed-repo coverage; auto-created if omitted
   --report-dir PATH        report artifact directory (default: reports/dogfood/<timestamp>)
   --timeout-seconds N      per-session timeout (default: 360)
+  --no-json                accepted target-path flag; stdout telemetry parsing is disabled
   --keep-stack             leave Docker Compose stack running
   -h, --help               show this help
 EOF
@@ -86,6 +87,9 @@ while [ "$#" -gt 0 ]; do
         --timeout-seconds)
             SESSION_TIMEOUT_SECONDS="${2:-}"
             shift 2
+            ;;
+        --no-json)
+            shift
             ;;
         --keep-stack)
             KEEP_STACK=1
@@ -303,7 +307,6 @@ if checks_tsv.exists():
         add(status, name, detail)
 
 manifest = []
-stdout_session_ids = set()
 if manifest_path.exists():
     for raw in manifest_path.read_text(encoding="utf-8").splitlines():
         if not raw.strip():
@@ -328,15 +331,6 @@ if manifest_path.exists():
                 "exit_code": exit_code,
             }
         )
-        stdout_file = Path(stdout_path)
-        if stdout_file.exists():
-            for line in stdout_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") == "thread.started" and event.get("thread_id"):
-                    stdout_session_ids.add(event["thread_id"])
 
 if len(manifest) >= expected_sessions:
     add("passed", "session_manifest_count", f"{len(manifest)} planned")
@@ -390,7 +384,6 @@ session_ids = {
     for event in marker_watch_events
     if isinstance(event, dict) and event.get("session_id")
 }
-session_ids.update(stdout_session_ids)
 for event in watch_events:
     if not isinstance(event, dict):
         continue
@@ -426,7 +419,7 @@ if cache_events:
     add("failed", "watch_no_codex_cache_event", f"unexpected cache events: {len(cache_events)}")
 else:
     add("passed", "watch_no_codex_cache_event", "no cache_event observed for marker sessions")
-add("skipped", "tool_watch_events", "local Codex stdout JSON is not a live telemetry source")
+add("skipped", "tool_watch_events", "Envoy does not prove local tool result lifecycle")
 add("skipped", "mcp_watch_events", "non-Envoy activity is outside the Codex telemetry surface")
 
 sessions_json_path = report_dir / "sessions.json"

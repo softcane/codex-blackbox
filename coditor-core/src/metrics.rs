@@ -1,15 +1,13 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{LazyLock, Mutex};
+use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use prometheus::{
-    gather, histogram_opts, opts, register_counter_vec, register_gauge_vec, register_histogram,
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec, CounterVec, Encoder, GaugeVec, Histogram, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
+    gather, histogram_opts, opts, register_histogram_vec, register_int_counter_vec, Encoder,
+    HistogramVec, IntCounterVec, TextEncoder,
 };
 
 pub const HISTORY_WINDOWS: [(&str, u64); 3] = [("1d", 1), ("7d", 7), ("30d", 30)];
-pub const HISTORY_MODELS: [&str; 9] = [
+pub const HISTORY_MODELS: [&str; 8] = [
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.3",
@@ -17,11 +15,10 @@ pub const HISTORY_MODELS: [&str; 9] = [
     "gpt-codex",
     "o4-mini",
     "o3",
-    "legacy_claude",
     "other",
 ];
-const LIVE_MODELS: [&str; 9] = HISTORY_MODELS;
-const LIVE_PROVIDERS: [&str; 3] = ["codex_responses", "legacy_anthropic", "unknown"];
+const LIVE_MODELS: [&str; 8] = HISTORY_MODELS;
+const LIVE_PROVIDERS: [&str; 2] = ["codex_responses", "unknown"];
 const LIVE_TOKEN_KINDS: [&str; 8] = [
     "input",
     "cached_input",
@@ -32,23 +29,10 @@ const LIVE_TOKEN_KINDS: [&str; 8] = [
     "cache_read",
     "cache_create",
 ];
-const LIVE_CACHE_EVENT_TYPES: [&str; 4] = ["cold_start", "partial", "miss_ttl", "miss_thrash"];
-const LIVE_SKILL_EVENT_TYPES: [&str; 5] = ["expected", "fired", "missed", "misfired", "failed"];
-const LIVE_SKILL_EVENT_SOURCES: [&str; 3] = ["hook", "proxy", "heuristic"];
-const LIVE_MCP_EVENT_TYPES: [&str; 4] = ["called", "succeeded", "failed", "denied"];
-const LIVE_MCP_EVENT_SOURCES: [&str; 2] = ["hook", "proxy"];
 const LIVE_CONTEXT_PROVIDERS: [&str; 2] = ["codex_responses", "unknown"];
 const LIVE_CODEX_RESPONSE_STATUSES: [&str; 4] = ["completed", "failed", "incomplete", "unknown"];
 pub const HISTORY_CACHE_EVENT_TYPES: [&str; 2] = ["miss_ttl", "miss_thrash"];
-pub const HISTORY_CAUSE_TYPES: [&str; 15] = [
-    "cache_miss_ttl",
-    "context_bloat",
-    "model_fallback",
-    "near_compaction",
-    "harness_pressure",
-    "cache_miss_thrash",
-    "tool_failure_streak",
-    "compaction_suspected",
+pub const HISTORY_CAUSE_TYPES: [&str; 7] = [
     "codex_response_failed",
     "codex_response_incomplete",
     "codex_model_mismatch",
@@ -78,45 +62,12 @@ pub struct HistoricalWindowMetrics {
 pub struct CoditorMetrics {
     requests_total: IntCounterVec,
     tokens_total: IntCounterVec,
-    estimated_cost_dollars_total: CounterVec,
-    cache_events_total: IntCounterVec,
-    estimated_cache_waste_dollars_total: CounterVec,
-    sessions_total: IntCounterVec,
-    degraded_sessions_total: IntCounter,
     sessions_degraded_total: IntCounterVec,
     codex_response_status_total: IntCounterVec,
     model_fallback_total: IntCounterVec,
-    compaction_suspected_total: IntCounter,
     tool_calls_total: IntCounterVec,
-    tool_failures_total: IntCounterVec,
-    mcp_tool_calls_total: IntCounterVec,
-    mcp_tool_failures_total: IntCounterVec,
-    mcp_server_calls_total: IntCounterVec,
-    mcp_server_failures_total: IntCounterVec,
-    mcp_events_total: IntCounterVec,
-    skill_events_total: IntCounterVec,
-    active_sessions: IntGauge,
-    weekly_tokens_used: IntGauge,
-    weekly_tokens_remaining: IntGauge,
-    weekly_token_budget: IntGaugeVec,
-    projected_exhaustion_seconds: IntGauge,
-    history_sessions: IntGaugeVec,
-    history_estimated_spend_dollars: GaugeVec,
-    history_estimated_spend_dollars_by_model: GaugeVec,
-    history_avg_estimated_session_cost_dollars: GaugeVec,
-    history_estimated_cache_waste_dollars: GaugeVec,
-    history_cache_hit_ratio: GaugeVec,
-    history_cache_events: IntGaugeVec,
-    history_degraded_sessions: IntGaugeVec,
-    history_degraded_session_ratio: GaugeVec,
-    history_degraded_causes: IntGaugeVec,
-    history_model_fallbacks: IntGaugeVec,
-    history_tool_failures: IntGaugeVec,
-    history_refresh_timestamp_seconds: IntGauge,
     turn_duration_seconds: HistogramVec,
     context_fill_percent: HistogramVec,
-    estimated_session_cost_dollars: HistogramVec,
-    session_turns: Histogram,
 }
 
 impl CoditorMetrics {
@@ -143,44 +94,10 @@ impl CoditorMetrics {
                 &["provider", "model", "kind"]
             )
             .expect("register coditor_tokens_total"),
-            estimated_cost_dollars_total: register_counter_vec!(
-                opts!(
-                    "coditor_estimated_cost_dollars_total",
-                    "Total estimated cost in USD from the active pricing catalog."
-                ),
-                &["model"]
-            )
-            .expect("register coditor_estimated_cost_dollars_total"),
-            cache_events_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_cache_events_total",
-                    "Session-scoped cache events emitted for tracked sessions."
-                ),
-                &["model", "event_type"]
-            )
-            .expect("register coditor_cache_events_total"),
-            estimated_cache_waste_dollars_total: register_counter_vec!(
-                opts!(
-                    "coditor_estimated_cache_waste_dollars_total",
-                    "Estimated avoidable cache rebuild waste in USD from the active pricing catalog."
-                ),
-                &["model"]
-            )
-            .expect("register coditor_estimated_cache_waste_dollars_total"),
-            sessions_total: register_int_counter_vec!(
-                opts!("coditor_sessions_total", "Sessions finalized by outcome."),
-                &["outcome"]
-            )
-            .expect("register coditor_sessions_total"),
-            degraded_sessions_total: register_int_counter!(opts!(
-                "coditor_degraded_sessions_total",
-                "Sessions whose diagnosis reported at least one degradation cause."
-            ))
-            .expect("register coditor_degraded_sessions_total"),
             sessions_degraded_total: register_int_counter_vec!(
                 opts!(
                     "coditor_sessions_degraded_total",
-                    "Degraded sessions by cause type."
+                    "Envoy-derived Codex degraded sessions by bounded cause type."
                 ),
                 &["cause_type"]
             )
@@ -196,187 +113,23 @@ impl CoditorMetrics {
             model_fallback_total: register_int_counter_vec!(
                 opts!(
                     "coditor_model_fallback_total",
-                    "Silent model fallback events."
+                    "Envoy-observed requested model versus served model mismatches."
                 ),
                 &["requested", "actual"]
             )
             .expect("register coditor_model_fallback_total"),
-            compaction_suspected_total: register_int_counter!(opts!(
-                "coditor_compaction_suspected_total",
-                "Compaction suspicion signals emitted by heuristics or explicit events."
-            ))
-            .expect("register coditor_compaction_suspected_total"),
             tool_calls_total: register_int_counter_vec!(
                 opts!(
                     "coditor_tool_calls_total",
-                    "Tool calls observed in assistant responses."
+                    "Custom tool-call intent observed in Envoy-proxied assistant responses."
                 ),
                 &["tool"]
             )
             .expect("register coditor_tool_calls_total"),
-            tool_failures_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_tool_failures_total",
-                    "Tool failures observed from tool_result blocks."
-                ),
-                &["tool"]
-            )
-            .expect("register coditor_tool_failures_total"),
-            mcp_tool_calls_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_mcp_tool_calls_total",
-                    "MCP tool calls observed in assistant responses, split by MCP server and tool."
-                ),
-                &["server", "tool"]
-            )
-            .expect("register coditor_mcp_tool_calls_total"),
-            mcp_tool_failures_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_mcp_tool_failures_total",
-                    "MCP tool failures observed from tool_result blocks, split by MCP server and tool."
-                ),
-                &["server", "tool"]
-            )
-            .expect("register coditor_mcp_tool_failures_total"),
-            mcp_server_calls_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_mcp_server_calls_total",
-                    "MCP tool calls observed in assistant responses, split by MCP server."
-                ),
-                &["server"]
-            )
-            .expect("register coditor_mcp_server_calls_total"),
-            mcp_server_failures_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_mcp_server_failures_total",
-                    "MCP tool failures observed from tool_result blocks, split by MCP server."
-                ),
-                &["server"]
-            )
-            .expect("register coditor_mcp_server_failures_total"),
-            mcp_events_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_mcp_events_total",
-                    "MCP lifecycle events observed by source."
-                ),
-                &["server", "tool", "event_type", "source"]
-            )
-            .expect("register coditor_mcp_events_total"),
-            skill_events_total: register_int_counter_vec!(
-                opts!(
-                    "coditor_skill_events_total",
-                    "Skill lifecycle events observed or inferred by coditor."
-                ),
-                &["skill", "event_type", "source"]
-            )
-            .expect("register coditor_skill_events_total"),
-            active_sessions: register_int_gauge!(
-                "coditor_active_sessions",
-                "Tracked active sessions currently in memory."
-            )
-            .expect("register coditor_active_sessions"),
-            weekly_tokens_used: register_int_gauge!(
-                "coditor_weekly_tokens_used",
-                "Tokens used since Monday 00:00 UTC."
-            )
-            .expect("register coditor_weekly_tokens_used"),
-            weekly_tokens_remaining: register_int_gauge!(
-                "coditor_weekly_tokens_remaining",
-                "Remaining weekly tokens under the active or suggested budget."
-            )
-            .expect("register coditor_weekly_tokens_remaining"),
-            weekly_token_budget: register_int_gauge_vec!(
-                "coditor_weekly_token_budget",
-                "Weekly token budget, labeled by source.",
-                &["source"]
-            )
-            .expect("register coditor_weekly_token_budget"),
-            projected_exhaustion_seconds: register_int_gauge!(
-                "coditor_projected_exhaustion_seconds",
-                "Projected seconds until the weekly token budget is exhausted."
-            )
-            .expect("register coditor_projected_exhaustion_seconds"),
-            history_sessions: register_int_gauge_vec!(
-                "coditor_history_sessions",
-                "Historical finalized session counts by rolling window.",
-                &["window"]
-            )
-            .expect("register coditor_history_sessions"),
-            history_estimated_spend_dollars: register_gauge_vec!(
-                "coditor_history_estimated_spend_dollars",
-                "Historical estimated cost in USD by rolling window.",
-                &["window"]
-            )
-            .expect("register coditor_history_estimated_spend_dollars"),
-            history_estimated_spend_dollars_by_model: register_gauge_vec!(
-                "coditor_history_estimated_spend_dollars_by_model",
-                "Historical estimated cost in USD by rolling window and model family.",
-                &["window", "model"]
-            )
-            .expect("register coditor_history_estimated_spend_dollars_by_model"),
-            history_avg_estimated_session_cost_dollars: register_gauge_vec!(
-                "coditor_history_avg_estimated_session_cost_dollars",
-                "Historical average estimated session cost in USD by rolling window and model family.",
-                &["window", "model"]
-            )
-            .expect("register coditor_history_avg_estimated_session_cost_dollars"),
-            history_estimated_cache_waste_dollars: register_gauge_vec!(
-                "coditor_history_estimated_cache_waste_dollars",
-                "Historical estimated cache rebuild waste in USD by rolling window and model family.",
-                &["window", "model"]
-            )
-            .expect("register coditor_history_estimated_cache_waste_dollars"),
-            history_cache_hit_ratio: register_gauge_vec!(
-                "coditor_history_cache_hit_ratio",
-                "Historical token-weighted cache reuse share by rolling window.",
-                &["window"]
-            )
-            .expect("register coditor_history_cache_hit_ratio"),
-            history_cache_events: register_int_gauge_vec!(
-                "coditor_history_cache_events",
-                "Historical cache event counts by rolling window and cache event type.",
-                &["window", "event_type"]
-            )
-            .expect("register coditor_history_cache_events"),
-            history_degraded_sessions: register_int_gauge_vec!(
-                "coditor_history_degraded_sessions",
-                "Historical degraded session counts by rolling window.",
-                &["window"]
-            )
-            .expect("register coditor_history_degraded_sessions"),
-            history_degraded_session_ratio: register_gauge_vec!(
-                "coditor_history_degraded_session_ratio",
-                "Historical degraded session ratio by rolling window.",
-                &["window"]
-            )
-            .expect("register coditor_history_degraded_session_ratio"),
-            history_degraded_causes: register_int_gauge_vec!(
-                "coditor_history_degraded_causes",
-                "Historical degraded cause counts by rolling window.",
-                &["window", "cause_type"]
-            )
-            .expect("register coditor_history_degraded_causes"),
-            history_model_fallbacks: register_int_gauge_vec!(
-                "coditor_history_model_fallbacks",
-                "Historical silent model fallback counts by rolling window.",
-                &["window", "requested", "actual"]
-            )
-            .expect("register coditor_history_model_fallbacks"),
-            history_tool_failures: register_int_gauge_vec!(
-                "coditor_history_tool_failures",
-                "Historical tool failure counts by rolling window and tool.",
-                &["window", "tool"]
-            )
-            .expect("register coditor_history_tool_failures"),
-            history_refresh_timestamp_seconds: register_int_gauge!(
-                "coditor_history_refresh_timestamp_seconds",
-                "Unix timestamp of the last successful historical gauge refresh."
-            )
-            .expect("register coditor_history_refresh_timestamp_seconds"),
             turn_duration_seconds: register_histogram_vec!(
                 histogram_opts!(
                     "coditor_turn_duration_seconds",
-                    "Observed turn durations in seconds.",
+                    "Envoy-observed Codex turn durations in seconds.",
                     turn_duration_buckets
                 ),
                 &["model"]
@@ -391,28 +144,11 @@ impl CoditorMetrics {
                 &["provider", "model"]
             )
             .expect("register coditor_context_fill_percent"),
-            estimated_session_cost_dollars: register_histogram_vec!(
-                histogram_opts!(
-                    "coditor_estimated_session_cost_dollars",
-                    "Estimated session costs in USD from the active pricing catalog.",
-                    vec![0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0]
-                ),
-                &["model"]
-            )
-            .expect("register coditor_estimated_session_cost_dollars"),
-            session_turns: register_histogram!(histogram_opts!(
-                "coditor_session_turns",
-                "Observed number of turns per session.",
-                vec![1.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]
-            ))
-            .expect("register coditor_session_turns"),
         }
     }
 }
 
 static METRICS: LazyLock<CoditorMetrics> = LazyLock::new(CoditorMetrics::register);
-static HISTORY_TOOL_LABELS: LazyLock<Mutex<BTreeSet<String>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
 pub fn init() {
     let metrics = LazyLock::force(&METRICS);
@@ -427,16 +163,7 @@ pub fn init() {
         }
     }
     for model in LIVE_MODELS {
-        metrics
-            .estimated_cost_dollars_total
-            .with_label_values(&[model]);
-        metrics
-            .estimated_cache_waste_dollars_total
-            .with_label_values(&[model]);
         metrics.turn_duration_seconds.with_label_values(&[model]);
-        metrics
-            .estimated_session_cost_dollars
-            .with_label_values(&[model]);
         for provider in LIVE_CONTEXT_PROVIDERS {
             metrics
                 .context_fill_percent
@@ -447,25 +174,9 @@ pub fn init() {
                 .model_fallback_total
                 .with_label_values(&[model, actual]);
         }
-        for event_type in LIVE_CACHE_EVENT_TYPES {
-            metrics
-                .cache_events_total
-                .with_label_values(&[model, event_type]);
-        }
     }
 
     ensure_tool_metric_labels("unknown");
-    ensure_mcp_metric_labels_for_parts("unknown", "unknown");
-    for event_type in LIVE_MCP_EVENT_TYPES {
-        for source in LIVE_MCP_EVENT_SOURCES {
-            ensure_mcp_event_metric_labels("unknown", "unknown", event_type, source);
-        }
-    }
-    for event_type in LIVE_SKILL_EVENT_TYPES {
-        for source in LIVE_SKILL_EVENT_SOURCES {
-            ensure_skill_metric_labels("unknown", event_type, source);
-        }
-    }
     for cause_type in HISTORY_CAUSE_TYPES {
         metrics
             .sessions_degraded_total
@@ -481,47 +192,6 @@ pub fn init() {
                 .with_label_values(&[status, model]);
         }
     }
-}
-
-pub fn record_request(
-    model: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-    cache_read_tokens: u64,
-    cache_create_tokens: u64,
-    estimated_cost_dollars: f64,
-    duration_seconds: f64,
-) {
-    let model = normalize_model(model);
-    let provider = "legacy_anthropic";
-    METRICS
-        .requests_total
-        .with_label_values(&[provider, model])
-        .inc();
-    METRICS
-        .tokens_total
-        .with_label_values(&[provider, model, "input"])
-        .inc_by(input_tokens);
-    METRICS
-        .tokens_total
-        .with_label_values(&[provider, model, "output"])
-        .inc_by(output_tokens);
-    METRICS
-        .tokens_total
-        .with_label_values(&[provider, model, "cache_read"])
-        .inc_by(cache_read_tokens);
-    METRICS
-        .tokens_total
-        .with_label_values(&[provider, model, "cache_create"])
-        .inc_by(cache_create_tokens);
-    METRICS
-        .estimated_cost_dollars_total
-        .with_label_values(&[model])
-        .inc_by(estimated_cost_dollars.max(0.0));
-    METRICS
-        .turn_duration_seconds
-        .with_label_values(&[model])
-        .observe(duration_seconds.max(0.0));
 }
 
 pub fn record_codex_turn(
@@ -565,10 +235,7 @@ pub fn record_codex_turn(
         .tokens_total
         .with_label_values(&[provider, model, "total"])
         .inc_by(total_tokens);
-    METRICS
-        .estimated_cost_dollars_total
-        .with_label_values(&[model])
-        .inc_by(estimated_cost_dollars.max(0.0));
+    let _ = estimated_cost_dollars;
     METRICS
         .turn_duration_seconds
         .with_label_values(&[model])
@@ -585,44 +252,6 @@ pub fn record_codex_response_status(status: &str, model: &str) {
         .inc();
 }
 
-pub fn record_cache_event(model: &str, event_type: &str, estimated_waste_dollars: Option<f64>) {
-    let model = normalize_model(model);
-    let event_type = normalize_cache_event(event_type);
-    METRICS
-        .cache_events_total
-        .with_label_values(&[model, event_type])
-        .inc();
-    if matches!(event_type, "miss_ttl" | "miss_thrash") {
-        if let Some(cost) = estimated_waste_dollars {
-            METRICS
-                .estimated_cache_waste_dollars_total
-                .with_label_values(&[model])
-                .inc_by(cost.max(0.0));
-        }
-    }
-}
-
-pub fn record_session_end(
-    outcome: &str,
-    model: Option<&str>,
-    estimated_total_cost_dollars: f64,
-    total_turns: u32,
-) {
-    METRICS
-        .sessions_total
-        .with_label_values(&[normalize_outcome(outcome)])
-        .inc();
-    METRICS
-        .estimated_session_cost_dollars
-        .with_label_values(&[normalize_model(model.unwrap_or("other"))])
-        .observe(estimated_total_cost_dollars.max(0.0));
-    METRICS.session_turns.observe(total_turns as f64);
-}
-
-pub fn record_degraded_session() {
-    METRICS.degraded_sessions_total.inc();
-}
-
 pub fn record_degraded_cause(cause_type: &str) {
     METRICS
         .sessions_degraded_total
@@ -635,16 +264,6 @@ pub fn record_model_fallback(requested: &str, actual: &str) {
         .model_fallback_total
         .with_label_values(&[normalize_model(requested), normalize_model(actual)])
         .inc();
-}
-
-pub fn record_compaction_suspected() {
-    METRICS.compaction_suspected_total.inc();
-}
-
-pub fn record_context_status(turns_to_compact: Option<u32>) {
-    if turns_to_compact == Some(0) {
-        METRICS.compaction_suspected_total.inc();
-    }
 }
 
 pub fn record_context_fill_percent(provider: &str, model: &str, fill_percent: f64) {
@@ -660,288 +279,15 @@ pub fn record_tool_call(tool_name: &str) {
         .tool_calls_total
         .with_label_values(&[tool.as_str()])
         .inc();
-    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
-        METRICS
-            .mcp_tool_calls_total
-            .with_label_values(&[server.as_str(), mcp_tool.as_str()])
-            .inc();
-        METRICS
-            .mcp_server_calls_total
-            .with_label_values(&[server.as_str()])
-            .inc();
-        record_mcp_event_parts(&server, &mcp_tool, "called", "proxy");
-    }
-}
-
-pub fn record_tool_failures(tool_name: &str, failures: u64) {
-    if failures == 0 {
-        return;
-    }
-    let tool = normalize_tool(tool_name);
-    METRICS
-        .tool_failures_total
-        .with_label_values(&[tool.as_str()])
-        .inc_by(failures);
-    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
-        METRICS
-            .mcp_tool_failures_total
-            .with_label_values(&[server.as_str(), mcp_tool.as_str()])
-            .inc_by(failures);
-        METRICS
-            .mcp_server_failures_total
-            .with_label_values(&[server.as_str()])
-            .inc_by(failures);
-        record_mcp_event_parts_by(&server, &mcp_tool, "failed", "proxy", failures);
-    }
 }
 
 pub fn ensure_tool_metric_labels(tool_name: &str) {
     let tool = normalize_tool(tool_name);
     METRICS.tool_calls_total.with_label_values(&[tool.as_str()]);
-    METRICS
-        .tool_failures_total
-        .with_label_values(&[tool.as_str()]);
-    if let Some((server, mcp_tool)) = mcp_tool_labels(tool_name) {
-        ensure_mcp_metric_labels_for_parts(&server, &mcp_tool);
-    }
-}
-
-fn ensure_mcp_metric_labels_for_parts(server: &str, tool: &str) {
-    METRICS
-        .mcp_tool_calls_total
-        .with_label_values(&[server, tool]);
-    METRICS
-        .mcp_tool_failures_total
-        .with_label_values(&[server, tool]);
-    METRICS.mcp_server_calls_total.with_label_values(&[server]);
-    METRICS
-        .mcp_server_failures_total
-        .with_label_values(&[server]);
-}
-
-pub fn record_mcp_event(server: &str, tool: &str, event_type: &str, source: &str) {
-    let server = normalize_tool(server);
-    let tool = normalize_tool(tool);
-    record_mcp_event_parts(&server, &tool, event_type, source);
-}
-
-fn record_mcp_event_parts(server: &str, tool: &str, event_type: &str, source: &str) {
-    record_mcp_event_parts_by(server, tool, event_type, source, 1);
-}
-
-fn record_mcp_event_parts_by(server: &str, tool: &str, event_type: &str, source: &str, count: u64) {
-    if count == 0 {
-        return;
-    }
-    let event_type = normalize_mcp_event_type(event_type);
-    let source = normalize_mcp_event_source(source);
-    METRICS
-        .mcp_events_total
-        .with_label_values(&[server, tool, event_type, source])
-        .inc_by(count);
-}
-
-pub fn record_skill_event(skill_name: &str, event_type: &str, source: &str) {
-    let skill = normalize_tool(skill_name);
-    let event_type = normalize_skill_event_type(event_type);
-    let source = normalize_skill_event_source(source);
-    METRICS
-        .skill_events_total
-        .with_label_values(&[skill.as_str(), event_type, source])
-        .inc();
-}
-
-pub fn ensure_skill_metric_labels(skill_name: &str, event_type: &str, source: &str) {
-    let skill = normalize_tool(skill_name);
-    let event_type = normalize_skill_event_type(event_type);
-    let source = normalize_skill_event_source(source);
-    METRICS
-        .skill_events_total
-        .with_label_values(&[skill.as_str(), event_type, source]);
-}
-
-pub fn ensure_mcp_event_metric_labels(server: &str, tool: &str, event_type: &str, source: &str) {
-    let server = normalize_tool(server);
-    let tool = normalize_tool(tool);
-    let event_type = normalize_mcp_event_type(event_type);
-    let source = normalize_mcp_event_source(source);
-    METRICS.mcp_events_total.with_label_values(&[
-        server.as_str(),
-        tool.as_str(),
-        event_type,
-        source,
-    ]);
-}
-
-pub fn set_active_sessions(count: usize) {
-    METRICS.active_sessions.set(count as i64);
-}
-
-pub fn update_weekly_budget_gauges(
-    used_this_week: u64,
-    remaining: Option<u64>,
-    budget: Option<u64>,
-    source: Option<&str>,
-    projected_exhaustion_secs: Option<u64>,
-) {
-    METRICS.weekly_tokens_used.set(used_this_week as i64);
-    METRICS
-        .weekly_tokens_remaining
-        .set(remaining.map(|n| n as i64).unwrap_or(-1));
-    METRICS
-        .projected_exhaustion_seconds
-        .set(projected_exhaustion_secs.map(|n| n as i64).unwrap_or(-1));
-
-    let _ = METRICS.weekly_token_budget.remove_label_values(&["env"]);
-    let _ = METRICS
-        .weekly_token_budget
-        .remove_label_values(&["auto_p95_4w"]);
-    if let (Some(budget), Some(source)) = (budget, source) {
-        METRICS
-            .weekly_token_budget
-            .with_label_values(&[source])
-            .set(budget as i64);
-    }
 }
 
 pub fn update_historical_gauges(windows: &[HistoricalWindowMetrics], refreshed_at_epoch: u64) {
-    for (window, _) in HISTORY_WINDOWS {
-        METRICS.history_sessions.with_label_values(&[window]).set(0);
-        METRICS
-            .history_estimated_spend_dollars
-            .with_label_values(&[window])
-            .set(0.0);
-        for model in HISTORY_MODELS {
-            METRICS
-                .history_estimated_spend_dollars_by_model
-                .with_label_values(&[window, model])
-                .set(0.0);
-            METRICS
-                .history_avg_estimated_session_cost_dollars
-                .with_label_values(&[window, model])
-                .set(0.0);
-            METRICS
-                .history_estimated_cache_waste_dollars
-                .with_label_values(&[window, model])
-                .set(0.0);
-            for actual in HISTORY_MODELS {
-                METRICS
-                    .history_model_fallbacks
-                    .with_label_values(&[window, model, actual])
-                    .set(0);
-            }
-        }
-        METRICS
-            .history_cache_hit_ratio
-            .with_label_values(&[window])
-            .set(0.0);
-        for event_type in HISTORY_CACHE_EVENT_TYPES {
-            METRICS
-                .history_cache_events
-                .with_label_values(&[window, event_type])
-                .set(0);
-        }
-        METRICS
-            .history_degraded_sessions
-            .with_label_values(&[window])
-            .set(0);
-        METRICS
-            .history_degraded_session_ratio
-            .with_label_values(&[window])
-            .set(0.0);
-        for cause_type in HISTORY_CAUSE_TYPES {
-            METRICS
-                .history_degraded_causes
-                .with_label_values(&[window, cause_type])
-                .set(0);
-        }
-    }
-
-    let mut known_tools = HISTORY_TOOL_LABELS.lock().unwrap();
-    for window_metrics in windows {
-        for tool in window_metrics.tool_failures_by_tool.keys() {
-            known_tools.insert(tool.clone());
-        }
-    }
-    for window in HISTORY_WINDOWS.map(|(window, _)| window) {
-        for tool in known_tools.iter() {
-            METRICS
-                .history_tool_failures
-                .with_label_values(&[window, tool.as_str()])
-                .set(0);
-        }
-    }
-
-    for window_metrics in windows {
-        METRICS
-            .history_sessions
-            .with_label_values(&[window_metrics.window])
-            .set(window_metrics.sessions as i64);
-        METRICS
-            .history_estimated_spend_dollars
-            .with_label_values(&[window_metrics.window])
-            .set(window_metrics.estimated_spend_dollars.max(0.0));
-        for (model, spend) in &window_metrics.estimated_spend_dollars_by_model {
-            METRICS
-                .history_estimated_spend_dollars_by_model
-                .with_label_values(&[window_metrics.window, model])
-                .set(spend.max(0.0));
-        }
-        for (model, avg_cost) in &window_metrics.avg_estimated_session_cost_dollars_by_model {
-            METRICS
-                .history_avg_estimated_session_cost_dollars
-                .with_label_values(&[window_metrics.window, model])
-                .set(avg_cost.max(0.0));
-        }
-        for (model, waste) in &window_metrics.estimated_cache_waste_dollars_by_model {
-            METRICS
-                .history_estimated_cache_waste_dollars
-                .with_label_values(&[window_metrics.window, model])
-                .set(waste.max(0.0));
-        }
-        METRICS
-            .history_cache_hit_ratio
-            .with_label_values(&[window_metrics.window])
-            .set(window_metrics.cache_hit_ratio.clamp(0.0, 1.0));
-        for (event_type, count) in &window_metrics.cache_events {
-            METRICS
-                .history_cache_events
-                .with_label_values(&[window_metrics.window, event_type])
-                .set(*count as i64);
-        }
-        METRICS
-            .history_degraded_sessions
-            .with_label_values(&[window_metrics.window])
-            .set(window_metrics.degraded_sessions as i64);
-        METRICS
-            .history_degraded_session_ratio
-            .with_label_values(&[window_metrics.window])
-            .set(window_metrics.degraded_session_ratio.clamp(0.0, 1.0));
-
-        for (cause_type, count) in &window_metrics.degraded_causes {
-            METRICS
-                .history_degraded_causes
-                .with_label_values(&[window_metrics.window, cause_type])
-                .set(*count as i64);
-        }
-        for ((requested, actual), count) in &window_metrics.model_fallbacks {
-            METRICS
-                .history_model_fallbacks
-                .with_label_values(&[window_metrics.window, requested, actual])
-                .set(*count as i64);
-        }
-        for (tool, count) in &window_metrics.tool_failures_by_tool {
-            METRICS
-                .history_tool_failures
-                .with_label_values(&[window_metrics.window, tool.as_str()])
-                .set(*count as i64);
-        }
-    }
-    drop(known_tools);
-
-    METRICS
-        .history_refresh_timestamp_seconds
-        .set(refreshed_at_epoch as i64);
+    let _ = (windows, refreshed_at_epoch);
 }
 
 pub fn render() -> Result<(String, String), String> {
@@ -971,12 +317,6 @@ fn normalize_model(model: &str) -> &'static str {
         "o4-mini"
     } else if lower.starts_with("o3") {
         "o3"
-    } else if lower.contains("claude")
-        || lower.contains("opus")
-        || lower.contains("sonnet")
-        || lower.contains("haiku")
-    {
-        "legacy_claude"
     } else {
         "other"
     }
@@ -986,36 +326,6 @@ fn normalize_context_provider(provider: &str) -> &'static str {
     match provider {
         "codex_responses" => "codex_responses",
         _ => "unknown",
-    }
-}
-
-fn normalize_cache_event(event_type: &str) -> &'static str {
-    match event_type {
-        "hit" => "hit",
-        "partial" => "partial",
-        "cold_start" => "cold_start",
-        "miss_ttl" => "miss_ttl",
-        "miss_thrash" => "miss_thrash",
-        _ => "other",
-    }
-}
-
-fn normalize_outcome(outcome: &str) -> &'static str {
-    let lower = outcome.to_ascii_lowercase();
-    if lower.contains("budget") {
-        "budget_exceeded"
-    } else if lower.contains("compaction") {
-        "compaction_suspected"
-    } else if lower.contains("partially") {
-        "partially_completed"
-    } else if lower.contains("completed") {
-        "completed"
-    } else if lower.contains("abandoned") {
-        "abandoned"
-    } else if lower.contains("timeout") {
-        "timeout"
-    } else {
-        "other"
     }
 }
 
@@ -1035,44 +345,6 @@ fn normalize_cause(cause_type: &str) -> &str {
         cause_type
     } else {
         "unknown"
-    }
-}
-
-fn normalize_skill_event_type(event_type: &str) -> &'static str {
-    match event_type {
-        "expected" => "expected",
-        "fired" => "fired",
-        "missed" => "missed",
-        "misfired" => "misfired",
-        "failed" => "failed",
-        _ => "other",
-    }
-}
-
-fn normalize_skill_event_source(source: &str) -> &'static str {
-    match source {
-        "hook" => "hook",
-        "proxy" => "proxy",
-        "heuristic" => "heuristic",
-        _ => "other",
-    }
-}
-
-fn normalize_mcp_event_type(event_type: &str) -> &'static str {
-    match event_type {
-        "called" => "called",
-        "succeeded" => "succeeded",
-        "failed" => "failed",
-        "denied" => "denied",
-        _ => "other",
-    }
-}
-
-fn normalize_mcp_event_source(source: &str) -> &'static str {
-    match source {
-        "hook" => "hook",
-        "proxy" => "proxy",
-        _ => "other",
     }
 }
 
@@ -1122,46 +394,12 @@ fn normalize_tool(tool_name: &str) -> String {
     }
 }
 
-pub fn mcp_tool_labels(tool_name: &str) -> Option<(String, String)> {
-    let rest = tool_name.trim().strip_prefix("mcp__")?;
-    let (server, tool) = rest.split_once("__")?;
-    if server.trim().is_empty() || tool.trim().is_empty() {
-        return None;
-    }
-
-    Some((normalize_tool(server), normalize_tool(tool)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        init, mcp_tool_labels, record_codex_response_status, record_codex_turn,
-        record_context_fill_percent, record_degraded_cause, render,
+        init, record_codex_response_status, record_codex_turn, record_context_fill_percent,
+        record_degraded_cause, render,
     };
-
-    #[test]
-    fn parses_mcp_tool_labels() {
-        assert_eq!(
-            mcp_tool_labels("mcp__github__get_issue"),
-            Some(("github".to_string(), "get_issue".to_string()))
-        );
-        assert_eq!(
-            mcp_tool_labels(" mcp__Git Hub__Get Issue "),
-            Some(("git_hub".to_string(), "get_issue".to_string()))
-        );
-        assert_eq!(
-            mcp_tool_labels("mcp__server__tool__with_suffix"),
-            Some(("server".to_string(), "tool__with_suffix".to_string()))
-        );
-    }
-
-    #[test]
-    fn rejects_non_mcp_tool_labels() {
-        assert_eq!(mcp_tool_labels("Bash"), None);
-        assert_eq!(mcp_tool_labels("mcp__github"), None);
-        assert_eq!(mcp_tool_labels("mcp____get_issue"), None);
-        assert_eq!(mcp_tool_labels("mcp__github__"), None);
-    }
 
     #[test]
     fn codex_observability_metrics_are_bounded_and_initialized() {
@@ -1176,13 +414,6 @@ mod tests {
             "coditor_context_fill_percent_count{model=\"gpt-codex\",provider=\"codex_responses\"}"
         ));
         assert!(
-            body.lines().any(|line| {
-                line.starts_with("coditor_estimated_cost_dollars_total{model=\"gpt-5.5\"}")
-                    && !line.ends_with(" 0")
-            }),
-            "Codex estimated cost counter should track nonzero known-model estimates"
-        );
-        assert!(
             body.contains("coditor_sessions_degraded_total{cause_type=\"codex_response_failed\"}")
         );
         assert!(body.contains(
@@ -1192,5 +423,20 @@ mod tests {
         assert!(!body.contains("session-id-like-cause-phase-8b"));
         assert!(!body.contains("session_id="));
         assert!(!body.contains("coditor_session_id="));
+        for (prefix, suffix) in [
+            ("coditor_", "estimated_cost_dollars_total"),
+            ("coditor_", "tool_failures_total"),
+            ("coditor_", "mcp_"),
+            ("coditor_", "skill_events_total"),
+            ("coditor_", "active_sessions"),
+            ("coditor_", "weekly_tokens"),
+            ("coditor_", "history_"),
+        ] {
+            let dropped_metric = format!("{prefix}{suffix}");
+            assert!(
+                !body.contains(&dropped_metric),
+                "non-Envoy Codex metric family remained exposed: {dropped_metric}"
+            );
+        }
     }
 }

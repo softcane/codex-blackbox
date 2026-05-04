@@ -32,7 +32,9 @@ Suggested options:
 - `--mode real`: run real Codex through the ChatGPT/Codex subscription proxy path.
 - `--sessions N`: number of Codex sessions to launch.
 - `--repos same|mixed`: run all sessions in one repo or across multiple repos.
-- `--include-mcp`: include MCP-oriented prompts when MCP is configured.
+- `--include-mcp`: include MCP-oriented prompts as workload only when MCP is
+  configured; lifecycle telemetry remains outside the Codex correctness
+  surface.
 - `--keep-stack`: leave Docker Compose running after the test.
 - `--report-dir <path>`: write report artifacts to a chosen directory.
 
@@ -172,14 +174,13 @@ smoke can be run through the same harness:
 Record future smoke outcomes in `docs/real-codex-smoke.md` with the date, Codex
 version, command/config, observed events, rollback command, and limitations.
 
-### Tool And MCP Assertions
+### Envoy Tool Intent Assertions
 
-Tool telemetry should verify:
+Tool checks are limited to facts present in Envoy-observed Responses traffic:
 
-- read/search/local command prompts produce tool events when Codex exposes them
-- failed tools are marked as failures
-- MCP prompts produce MCP events when MCP servers are configured
-- missing MCP configuration is reported as skipped, not failed
+- custom tool-call intent is reported when the Responses stream contains it
+- local command results and tool failures are not reported as Codex truth
+- MCP lifecycle events are skipped unless a future Responses field proves them
 
 ## Report Format
 
@@ -208,9 +209,9 @@ The goal is not just pass/fail. The report should say exactly what is left, for 
 {
   "status": "partial",
   "passed": ["watch_session_start", "context_status", "prometheus_no_session_labels"],
-  "missing": ["codex_sqlite_persistence", "mcp_event_correlation"],
+  "missing": ["codex_sqlite_persistence", "codex_turn_summary"],
   "failed": ["grafana_panel_metric_missing"],
-  "skipped": ["mcp_prompts_no_servers_configured"]
+  "skipped": ["non_envoy_lifecycle_telemetry"]
 }
 ```
 
@@ -229,10 +230,10 @@ Start real multi-session dogfood testing only after these are true:
 Those minimum gates were satisfied before the first live run recorded in
 `docs/real-codex-smoke.md`.
 
-For the full version that checks tools, MCP, diagnosis, Prometheus, and Grafana, also complete:
+For the full version that checks Envoy-derived response facts, diagnosis,
+Prometheus, and Grafana, also complete:
 
 - Phase 6C: watch/tmux Codex rendering polish.
-- Phase 7: Codex hook/tool/MCP telemetry.
 - Phase 8: diagnostics, observability validation, rate-limit boundary, and
   context intelligence.
 
@@ -254,7 +255,7 @@ That can start after Phase 6B, but it should be labeled `smoke`, not full dogfoo
 The full automated feedback harness is ready when it can run:
 
 ```sh
-./test/dogfood-codex-sessions.sh --sessions 4 --repos mixed --include-mcp --mode real
+./test/dogfood-codex-sessions.sh --sessions 4 --repos mixed --mode real --no-json
 ```
 
 and produce a report that answers:

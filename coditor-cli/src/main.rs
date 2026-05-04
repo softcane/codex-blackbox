@@ -2130,26 +2130,17 @@ fn is_codex_model_name(model: &str) -> bool {
         || lower.starts_with("o4")
 }
 
-fn is_legacy_model_name(model: &str) -> bool {
-    model.to_ascii_lowercase().starts_with("claude-")
-}
-
 fn watch_model_label(model: &str) -> String {
     if is_codex_model_name(model) {
         format!("CODEX \u{00b7} {model}")
-    } else if is_legacy_model_name(model) {
-        format!("LEGACY MODEL \u{00b7} {model}")
     } else {
         model.to_string()
     }
 }
 
 fn model_change_label(requested: &str, actual: &str) -> &'static str {
-    if is_legacy_model_name(requested) || is_legacy_model_name(actual) {
-        "LEGACY MODEL CHANGE"
-    } else {
-        "MODEL CHANGE"
-    }
+    let _ = (requested, actual);
+    "MODEL CHANGE"
 }
 
 fn model_change_line(time: &str, requested: &str, actual: &str) -> String {
@@ -3110,7 +3101,7 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(sid);
         let short_sid = truncate_for_box(label, 20);
         let model = s.get("model").and_then(|v| v.as_str()).unwrap_or("?");
-        let short_model = model.replace("claude-", "").replace("-20250514", "");
+        let short_model = model.to_string();
         let turns = s.get("total_turns").and_then(|v| v.as_i64()).unwrap_or(0);
         let outcome = s.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
         let cost = s
@@ -3234,7 +3225,7 @@ async fn fetch_recall(
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("?")
-            .replace("claude-", "");
+            .to_string();
         let outcome = hit.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
         let initial_prompt = hit
             .get("initial_prompt")
@@ -3464,8 +3455,8 @@ mod tests {
             "CODEX \u{00b7} gpt-codex-fixture"
         );
         assert_eq!(
-            watch_model_label("claude-sonnet-fixture"),
-            "LEGACY MODEL \u{00b7} claude-sonnet-fixture"
+            watch_model_label("unknown-model-fixture"),
+            "unknown-model-fixture"
         );
 
         let line = model_change_line("12:00:00", "gpt-codex", "gpt-codex-served");
@@ -3554,7 +3545,7 @@ mod tests {
 
     #[test]
     fn run_watch_after_child_command_is_coditor_flag() {
-        let cli = Cli::try_parse_from(["coditor", "run", "claude", "--watch"])
+        let cli = Cli::try_parse_from(["coditor", "run", "codex", "--watch"])
             .expect("run command parses");
         let Commands::Run {
             watch,
@@ -3567,12 +3558,12 @@ mod tests {
         assert!(!dry_run);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
-        assert_eq!(command, vec!["claude"]);
+        assert_eq!(command, vec!["codex"]);
     }
 
     #[test]
     fn run_watch_before_child_command_is_coditor_flag() {
-        let cli = Cli::try_parse_from(["coditor", "run", "--watch", "claude"])
+        let cli = Cli::try_parse_from(["coditor", "run", "--watch", "codex"])
             .expect("run command parses");
         let Commands::Run {
             watch,
@@ -3585,7 +3576,7 @@ mod tests {
         assert!(!dry_run);
         let (watch, command) = extract_run_watch(watch, command);
         assert!(watch);
-        assert_eq!(command, vec!["claude"]);
+        assert_eq!(command, vec!["codex"]);
     }
 
     #[test]
@@ -3593,10 +3584,10 @@ mod tests {
         let cli = Cli::try_parse_from([
             "coditor",
             "run",
-            "claude",
+            "codex",
             "--dangerously-skip-permissions",
             "--model",
-            "opus",
+            "gpt-5.5",
         ])
         .expect("run command parses");
         let Commands::Run {
@@ -3613,10 +3604,10 @@ mod tests {
         assert_eq!(
             command,
             vec![
-                "claude",
+                "codex",
                 "--dangerously-skip-permissions",
                 "--model",
-                "opus"
+                "gpt-5.5"
             ]
         );
     }
@@ -3952,12 +3943,12 @@ coditor_requests_total{model="legacy_model",provider="legacy_provider"} 99
             ": keepalive\n\n".to_string(),
             concat!(
                 "data: {\"type\":\"session_start\",\"session_id\":\"session_other\",",
-                "\"display_name\":\"other\",\"model\":\"opus\"}\n\n"
+                "\"display_name\":\"other\",\"model\":\"gpt-5.5\"}\n\n"
             )
             .to_string(),
             concat!(
                 "data: {\"type\":\"session_start\",\"session_id\":\"session_target\",",
-                "\"display_name\":\"api\",\"model\":\"sonnet\",",
+                "\"display_name\":\"api\",\"model\":\"gpt-5.4\",",
                 "\"initial_prompt\":\"investigate auth\"}\n\n"
             )
             .to_string(),
