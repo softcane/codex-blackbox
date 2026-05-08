@@ -2142,41 +2142,46 @@ fn context_status_line(
     )
 }
 
-fn codex_turn_summary_line(
-    time: &str,
-    status: &str,
-    requested_model: &str,
-    served_model: Option<&str>,
+struct CodexTurnSummaryLine<'a> {
+    time: &'a str,
+    status: &'a str,
+    requested_model: &'a str,
+    served_model: Option<&'a str>,
     input_tokens: u64,
     cached_input_tokens: u64,
     uncached_input_tokens: u64,
     output_tokens: u64,
     reasoning_output_tokens: u64,
     total_tokens: u64,
-) -> String {
-    let model_part = match served_model {
-        Some(served) if served != requested_model => {
-            format!("requested {}, served {}", requested_model, served)
+}
+
+fn codex_turn_summary_line(summary: CodexTurnSummaryLine<'_>) -> String {
+    let model_part = match summary.served_model {
+        Some(served) if served != summary.requested_model => {
+            format!("requested {}, served {}", summary.requested_model, served)
         }
         Some(served) => format!("served {}", served),
-        None => format!("requested {}", requested_model),
+        None => format!("requested {}", summary.requested_model),
     };
-    let reasoning_part = if reasoning_output_tokens > 0 {
-        format!(" + {} reasoning", format_tokens(reasoning_output_tokens))
+    let reasoning_part = if summary.reasoning_output_tokens > 0 {
+        format!(
+            " + {} reasoning",
+            format_tokens(summary.reasoning_output_tokens)
+        )
     } else {
         String::new()
     };
     format!(
         "{}  CODEX   {} \u{00b7} {} \u{00b7} input {} ({} cached, {} uncached) \u{00b7} output {}{} \u{00b7} total {}",
-        time,
-        status,
+        summary.time,
+        summary.status,
         model_part,
-        format_tokens(input_tokens),
-        format_tokens(cached_input_tokens),
-        format_tokens(uncached_input_tokens),
-        format_tokens(output_tokens),
+        format_tokens(summary.input_tokens),
+        format_tokens(summary.cached_input_tokens),
+        format_tokens(summary.uncached_input_tokens),
+        format_tokens(summary.output_tokens),
         reasoning_part,
-        format_tokens(total_tokens)
+        format_tokens(summary.total_tokens)
     )
 }
 
@@ -2376,18 +2381,18 @@ fn render_event(
             total_tokens,
         } => {
             let time = now_hms();
-            let line = codex_turn_summary_line(
-                &time,
+            let line = codex_turn_summary_line(CodexTurnSummaryLine {
+                time: &time,
                 status,
                 requested_model,
-                served_model.as_deref(),
-                *input_tokens,
-                *cached_input_tokens,
-                *uncached_input_tokens,
-                *output_tokens,
-                *reasoning_output_tokens,
-                *total_tokens,
-            );
+                served_model: served_model.as_deref(),
+                input_tokens: *input_tokens,
+                cached_input_tokens: *cached_input_tokens,
+                uncached_input_tokens: *uncached_input_tokens,
+                output_tokens: *output_tokens,
+                reasoning_output_tokens: *reasoning_output_tokens,
+                total_tokens: *total_tokens,
+            });
             let colored = match status.as_str() {
                 "completed" => line.green().to_string(),
                 "failed" => line.red().bold().to_string(),
@@ -3357,8 +3362,8 @@ mod tests {
         parse_codex_requests_total, parse_mcp_tool_name, push_unique, render_child_run_plan,
         render_codex_config_preview, shell_join, shell_quote, should_suppress_codex_stderr_line,
         tmux_orchestrator_watch_url, truncate_for_box, watch_model_label, yaml_quote,
-        ActiveSessions, ChildStdinMode, Cli, Commands, ConfigCommands, RunMode, WatchEvent,
-        WatchRetryLog,
+        ActiveSessions, ChildStdinMode, Cli, CodexTurnSummaryLine, Commands, ConfigCommands,
+        RunMode, WatchEvent, WatchRetryLog,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -3512,18 +3517,18 @@ mod tests {
         );
         assert!(!context.contains("cache"));
 
-        let summary = codex_turn_summary_line(
-            "12:00:00",
-            "completed",
-            "gpt-codex-fixture",
-            Some("gpt-codex-served"),
-            1_280,
-            512,
-            768,
-            96,
-            32,
-            1_376,
-        );
+        let summary = codex_turn_summary_line(CodexTurnSummaryLine {
+            time: "12:00:00",
+            status: "completed",
+            requested_model: "gpt-codex-fixture",
+            served_model: Some("gpt-codex-served"),
+            input_tokens: 1_280,
+            cached_input_tokens: 512,
+            uncached_input_tokens: 768,
+            output_tokens: 96,
+            reasoning_output_tokens: 32,
+            total_tokens: 1_376,
+        });
         assert!(summary.contains("CODEX   completed"));
         assert!(summary.contains("input 1K (512 cached, 768 uncached)"));
         assert!(summary.contains("output 96 + 32 reasoning"));

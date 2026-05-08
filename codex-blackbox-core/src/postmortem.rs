@@ -262,10 +262,8 @@ fn load_turn_evidence_from_snapshots(
          ORDER BY t.turn_number ASC, t.timestamp ASC",
     )?;
 
-    let turns = stmt
-        .query_map(rusqlite::params![session_id, PROVIDER], row_to_turn)?
-        .collect();
-    turns
+    let rows = stmt.query_map(rusqlite::params![session_id, PROVIDER], row_to_turn)?;
+    rows.collect()
 }
 
 fn load_turn_evidence_from_requests(

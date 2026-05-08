@@ -184,18 +184,20 @@ pub fn init() {
     }
 }
 
-pub fn record_codex_turn(
-    model: &str,
-    input_tokens: u64,
-    cached_input_tokens: u64,
-    uncached_input_tokens: u64,
-    output_tokens: u64,
-    reasoning_output_tokens: u64,
-    total_tokens: u64,
-    estimated_cost_dollars: f64,
-    duration_seconds: f64,
-) {
-    let model = normalize_model(model);
+pub struct CodexTurnMetric<'a> {
+    pub model: &'a str,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub uncached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_cost_dollars: f64,
+    pub duration_seconds: f64,
+}
+
+pub fn record_codex_turn(turn: CodexTurnMetric<'_>) {
+    let model = normalize_model(turn.model);
     let provider = "codex_responses";
     METRICS
         .requests_total
@@ -204,32 +206,32 @@ pub fn record_codex_turn(
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "input"])
-        .inc_by(input_tokens);
+        .inc_by(turn.input_tokens);
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "cached_input"])
-        .inc_by(cached_input_tokens);
+        .inc_by(turn.cached_input_tokens);
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "uncached_input"])
-        .inc_by(uncached_input_tokens);
+        .inc_by(turn.uncached_input_tokens);
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "output"])
-        .inc_by(output_tokens);
+        .inc_by(turn.output_tokens);
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "reasoning_output"])
-        .inc_by(reasoning_output_tokens);
+        .inc_by(turn.reasoning_output_tokens);
     METRICS
         .tokens_total
         .with_label_values(&[provider, model, "total"])
-        .inc_by(total_tokens);
-    let _ = estimated_cost_dollars;
+        .inc_by(turn.total_tokens);
+    let _ = turn.estimated_cost_dollars;
     METRICS
         .turn_duration_seconds
         .with_label_values(&[model])
-        .observe(duration_seconds.max(0.0));
+        .observe(turn.duration_seconds.max(0.0));
 }
 
 pub fn record_codex_response_status(status: &str, model: &str) {
@@ -381,7 +383,7 @@ fn normalize_tool(tool_name: &str) -> String {
 mod tests {
     use super::{
         init, record_codex_response_status, record_codex_turn, record_context_fill_percent,
-        record_degraded_cause, render,
+        record_degraded_cause, render, CodexTurnMetric,
     };
 
     #[test]
@@ -389,7 +391,17 @@ mod tests {
         init();
         record_context_fill_percent("codex_responses", "gpt-codex-fixture", 42.0);
         record_degraded_cause("session-id-like-cause-phase-8b");
-        record_codex_turn("gpt-5.5", 1_280, 512, 768, 96, 32, 1_376, 0.006976, 1.5);
+        record_codex_turn(CodexTurnMetric {
+            model: "gpt-5.5",
+            input_tokens: 1_280,
+            cached_input_tokens: 512,
+            uncached_input_tokens: 768,
+            output_tokens: 96,
+            reasoning_output_tokens: 32,
+            total_tokens: 1_376,
+            estimated_cost_dollars: 0.006976,
+            duration_seconds: 1.5,
+        });
         record_codex_response_status("failed", "gpt-5.5");
 
         let (_, body) = render().expect("render metrics");

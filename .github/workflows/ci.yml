@@ -56,6 +56,9 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Install shell test tools
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Show tool versions
         run: |
           rustc --version

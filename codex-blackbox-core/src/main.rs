@@ -466,6 +466,36 @@ CREATE INDEX IF NOT EXISTS idx_billing_reconciliations_session_imported
     ON billing_reconciliations(session_id, imported_at DESC);
 ";
 
+struct RecordCodexTurnCommand {
+    request_id: String,
+    session_id: String,
+    timestamp: String,
+    requested_model: String,
+    served_model: Option<String>,
+    status: String,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    uncached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    duration_ms: u64,
+    context_utilization: f64,
+    context_window_tokens: u64,
+    display_name: String,
+    initial_prompt: Option<String>,
+    response_summary: Option<String>,
+    response_id: Option<String>,
+    failure_detail: Option<String>,
+    incomplete_detail: Option<String>,
+    tool_names_json: String,
+    tool_calls_json: String,
+    accounting_anomalies_json: String,
+    cost_dollars: f64,
+    cost_source: String,
+    trusted_for_budget_enforcement: bool,
+}
+
 enum DbCommand {
     #[cfg(test)]
     InsertSession {
@@ -475,35 +505,7 @@ enum DbCommand {
         display_name: String,
         initial_prompt: Option<String>,
     },
-    RecordCodexTurn {
-        request_id: String,
-        session_id: String,
-        timestamp: String,
-        requested_model: String,
-        served_model: Option<String>,
-        status: String,
-        input_tokens: u64,
-        cached_input_tokens: u64,
-        uncached_input_tokens: u64,
-        output_tokens: u64,
-        reasoning_output_tokens: u64,
-        total_tokens: u64,
-        duration_ms: u64,
-        context_utilization: f64,
-        context_window_tokens: u64,
-        display_name: String,
-        initial_prompt: Option<String>,
-        response_summary: Option<String>,
-        response_id: Option<String>,
-        failure_detail: Option<String>,
-        incomplete_detail: Option<String>,
-        tool_names_json: String,
-        tool_calls_json: String,
-        accounting_anomalies_json: String,
-        cost_dollars: f64,
-        cost_source: String,
-        trusted_for_budget_enforcement: bool,
-    },
+    RecordCodexTurn(Box<RecordCodexTurnCommand>),
     WriteDiagnosis {
         session_id: String,
         completed_at: String,
@@ -931,35 +933,36 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                     rusqlite::params![session_id, started_at, model, display_name, initial_prompt],
                 );
             }
-            DbCommand::RecordCodexTurn {
-                request_id,
-                session_id,
-                timestamp,
-                requested_model,
-                served_model,
-                status,
-                input_tokens,
-                cached_input_tokens,
-                uncached_input_tokens,
-                output_tokens,
-                reasoning_output_tokens,
-                total_tokens,
-                duration_ms,
-                context_utilization,
-                context_window_tokens,
-                display_name,
-                initial_prompt,
-                response_summary,
-                response_id,
-                failure_detail,
-                incomplete_detail,
-                tool_names_json,
-                tool_calls_json,
-                accounting_anomalies_json,
-                cost_dollars,
-                cost_source,
-                trusted_for_budget_enforcement,
-            } => {
+            DbCommand::RecordCodexTurn(command) => {
+                let RecordCodexTurnCommand {
+                    request_id,
+                    session_id,
+                    timestamp,
+                    requested_model,
+                    served_model,
+                    status,
+                    input_tokens,
+                    cached_input_tokens,
+                    uncached_input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    total_tokens,
+                    duration_ms,
+                    context_utilization,
+                    context_window_tokens,
+                    display_name,
+                    initial_prompt,
+                    response_summary,
+                    response_id,
+                    failure_detail,
+                    incomplete_detail,
+                    tool_names_json,
+                    tool_calls_json,
+                    accounting_anomalies_json,
+                    cost_dollars,
+                    cost_source,
+                    trusted_for_budget_enforcement,
+                } = *command;
                 let model_for_row = served_model
                     .as_deref()
                     .unwrap_or(requested_model.as_str())
@@ -2155,17 +2158,17 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
         .served_model
         .as_deref()
         .unwrap_or(outcome.accounting.requested_model.as_str());
-    metrics::record_codex_turn(
-        metric_model,
-        outcome.accounting.input_tokens,
-        outcome.accounting.cached_input_tokens,
-        outcome.accounting.uncached_input_tokens,
-        outcome.accounting.output_tokens,
-        outcome.accounting.reasoning_output_tokens,
-        outcome.accounting.total_tokens,
-        outcome.accounting.pricing.cost_dollars.unwrap_or(0.0),
-        duration.as_secs_f64(),
-    );
+    metrics::record_codex_turn(metrics::CodexTurnMetric {
+        model: metric_model,
+        input_tokens: outcome.accounting.input_tokens,
+        cached_input_tokens: outcome.accounting.cached_input_tokens,
+        uncached_input_tokens: outcome.accounting.uncached_input_tokens,
+        output_tokens: outcome.accounting.output_tokens,
+        reasoning_output_tokens: outcome.accounting.reasoning_output_tokens,
+        total_tokens: outcome.accounting.total_tokens,
+        estimated_cost_dollars: outcome.accounting.pricing.cost_dollars.unwrap_or(0.0),
+        duration_seconds: duration.as_secs_f64(),
+    });
     metrics::record_codex_response_status(
         codex_status_label(&outcome.accounting.status),
         metric_model,
@@ -2436,7 +2439,7 @@ fn remember_codex_turn_and_emit_diagnosis(outcome: &CodexFinalizationOutcome) {
 
 fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: String) -> DbCommand {
     let accounting = &outcome.accounting;
-    DbCommand::RecordCodexTurn {
+    DbCommand::RecordCodexTurn(Box::new(RecordCodexTurnCommand {
         request_id: outcome.request_id.clone(),
         session_id: accounting.identity.session_id.clone(),
         timestamp: timestamp.clone(),
@@ -2464,7 +2467,7 @@ fn record_codex_turn_command(outcome: &CodexFinalizationOutcome, timestamp: Stri
         cost_dollars: accounting.pricing.cost_dollars.unwrap_or(0.0),
         cost_source: codex_cost_source(accounting),
         trusted_for_budget_enforcement: accounting.pricing.trusted_for_budget_enforcement,
-    }
+    }))
 }
 
 fn persist_codex_finalization_outcome(outcome: &CodexFinalizationOutcome) {
@@ -2796,35 +2799,33 @@ fn load_persisted_watch_turns(
          ORDER BY turn_number ASC",
     )?;
 
-    let turns = stmt
-        .query_map(rusqlite::params![session_id], |row| {
-            let context_window_tokens = row
-                .get::<_, Option<i64>>(11)?
-                .map(|value| value.max(0) as u64)
-                .filter(|value| *value > 0);
-            let tool_calls_raw = row.get::<_, Option<String>>(12)?.unwrap_or_default();
-            Ok(PersistedWatchTurn {
-                timestamp: row.get::<_, String>(0)?,
-                status: row
-                    .get::<_, Option<String>>(1)?
-                    .unwrap_or_else(|| "completed".to_string()),
-                requested_model: row
-                    .get::<_, Option<String>>(2)?
-                    .unwrap_or_else(|| "unknown".to_string()),
-                served_model: row.get::<_, Option<String>>(3)?,
-                input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
-                cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
-                uncached_input_tokens: row.get::<_, i64>(6)?.max(0) as u64,
-                output_tokens: row.get::<_, i64>(7)?.max(0) as u64,
-                reasoning_output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
-                total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
-                context_utilization: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                context_window_tokens,
-                tool_calls: parse_codex_tool_calls_json(&tool_calls_raw),
-            })
-        })?
-        .collect();
-    turns
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        let context_window_tokens = row
+            .get::<_, Option<i64>>(11)?
+            .map(|value| value.max(0) as u64)
+            .filter(|value| *value > 0);
+        let tool_calls_raw = row.get::<_, Option<String>>(12)?.unwrap_or_default();
+        Ok(PersistedWatchTurn {
+            timestamp: row.get::<_, String>(0)?,
+            status: row
+                .get::<_, Option<String>>(1)?
+                .unwrap_or_else(|| "completed".to_string()),
+            requested_model: row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "unknown".to_string()),
+            served_model: row.get::<_, Option<String>>(3)?,
+            input_tokens: row.get::<_, i64>(4)?.max(0) as u64,
+            cached_input_tokens: row.get::<_, i64>(5)?.max(0) as u64,
+            uncached_input_tokens: row.get::<_, i64>(6)?.max(0) as u64,
+            output_tokens: row.get::<_, i64>(7)?.max(0) as u64,
+            reasoning_output_tokens: row.get::<_, i64>(8)?.max(0) as u64,
+            total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
+            context_utilization: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+            context_window_tokens,
+            tool_calls: parse_codex_tool_calls_json(&tool_calls_raw),
+        })
+    })?;
+    rows.collect()
 }
 
 fn load_persisted_watch_replay_events(
