@@ -4,7 +4,7 @@
 # In --mode real this launches real Codex sessions through Codex Blackbox's
 # ChatGPT/Codex subscription proxy path. It uses the existing local Codex
 # ChatGPT login, can contact chatgpt.com, and must not edit ~/.codex/config.toml.
-# Run the fake Phase 9A gate first:
+# Run the fake regression gate first:
 #
 #   ./test/e2e-openai-responses-full.sh
 #
@@ -40,7 +40,7 @@ usage() {
 Usage: ./test/dogfood-codex-sessions.sh [options]
 
 Options:
-  --mode real|fixture       real launches Codex; fixture delegates to Phase 9A fake e2e
+  --mode real|fixture       real launches Codex; fixture delegates to the fake regression
   --sessions N             number of sessions to launch in real mode, 1-4 (default: 4)
   --repos same|mixed       run only the current repo or include another repo (default: mixed)
   --include-mcp            include an MCP-oriented prompt when MCP config exists
@@ -716,9 +716,9 @@ for cmd in docker curl python3 "$CODEX_BIN"; do
 done
 
 if [ "$MODE" = "fixture" ]; then
-    record skipped "real_codex_sessions" "--mode fixture delegates to Phase 9A fake e2e"
-    CODEX_BLACKBOX_FULL_E2E_REPORT_DIR="$REPORT_DIR/phase9a" ./test/e2e-openai-responses-full.sh
-    record passed "phase9a_fake_e2e" "see $REPORT_DIR/phase9a"
+    record skipped "real_codex_sessions" "--mode fixture delegates to fake regression"
+    CODEX_BLACKBOX_FULL_E2E_REPORT_DIR="$REPORT_DIR/fake-regression" ./test/e2e-openai-responses-full.sh
+    record passed "fake_responses_regression" "see $REPORT_DIR/fake-regression"
     finish_and_exit 0
 fi
 
@@ -758,7 +758,7 @@ if [ "$STACK_ALREADY_READY" = "0" ]; then
     record passed "stack_preclean" "removed stale Codex Blackbox Compose services before real smoke"
 fi
 
-SMOKE_PROMPT="$PROMPT_MARKER preflight: Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
+SMOKE_PROMPT="$PROMPT_MARKER preflight: Read AGENTS.md and docs/reference/developing.md, then summarize the current validation rules in 3 bullets. Do not edit files."
 preflight_cmd=(
     env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
     "$CODEX_BLACKBOX_BIN" preflight codex-subscription --
@@ -806,7 +806,7 @@ add_case \
     "same-read-a" \
     "same" \
     "$SAME_REPO" \
-    "$PROMPT_MARKER same-read-a: Read AGENTS.md and docs/remaining-phases.md. Answer with exactly three bullets about the current phase gate. Do not edit files."
+    "$PROMPT_MARKER same-read-a: Read AGENTS.md and docs/reference/developing.md. Answer with exactly three bullets about the validation boundary. Do not edit files."
 
 add_case \
     "same-tool-b" \
@@ -825,7 +825,7 @@ else
         "same-read-c" \
         "same" \
         "$SAME_REPO" \
-        "$PROMPT_MARKER same-read-c: Read docs/codex-traffic-contract.md and summarize two current unknowns. Do not edit files."
+        "$PROMPT_MARKER same-read-c: Read README.md and summarize two things this project observes directly. Do not edit files."
 fi
 
 if [ "$INCLUDE_MCP" = "1" ] && [ "$MCP_CONFIGURED" = "1" ]; then
@@ -839,7 +839,7 @@ else
         "same-context-d" \
         "same" \
         "$SAME_REPO" \
-        "$PROMPT_MARKER same-context-d: Read docs/automated-feedback-testing.md and report the smallest real dogfood gap still called out there. Do not edit files."
+        "$PROMPT_MARKER same-context-d: Read docs/reference/developing.md and report the difference between fake and live evidence in one paragraph. Do not edit files."
 fi
 
 : >"$WATCH_SSE"

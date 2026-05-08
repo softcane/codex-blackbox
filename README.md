@@ -136,8 +136,6 @@ Local fake tests:
 
 ```bash
 ./test/validate-openai-config.sh
-./test/e2e-openai-responses.sh
-./test/observability-openai-responses.sh
 ./test/e2e-openai-responses-full.sh
 ```
 

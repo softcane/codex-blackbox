@@ -1,5 +1,4 @@
-# Phase 5A Codex Blackbox E2E Envoy proxy.
-# Local-only fake OpenAI Responses routing for test/e2e-openai-responses.sh.
+# Local-only fake OpenAI Responses routing for test/e2e-openai-responses-full.sh.
 
 admin:
   address:

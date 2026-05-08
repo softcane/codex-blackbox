@@ -1,4 +1,4 @@
-# Phase 5A fake OpenAI Responses E2E override.
+# Fake OpenAI Responses E2E override.
 # Routes only local test traffic to test/fake-openai.py; production Envoy
 # remains unchanged and real OpenAI/Codex is not contacted.
 

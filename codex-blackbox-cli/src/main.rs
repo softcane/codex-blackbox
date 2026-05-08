@@ -780,7 +780,7 @@ fn codex_stack_config_available() -> Option<bool> {
 
 fn fake_openai_e2e_available() -> Option<bool> {
     [
-        "test/e2e-openai-responses.sh",
+        "test/e2e-openai-responses-full.sh",
         "test/fake-openai.py",
         "test/docker-compose.openai-responses.yml",
         "test/envoy.openai-responses.e2e.yaml",
@@ -944,7 +944,7 @@ async fn run_doctor() -> i32 {
             print_check("⚠", "fake OpenAI Responses e2e files missing");
             push_unique(
                 &mut fixes,
-                "Run from the Codex Blackbox repository if you need `./test/e2e-openai-responses.sh`.",
+                "Run from the Codex Blackbox repository if you need `./test/e2e-openai-responses-full.sh`.",
             );
         }
         None => {

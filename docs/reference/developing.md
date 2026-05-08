@@ -10,8 +10,6 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 ./test/validate-openai-config.sh
-./test/e2e-openai-responses.sh
-./test/observability-openai-responses.sh
 ./test/e2e-openai-responses-full.sh
 ```
 
@@ -32,6 +30,7 @@ codex-blackbox postmortem last
 Release-facing claims require a real Codex model turn observed by
 `codex-blackbox-core` with `provider="codex_responses"`. Fake fixture tests
 validate local parser, persistence, API, watch, and dashboard contracts only.
+Keep the fake regression in CI, but do not describe it as live support proof.
 
 Before changing behavior, read the repository `AGENTS.md` and the module map in
 that file. The highest-risk paths are request parsing, Responses SSE

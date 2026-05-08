@@ -138,10 +138,6 @@ overrides them.
 - For Rust changes, run targeted tests or `cargo test` when feasible.
 - Static default config validation:
   `./test/validate-openai-config.sh`
-- Narrow fake Responses proxy test:
-  `./test/e2e-openai-responses.sh`
-- Fake observability validation:
-  `./test/observability-openai-responses.sh`
-- Broader fake regression before real smoke:
+- Fake Responses regression before real smoke:
   `./test/e2e-openai-responses-full.sh`
 - If a relevant test is skipped, state why in the final response.

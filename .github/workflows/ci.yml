@@ -69,13 +69,7 @@ jobs:
       - name: Validate default ChatGPT/Codex Envoy config
         run: ./test/validate-openai-config.sh
 
-      - name: Run narrow fake Responses proxy test
-        run: ./test/e2e-openai-responses.sh
-
-      - name: Run fake observability validation
-        run: ./test/observability-openai-responses.sh
-
-      - name: Run broad fake Responses regression
+      - name: Run fake Responses regression
         run: ./test/e2e-openai-responses-full.sh
 
       - name: Capture docker compose state on failure

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 9A broader fake OpenAI Responses regression.
+# Full fake OpenAI Responses regression.
 #
 # This drives only local Docker Compose services and test/fake-openai.py. It
 # does not require OpenAI credentials, does not launch Codex, and must not
@@ -14,7 +14,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 RUN_ID="${CODEX_BLACKBOX_FULL_E2E_RUN_ID:-openai-full-e2e-$(date +%s)-$$}"
-REPORT_DIR="${CODEX_BLACKBOX_FULL_E2E_REPORT_DIR:-${TMPDIR:-/tmp}/codex-blackbox-phase9a-${RUN_ID}}"
+REPORT_DIR="${CODEX_BLACKBOX_FULL_E2E_REPORT_DIR:-${TMPDIR:-/tmp}/codex-blackbox-full-fake-${RUN_ID}}"
 REQUEST_DIR="$REPORT_DIR/requests"
 RESPONSE_DIR="$REPORT_DIR/responses"
 LOG_DIR="$REPORT_DIR/logs"
@@ -123,54 +123,54 @@ run_id = os.environ["RUN_ID"]
 request_dir = Path(os.environ["REQUEST_DIR"])
 manifest = Path(os.environ["REQUEST_MANIFEST"])
 repo = str(Path.cwd())
-other_repo = "/tmp/codex-blackbox-phase9a-other-repo"
+other_repo = "/tmp/codex-blackbox-full-fake-other-repo"
 
 cases = [
     {
         "case": "same-a",
         "fixture": "completed",
         "cwd": repo,
-        "prompt": f"Phase 9A {run_id}: inspect workspace Cargo metadata for same repo alpha.",
+        "prompt": f"full fake {run_id}: inspect workspace Cargo metadata for same repo alpha.",
         "split": "0",
     },
     {
         "case": "same-b-split",
         "fixture": "completed",
         "cwd": repo,
-        "prompt": f"Phase 9A {run_id}: summarize test scripts for same repo beta.",
+        "prompt": f"full fake {run_id}: summarize test scripts for same repo beta.",
         "split": "1",
     },
     {
         "case": "other-repo",
         "fixture": "completed",
         "cwd": other_repo,
-        "prompt": f"Phase 9A {run_id}: inspect a different repo placeholder gamma.",
+        "prompt": f"full fake {run_id}: inspect a different repo placeholder gamma.",
         "split": "0",
     },
     {
         "case": "failed",
         "fixture": "failed",
         "cwd": repo,
-        "prompt": f"Phase 9A {run_id}: trigger failed Responses fixture delta.",
+        "prompt": f"full fake {run_id}: trigger failed Responses fixture delta.",
         "split": "0",
     },
     {
         "case": "incomplete",
         "fixture": "incomplete",
         "cwd": other_repo,
-        "prompt": f"Phase 9A {run_id}: trigger incomplete Responses fixture epsilon.",
+        "prompt": f"full fake {run_id}: trigger incomplete Responses fixture epsilon.",
         "split": "0",
     },
 ]
 
 with manifest.open("w", encoding="utf-8") as out:
     for item in cases:
-        session_id = f"phase-9a-{run_id}-{item['case']}"
+        session_id = f"fake-full-{run_id}-{item['case']}"
         request_id = f"req-{run_id}-{item['case']}"
         metadata_fixture = item["fixture"] if item["fixture"] in {"failed", "incomplete"} else "minimal_text"
         body = {
             "model": "gpt-codex-fixture",
-            "instructions": "You are Codex running inside the local Phase 9A fake e2e contract.",
+            "instructions": "You are Codex running inside the local fake Responses contract.",
             "input": [
                 {
                     "type": "message",
@@ -184,11 +184,11 @@ with manifest.open("w", encoding="utf-8") as out:
                 }
             ],
             "reasoning": {"effort": "medium", "summary": "auto"},
-            "prompt_cache_key": f"codex-blackbox-phase9a:{item['cwd']}",
+            "prompt_cache_key": f"codex-blackbox-full-fake:{item['cwd']}",
             "metadata": {
                 "cwd": item["cwd"],
                 "codex_blackbox_fixture": metadata_fixture,
-                "phase": "9A",
+                "evidence": "fake",
                 "case": item["case"],
                 "run_id": run_id,
             },
@@ -234,7 +234,7 @@ send_case() {
         if ! http_code=$(curl -sS --max-time 45 --no-buffer -N \
             -w "%{http_code}" \
             -o "$output_path" \
-            -H "authorization: Bearer fake-openai-phase9a" \
+            -H "authorization: Bearer fake-openai-full-fake" \
             -H "content-type: application/json" \
             -H "accept-encoding: gzip" \
             -H "session-id: $session_id" \
@@ -250,7 +250,7 @@ send_case() {
         if ! http_code=$(curl -sS --max-time 45 --no-buffer -N \
             -w "%{http_code}" \
             -o "$output_path" \
-            -H "authorization: Bearer fake-openai-phase9a" \
+            -H "authorization: Bearer fake-openai-full-fake" \
             -H "content-type: application/json" \
             -H "accept-encoding: gzip" \
             -H "session-id: $session_id" \
@@ -392,7 +392,7 @@ raise SystemExit(1)
 PY
         sleep 1
     done
-    fail "SQLite did not contain all Phase 9A Codex requests after waiting"
+    fail "SQLite did not contain all full fake Codex requests after waiting"
 }
 
 assert_sqlite_persistence() {
@@ -510,7 +510,7 @@ for case in cases:
             fail(f"{case['case']} {row_name} total tokens mismatch: total={total} input={input_tokens} output={output}")
 
 if len(prompts) != len(cases):
-    fail("persisted prompt excerpts were not distinct across Phase 9A requests")
+    fail("persisted prompt excerpts were not distinct across full fake requests")
 
 status_counts = dict(
     conn.execute(
@@ -619,7 +619,7 @@ def wait_until(label, predicate, timeout=90):
 
 wait_until("Prometheus scrape for codex-blackbox-core", lambda: prom_value('up{job="codex-blackbox-core"}') == 1.0)
 wait_until(
-    "Prometheus observed all Phase 9A requests",
+    "Prometheus observed all full fake requests",
     lambda: (prom_value("sum(codex_blackbox_requests_total)") or 0.0) >= expected_requests,
 )
 wait_until(
@@ -721,14 +721,14 @@ for panel in dashboard.get("panels", []):
         if copied_model_term in panel_text:
             fail(f"Grafana Codex panel {title!r} references legacy model term {copied_model_term!r}")
 
-print("Prometheus and Grafana Phase 9A assertions passed")
+print("Prometheus and Grafana full fake assertions passed")
 PY
-    pass "Prometheus and Grafana expose Phase 9A fake-session observability"
+    pass "Prometheus and Grafana expose full fake session observability"
 }
 
 assert_cli_dry_run() {
     local output_path="$REPORT_DIR/codex-blackbox-run-dry-run.txt"
-    cargo run -q -p codex-blackbox-cli -- run --dry-run -- codex exec "Phase 9A fake smoke" >"$output_path"
+    cargo run -q -p codex-blackbox-cli -- run --dry-run -- codex exec "full fake smoke" >"$output_path"
     assert_file_contains "$output_path" "Mode: experimental Codex ChatGPT subscription proxy" "CLI dry-run uses subscription proxy mode"
     assert_file_contains "$output_path" "Config files: not modified" "CLI dry-run is read-only"
     assert_file_contains "$output_path" "chatgpt_base_url" "CLI dry-run prints ChatGPT backend proxy override"
@@ -746,7 +746,7 @@ assert_cli_dry_run() {
         fail "CLI dry-run should not print API-key or stale custom/fake-provider overrides"
     fi
     assert_file_contains "$output_path" "exec -c" "CLI dry-run attaches subscription overrides to Codex exec"
-    assert_file_contains "$output_path" "'Phase 9A fake smoke'" "CLI dry-run preserves Codex prompt argument"
+    assert_file_contains "$output_path" "'full fake smoke'" "CLI dry-run preserves Codex prompt argument"
     if grep -q -- "--json" "$output_path"; then
         fail "CLI dry-run must not pass Codex local JSON stdout mode"
     fi
@@ -764,15 +764,15 @@ path = os.environ["REQUEST_PATH"]
 body = {
     "model": "gpt-codex-fixture",
     "instructions": "Local failure-open fixture after codex-blackbox-core is stopped.",
-    "input": f"Phase 9A {run_id}: verify Envoy failure-open after core stop.",
+    "input": f"full fake {run_id}: verify Envoy failure-open after core stop.",
     "metadata": {
         "cwd": "/tmp/codex-blackbox-failure-open",
         "codex_blackbox_fixture": "minimal_text",
-        "phase": "9A",
+        "evidence": "fake",
         "case": "failure-open",
     },
     "client_metadata": {
-        "session_id": f"phase-9a-{run_id}-failure-open",
+        "session_id": f"fake-full-{run_id}-failure-open",
         "x_client_request_id": f"req-{run_id}-failure-open",
     },
     "stream": True,
@@ -787,9 +787,9 @@ PY
     if ! http_code=$(curl -sS --max-time 45 --no-buffer -N \
         -w "%{http_code}" \
         -o "$response_path" \
-        -H "authorization: Bearer fake-openai-phase9a" \
+        -H "authorization: Bearer fake-openai-full-fake" \
         -H "content-type: application/json" \
-        -H "session-id: phase-9a-${RUN_ID}-failure-open" \
+        -H "session-id: fake-full-${RUN_ID}-failure-open" \
         -H "x-client-request-id: req-${RUN_ID}-failure-open" \
         -H "x-codex-blackbox-fixture: completed" \
         --data-binary @"$request_path" \
