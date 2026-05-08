@@ -1,35 +1,60 @@
 # Codex Blackbox
 
-Codex can finish successfully while leaving you with the harder question: what
-actually happened in that session? Codex Blackbox runs Codex CLI through a local
-Envoy proxy and records the Responses-shaped model-turn facts that are safe to
-observe from the proxy boundary.
+Codex Blackbox helps you answer a simple question after a Codex run:
 
-The first useful output is a redacted Codex Responses Postmortem. It shows the
-session state, requested and served model, terminal Responses status, token
-accounting, local cost estimate, evidence, caveats, and the next action worth
-taking. Watch mode and Grafana are available when you need live activity or
-history across sessions.
+What happened?
 
-Codex Blackbox runs locally. The proxy, database, metrics endpoint, dashboard,
-and CLI run on your machine. It does not send telemetry to a hosted Codex
-Blackbox service.
+It runs Codex CLI through a local Envoy proxy, records the Codex Responses
+traffic it can see, and gives you a short postmortem for the session.
 
-## Codex Postmortem
+It is meant for local debugging. The proxy, database, metrics, Grafana, and CLI
+run on your machine.
+
+## Quick Start
+
+Install:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh
+```
+
+Start the local stack:
+
+```bash
+codex-blackbox doctor
 codex-blackbox up
-codex-blackbox run --watch -- codex exec --sandbox read-only "Summarize this repo in 3 bullets. Do not edit files."
+```
+
+Run Codex through the wrapper:
+
+```bash
+codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize this repo. Do not edit files."
+```
+
+Read the latest report:
+
+```bash
 codex-blackbox postmortem last
 ```
 
-Postmortems are redacted by default. Use `codex-blackbox postmortem
-<session_id>` for a specific session, `--no-redact` for local unredacted
-evidence, and `--output <path>` to write the markdown report to a file.
+Open Grafana:
 
-The structured API contract is available at `GET /api/postmortem/last` and
-`GET /api/postmortem/:session_id`. Add `?redact=false` only for local debugging.
-Postmortems are deterministic and limited to Envoy-observed Responses evidence.
+[http://127.0.0.1:3000/d/codex-blackbox-main](http://127.0.0.1:3000/d/codex-blackbox-main)
+
+## What You Get
+
+The postmortem is redacted by default. It shows:
+
+- the session id
+- whether the run completed, failed, or ended incomplete
+- the requested model and served model
+- input, cached input, uncached input, output, and reasoning tokens
+- local token and cost estimates
+- important signals, like high context use or model mismatch
+- tool calls the model tried to make
+- caveats about what Codex Blackbox could not see
+
+Example:
 
 ```markdown
 # Codex Responses Postmortem
@@ -43,100 +68,97 @@ Postmortems are deterministic and limited to Envoy-observed Responses evidence.
 - Turns: 3
 - Tokens: input 54231, cached 41600, uncached 12631, output 610, reasoning 445, local total 54841
 - Local Estimate: $0.10
-- Local Estimate Trust: untrusted for budget enforcement
 
-## Caveats
-- Evidence is limited to local Envoy-observed Codex Responses traffic.
-- Tool-call rows are model-side intent only; local execution outcome is not observed.
-- Cached input is token accounting only; lifecycle timing is not inferred.
+## Recommendations
+- Continue from the latest response summary if it matches the intended task.
 ```
 
-## Quick Start
-
-Install Codex Blackbox:
+For a specific session:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh
+codex-blackbox postmortem <session_id>
 ```
 
-Start the local stack and run Codex through the wrapper:
+For local debugging without redaction:
+
+```bash
+codex-blackbox postmortem last --no-redact
+```
+
+To write the report to a file:
+
+```bash
+codex-blackbox postmortem last --output report.md
+```
+
+## What It Can Tell You
+
+Codex Blackbox can report facts that passed through the local proxy:
+
+- Codex Responses requests
+- response status: completed, failed, incomplete, or unknown
+- requested model and served model
+- token counts
+- cached input as part of input, not extra input
+- reasoning output as part of output-side detail, not extra output
+- response ids
+- model-side tool-call intent
+
+## What It Cannot Tell You
+
+Codex Blackbox does not see everything Codex does locally.
+
+It cannot prove:
+
+- whether a local tool call succeeded or failed
+- whether an MCP server started, stopped, or failed
+- whether a skill loaded or failed
+- why a permission was approved or denied
+- provider quota, cap, or rate-limit state
+- cache TTL, cache expiry, or cache rebuild timing
+
+When the report lists tool calls, read that as "the model tried to call this
+tool", not "the tool succeeded".
+
+## Common Commands
 
 ```bash
 codex-blackbox doctor
 codex-blackbox up
-codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize the project. Do not edit files."
+codex-blackbox watch --url http://127.0.0.1:9091
+codex-blackbox sessions --limit 20 --days 7
+codex-blackbox postmortem last
+codex-blackbox postmortem last --no-redact
 ```
 
-Open Grafana at
-[http://127.0.0.1:3000/d/codex-blackbox-main](http://127.0.0.1:3000/d/codex-blackbox-main).
-Anonymous viewer mode is enabled by the local stack.
+API shortcuts:
 
-## What Codex Blackbox Catches
+```bash
+curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'
+curl -s 'http://127.0.0.1:9091/api/postmortem/last'
+curl -s http://127.0.0.1:9091/metrics
+```
 
-- **Responses status:** completed, failed, incomplete, and unknown terminal
-  statuses observed from Codex Responses streams.
-- **Model route facts:** requested model from the request and served model from
-  response headers or payload.
-- **Token and context pressure:** input, cached input, uncached input, output,
-  reasoning output, local total tokens, estimated context fill, and local cost
-  estimate.
-- **Accounting anomalies:** malformed or future provider payloads where local
-  accounting rules differ from provider-reported totals.
-- **Model-side tool-call intent:** tool calls the model attempted to emit, with
-  explicit caveats that this is not proof of local tool result success or
-  failure.
+## Testing
 
-## Why It Is Safe To Run Locally
+Local fake tests:
 
-- **Local-first:** Envoy, `codex-blackbox-core`, SQLite, Prometheus, Grafana,
-  and the CLI run on your machine. Default ports bind to `127.0.0.1`.
-- **No user config mutation:** `codex-blackbox run -- codex ...` passes
-  command-line Codex config overrides and does not edit `~/.codex/config.toml`.
-- **No full transcript claim:** Codex Blackbox stores request/response facts,
-  cleaned prompt excerpts, compact response summaries, and token/accounting
-  fields. It is not a full local runtime trace.
-- **Evidence is labeled:** Fake fixtures validate local contracts only.
-  Live/dogfood claims require real Codex CLI traffic observed by
-  `codex-blackbox-core` with `provider="codex_responses"`.
+```bash
+./test/validate-openai-config.sh
+./test/e2e-openai-responses.sh
+./test/observability-openai-responses.sh
+./test/e2e-openai-responses-full.sh
+```
 
-## Product Boundary
+These tests use fake Responses fixtures. They do not contact OpenAI, and they
+do not prove live Codex support.
 
-Codex Blackbox is a Codex Responses observability tool, not a complete Codex
-runtime recorder. It does not use Codex hooks, local JSON stdout, or app-server
-hook endpoints as telemetry sources.
+Live or dogfood evidence means a real Codex CLI run went through
+`codex-blackbox run -- codex ...` and `codex-blackbox-core` recorded at least
+one new request with `provider="codex_responses"`.
 
-Do not treat Codex Blackbox output as evidence for:
+## Development
 
-- local tool result success or failure
-- MCP server lifecycle state
-- skill lifecycle state
-- cache TTL, cache expiry, or cache rebuild lifecycle
-- provider quota, cap, or rate-limit window state
-- permission approval or denial decisions
+Developer notes:
 
-## Reference
-
-Common commands:
-
-- `codex-blackbox doctor`
-- `codex-blackbox up`
-- `codex-blackbox run -- codex exec --sandbox read-only "Prompt"`
-- `codex-blackbox watch --url http://127.0.0.1:9091`
-- `codex-blackbox sessions --limit 20 --days 7`
-- `codex-blackbox postmortem last`
-- `codex-blackbox postmortem last --no-redact`
-- `curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'`
-- `curl -s http://127.0.0.1:9091/metrics`
-
-Validation commands:
-
-- `./test/validate-openai-config.sh`
-- `./test/e2e-openai-responses.sh`
-- `./test/observability-openai-responses.sh`
-- `./test/e2e-openai-responses-full.sh`
-
-The fake Responses tests do not contact OpenAI or launch Codex. They are local
-contract checks only. Read [test/README.md](test/README.md) for the distinction
-between fake, preflight, dogfood, and live evidence.
-
-Developer notes live in [docs/reference/developing.md](docs/reference/developing.md).
+[docs/reference/developing.md](docs/reference/developing.md)
