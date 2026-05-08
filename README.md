@@ -61,7 +61,6 @@ The postmortem is redacted by default. It shows:
 - local token and cost estimates
 - important signals, like high context use or model mismatch
 - tool calls the model tried to make
-- caveats about what Codex Blackbox could not see
 
 Example:
 
@@ -111,22 +110,6 @@ Codex Blackbox can report what it observed during the model run:
 - what was the local cost estimate?
 - did the run show context pressure, model mismatch, or accounting oddities?
 - which tools did the model try to call?
-
-## What It Cannot Tell You
-
-Codex Blackbox does not see everything Codex does locally.
-
-It cannot prove:
-
-- whether a local tool call succeeded or failed
-- whether an MCP server started, stopped, or failed
-- whether a skill loaded or failed
-- why a permission was approved or denied
-- provider quota, cap, or rate-limit state
-- cache TTL, cache expiry, or cache rebuild timing
-
-When the report lists tool calls, read that as "the model tried to call this
-tool", not "the tool succeeded".
 
 ## Common Commands
 
