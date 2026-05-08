@@ -1,14 +1,17 @@
 # Codex Blackbox
 
-Codex Blackbox helps you answer a simple question after a Codex run:
+Codex runs can be hard to judge after the fact.
 
-What happened?
+It may finish, but you still do not know what happened: which model answered,
+whether the response actually completed, how many tokens were used, whether
+cached input helped, or whether the run is worth continuing.
 
-It runs Codex CLI through a local Envoy proxy, records the Codex Responses
-traffic it can see, and gives you a short postmortem for the session.
+Codex Blackbox gives you a local postmortem for a Codex CLI session. It turns
+the run into a short report with the outcome, model, token use, cost estimate,
+important signals, and a practical next step.
 
-It is meant for local debugging. The proxy, database, metrics, Grafana, and CLI
-run on your machine.
+It is built for local debugging. The database, metrics, dashboard, and CLI run
+on your machine.
 
 ## Quick Start
 
@@ -93,16 +96,15 @@ codex-blackbox postmortem last --output report.md
 
 ## What It Can Tell You
 
-Codex Blackbox can report facts that passed through the local proxy:
+Codex Blackbox can report what it observed during the model run:
 
-- Codex Responses requests
-- response status: completed, failed, incomplete, or unknown
-- requested model and served model
-- token counts
-- cached input as part of input, not extra input
-- reasoning output as part of output-side detail, not extra output
-- response ids
-- model-side tool-call intent
+- did the model response complete, fail, or stop incomplete?
+- which model was requested, and which model answered?
+- how many input, cached input, uncached input, output, and reasoning tokens
+  were used?
+- what was the local cost estimate?
+- did the run show context pressure, model mismatch, or accounting oddities?
+- which tools did the model try to call?
 
 ## What It Cannot Tell You
 
@@ -154,8 +156,8 @@ These tests use fake Responses fixtures. They do not contact OpenAI, and they
 do not prove live Codex support.
 
 Live or dogfood evidence means a real Codex CLI run went through
-`codex-blackbox run -- codex ...` and `codex-blackbox-core` recorded at least
-one new request with `provider="codex_responses"`.
+`codex-blackbox run -- codex ...` and Codex Blackbox saved at least one real
+Codex Responses request for that run.
 
 ## Development
 
