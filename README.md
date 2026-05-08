@@ -28,16 +28,22 @@ codex-blackbox doctor
 codex-blackbox up
 ```
 
-Run Codex through the wrapper:
+Run Codex normally through the wrapper:
 
 ```bash
-codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize this repo. Do not edit files."
+codex-blackbox run --watch -- codex
 ```
 
 Read the latest report:
 
 ```bash
 codex-blackbox postmortem last
+```
+
+For a quick one-shot check instead of an interactive Codex session:
+
+```bash
+codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize this repo. Do not edit files."
 ```
 
 Open Grafana:
