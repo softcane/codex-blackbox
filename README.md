@@ -13,6 +13,8 @@ important signals, and a practical next step.
 It is built for local debugging. The database, metrics, dashboard, and CLI run
 on your machine.
 
+![demo](docs/demo.gif)
+
 ## Quick Start
 
 Install:

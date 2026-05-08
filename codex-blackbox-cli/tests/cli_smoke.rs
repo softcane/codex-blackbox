@@ -468,9 +468,12 @@ fn postmortem_command_renders_redacted_markdown_from_api() {
     assert!(out.contains("## Caveats"));
     assert!(out.contains("## Restart Prompt"));
     assert!(out.contains("[redacted prompt excerpt]"));
-    assert!(out.contains("Local Estimate Source: codex_unpriced:unknown_model:gpt-5.5"));
-    assert!(out.contains("Local Estimate Trust: untrusted for budget enforcement"));
-    assert!(out.contains("Tool-call intent: read_file: 1"));
+    assert!(out.contains("Local Estimate Source"));
+    assert!(out.contains("codex_unpriced:unknown_model:gpt-5.5"));
+    assert!(out.contains("Local Estimate Trust"));
+    assert!(out.contains("untrusted for budget enforcement"));
+    assert!(out.contains("Tool-call intent"));
+    assert!(out.contains("read_file: 1"));
     assert!(!out.to_ascii_lowercase().contains("tool result"));
     assert!(!out.to_ascii_lowercase().contains("mcp lifecycle"));
 }

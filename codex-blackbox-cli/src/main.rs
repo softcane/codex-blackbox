@@ -1023,16 +1023,6 @@ async fn run_doctor() -> i32 {
         push_unique(&mut fixes, "Run: codex-blackbox up");
     }
 
-    println!();
-    print_check(
-        "⚠",
-        "`codex-blackbox run -- codex ...` defaults to ChatGPT subscription proxy overrides",
-    );
-    print_check(
-        "⚠",
-        "Live ChatGPT/Codex subscription traffic is experimental; Codex 0.125.0 smoke is documented",
-    );
-
     if !fixes.is_empty() {
         println!();
         println!("Fix:");
@@ -2901,9 +2891,311 @@ async fn fetch_postmortem(
         fs::write(path, markdown)
             .map_err(|err| format!("failed to write {}: {}", path.display(), err))?;
     } else {
-        print!("{}", markdown);
+        print_postmortem_terminal_block(&markdown);
     }
     Ok(())
+}
+
+fn parse_percent_prefix(value: &str) -> Option<f64> {
+    value.split_whitespace().find_map(|part| {
+        part.trim_matches(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '%'))
+            .strip_suffix('%')
+            .and_then(|number| number.parse::<f64>().ok())
+    })
+}
+
+fn colorize_postmortem_value(label: &str, value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    match label {
+        "State" => {
+            if lower.contains("final") {
+                value.green().bold().to_string()
+            } else {
+                value.yellow().bold().to_string()
+            }
+        }
+        "Outcome" => {
+            if lower.contains("failed") || lower.contains("error") {
+                value.red().bold().to_string()
+            } else if lower.contains("completed") || lower.contains("complete") {
+                value.green().bold().to_string()
+            } else if lower.contains("incomplete") || lower.contains("partial") {
+                value.yellow().bold().to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        "Requested Model" | "Served Model" => value.cyan().to_string(),
+        "Turns" => value.bright_white().to_string(),
+        "Tokens" => value.yellow().to_string(),
+        "Local Estimate" | "Billed" => value.magenta().to_string(),
+        "Local Estimate Trust" => {
+            if lower.contains("untrusted") {
+                value.red().bold().to_string()
+            } else {
+                value.green().to_string()
+            }
+        }
+        "Primary Cause" => {
+            if lower == "none" || lower.contains("no primary") {
+                value.green().bold().to_string()
+            } else {
+                value.yellow().bold().to_string()
+            }
+        }
+        "Responses statuses" => {
+            if lower.contains("failed") || lower.contains("incomplete") {
+                value.red().bold().to_string()
+            } else if lower.contains("completed") {
+                value.green().bold().to_string()
+            } else {
+                value.to_string()
+            }
+        }
+        "Estimated context fill max" => match parse_percent_prefix(value) {
+            Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
+            Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
+            Some(_) => value.green().to_string(),
+            None => value.to_string(),
+        },
+        "Cached input reuse" => match parse_percent_prefix(value) {
+            Some(percent) if percent >= 60.0 => value.green().to_string(),
+            Some(percent) if percent >= 30.0 => value.yellow().to_string(),
+            Some(_) => value.red().bold().to_string(),
+            None => value.to_string(),
+        },
+        "Max reasoning-output share" => match parse_percent_prefix(value) {
+            Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
+            Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
+            Some(_) => value.green().to_string(),
+            None => value.to_string(),
+        },
+        "Tool-call intent" => value.cyan().to_string(),
+        "Prompt" | "Final Summary" => value.bright_white().to_string(),
+        _ => value.to_string(),
+    }
+}
+
+fn colorize_bullet_key_value_line(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("- ")?;
+    let (label, value) = rest.split_once(": ")?;
+    if label.is_empty() || value.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{} {}{} {}",
+        "-".bright_black(),
+        label.bright_blue().bold(),
+        ":".bright_black(),
+        colorize_postmortem_value(label, value)
+    ))
+}
+
+fn colorize_evidence_kind(kind: &str) -> String {
+    match kind {
+        "direct" => kind.green().bold().to_string(),
+        "heuristic" => kind.yellow().bold().to_string(),
+        "derived" => kind.cyan().bold().to_string(),
+        _ => kind.bright_white().to_string(),
+    }
+}
+
+fn colorize_evidence_bullet_line(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("- [")?;
+    let (kind, detail) = rest.split_once("] ")?;
+    Some(format!(
+        "{} [{}] {}",
+        "-".bright_black(),
+        colorize_evidence_kind(kind),
+        detail
+    ))
+}
+
+fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start_matches(' ').len();
+    if indent_len == 0 {
+        return None;
+    }
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let split_at = rest.find("  ")?;
+    let label_area = &rest[..split_at];
+    let label = label_area.trim_end();
+    if label.is_empty() {
+        return None;
+    }
+    let value_area = &rest[split_at..];
+    let value = value_area.trim_start();
+    if value.is_empty() {
+        return None;
+    }
+
+    let padding_len = (label_area.len() - label.len()) + (value_area.len() - value.len());
+    Some(format!(
+        "{}{}{}{}",
+        indent,
+        label.bright_blue().bold(),
+        " ".repeat(padding_len),
+        colorize_postmortem_value(label, value)
+    ))
+}
+
+fn colorize_table_row(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start_matches(' ').len();
+    let indent = &line[..indent_len];
+    let rest = &line[indent_len..];
+    let first_end = rest.find(char::is_whitespace)?;
+    let first = &rest[..first_end];
+    if !matches!(first, "direct" | "heuristic" | "derived") {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        indent,
+        colorize_evidence_kind(first),
+        &rest[first_end..]
+    ))
+}
+
+fn colorize_postmortem_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    if line.starts_with("# ") {
+        return line.bright_cyan().bold().to_string();
+    }
+    if line.starts_with("## ") {
+        return line.cyan().bold().to_string();
+    }
+    if line.starts_with("```") {
+        return line.bright_black().to_string();
+    }
+    if (trimmed.starts_with("Type") && trimmed.contains("Signal"))
+        || (trimmed.starts_with("Time") && trimmed.contains("Event"))
+    {
+        return line.bright_black().bold().to_string();
+    }
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+    {
+        return line.bright_black().to_string();
+    }
+    if let Some(colored) = colorize_table_row(line) {
+        return colored;
+    }
+    if let Some(colored) = colorize_aligned_key_value_line(line) {
+        return colored;
+    }
+    if let Some(colored) = colorize_evidence_bullet_line(line) {
+        return colored;
+    }
+    if let Some(colored) = colorize_bullet_key_value_line(line) {
+        return colored;
+    }
+    if line.starts_with("- ") {
+        return format!(
+            "{} {}",
+            "-".bright_black(),
+            line.trim_start_matches("- ").bright_white()
+        );
+    }
+    line.to_string()
+}
+
+fn colorize_postmortem_for_terminal(markdown: &str) -> String {
+    let mut colored = markdown
+        .lines()
+        .map(colorize_postmortem_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if markdown.ends_with('\n') {
+        colored.push('\n');
+    }
+    colored
+}
+
+#[cfg(unix)]
+fn terminal_width_from_stdout() -> Option<usize> {
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    const TIOCGWINSZ: std::os::raw::c_ulong = 0x40087468;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    return None;
+
+    unsafe extern "C" {
+        fn ioctl(
+            fd: std::os::raw::c_int,
+            request: std::os::raw::c_ulong,
+            size: *mut Winsize,
+        ) -> std::os::raw::c_int;
+    }
+
+    let mut size = Winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut size) };
+    (rc == 0 && size.ws_col >= 20).then_some(size.ws_col as usize)
+}
+
+#[cfg(not(unix))]
+fn terminal_width_from_stdout() -> Option<usize> {
+    None
+}
+
+fn terminal_width_from_columns_env() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|width| *width >= 20)
+}
+
+fn terminal_width() -> usize {
+    terminal_width_from_stdout()
+        .or_else(terminal_width_from_columns_env)
+        .unwrap_or(100)
+}
+
+fn postmortem_separator_line_for_width(width: usize) -> String {
+    "\u{2501}".repeat(width.max(20))
+}
+
+fn postmortem_separator_line() -> String {
+    postmortem_separator_line_for_width(terminal_width())
+}
+
+fn print_postmortem_terminal_block(markdown: &str) {
+    println!();
+    println!("{}", postmortem_separator_line().dimmed());
+    print!("{}", colorize_postmortem_for_terminal(markdown));
+    if !markdown.ends_with('\n') {
+        println!();
+    }
+    println!("{}", postmortem_separator_line().dimmed());
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -2916,6 +3208,92 @@ fn encode_path_segment(value: &str) -> String {
         }
     }
     out
+}
+
+fn postmortem_table_cell(value: &str) -> String {
+    let single_line = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_for_box(&single_line, 140)
+}
+
+fn postmortem_column_widths(headers: &[&str]) -> Vec<usize> {
+    match headers {
+        ["Type", "Signal", "Turn", "Detail"] => vec![10, 28, 5, 0],
+        ["Time", "Event", "Detail"] => vec![20, 18, 0],
+        _ => headers
+            .iter()
+            .enumerate()
+            .map(|(idx, header)| {
+                if idx + 1 == headers.len() {
+                    0
+                } else {
+                    header.len().max(8)
+                }
+            })
+            .collect(),
+    }
+}
+
+fn push_postmortem_table_header(out: &mut String, headers: &[&str]) {
+    let widths = postmortem_column_widths(headers);
+    out.push_str("  ");
+    for (idx, header) in headers.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        if width == 0 {
+            out.push_str(header);
+        } else {
+            out.push_str(&format!("{:<width$}", header, width = width));
+            out.push_str("  ");
+        }
+    }
+    out.push('\n');
+    out.push_str("  ");
+    for (idx, header) in headers.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        let underline_width = if width == 0 {
+            header.len().max(6)
+        } else {
+            width
+        };
+        out.push_str(&"-".repeat(underline_width));
+        if width != 0 {
+            out.push_str("  ");
+        }
+    }
+    out.push('\n');
+}
+
+fn push_postmortem_table_row(out: &mut String, headers: &[&str], cells: &[String]) {
+    let widths = postmortem_column_widths(headers);
+    out.push_str("  ");
+    for (idx, cell) in cells.iter().enumerate() {
+        let width = widths.get(idx).copied().unwrap_or(0);
+        let value = postmortem_table_cell(cell);
+        if width == 0 {
+            out.push_str(&value);
+        } else {
+            out.push_str(&format!("{:<width$}", value, width = width));
+            out.push_str("  ");
+        }
+    }
+    out.push('\n');
+}
+
+fn push_key_value_table(out: &mut String, rows: Vec<(&str, String)>) {
+    let label_width = rows
+        .iter()
+        .map(|(field, _)| field.len())
+        .max()
+        .unwrap_or(5)
+        .clamp(10, 28);
+    for (field, value) in rows {
+        out.push_str(&format!(
+            "  {:<label_width$}  {}\n",
+            field,
+            postmortem_table_cell(&value),
+            label_width = label_width
+        ));
+    }
+    out.push('\n');
 }
 
 fn render_postmortem_markdown(report: &serde_json::Value) -> String {
@@ -3033,6 +3411,7 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
         return;
     };
     out.push_str("\n## Signals\n");
+    let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(statuses) = signals
         .get("response_statuses")
         .and_then(|value| value.as_object())
@@ -3045,7 +3424,7 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .collect::<Vec<_>>()
             .join(", ");
         if !rendered.is_empty() {
-            push_md_bullet(out, &format!("Responses statuses: {rendered}"));
+            rows.push(("Responses statuses", rendered));
         }
     }
     if let Some(context) = signals.get("context_fill") {
@@ -3053,19 +3432,19 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .get("max_percent")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0);
-        push_md_bullet(out, &format!("Estimated context fill max: {percent:.1}%"));
+        rows.push(("Estimated context fill max", format!("{percent:.1}%")));
     }
     if let Some(cache) = signals.get("cached_input_reuse") {
         if let Some(ratio) = cache.get("ratio").and_then(|value| value.as_f64()) {
-            push_md_bullet(out, &format!("Cached input reuse: {:.0}%", ratio * 100.0));
+            rows.push(("Cached input reuse", format!("{:.0}%", ratio * 100.0)));
         }
     }
     if let Some(reasoning) = signals.get("reasoning_output_share") {
         if let Some(ratio) = reasoning.get("max_ratio").and_then(|value| value.as_f64()) {
-            push_md_bullet(
-                out,
-                &format!("Max reasoning-output share: {:.0}%", ratio * 100.0),
-            );
+            rows.push((
+                "Max reasoning-output share",
+                format!("{:.0}%", ratio * 100.0),
+            ));
         }
     }
     if let Some(counts) = signals
@@ -3080,9 +3459,10 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .collect::<Vec<_>>()
             .join(", ");
         if !rendered.is_empty() {
-            push_md_bullet(out, &format!("Tool-call intent: {rendered}"));
+            rows.push(("Tool-call intent", rendered));
         }
     }
+    push_key_value_table(out, rows);
 }
 
 fn render_postmortem_evidence(report: &serde_json::Value, out: &mut String) {
@@ -3095,6 +3475,8 @@ fn render_postmortem_evidence(report: &serde_json::Value, out: &mut String) {
         return;
     }
     out.push_str("\n## Evidence\n");
+    let headers = ["Type", "Signal", "Turn", "Detail"];
+    push_postmortem_table_header(out, &headers);
     for row in rows.iter().take(12) {
         let kind = json_str(row, "type").unwrap_or("signal");
         let signal = json_str(row, "signal").unwrap_or("unknown");
@@ -3103,7 +3485,16 @@ fn render_postmortem_evidence(report: &serde_json::Value, out: &mut String) {
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
         let detail = json_str(row, "detail").unwrap_or("");
-        push_md_bullet(out, &format!("[{kind}] turn {turn} {signal}: {detail}"));
+        push_postmortem_table_row(
+            out,
+            &headers,
+            &[
+                kind.to_string(),
+                signal.to_string(),
+                turn.to_string(),
+                detail.to_string(),
+            ],
+        );
     }
 }
 
@@ -3117,11 +3508,17 @@ fn render_postmortem_timeline(report: &serde_json::Value, out: &mut String) {
         return;
     }
     out.push_str("\n## Timeline\n");
+    let headers = ["Time", "Event", "Detail"];
+    push_postmortem_table_header(out, &headers);
     for row in rows.iter().take(14) {
         let timestamp = json_str(row, "timestamp").unwrap_or("");
         let event = json_str(row, "event").unwrap_or("event");
         let detail = json_str(row, "detail").unwrap_or("");
-        push_md_bullet(out, &format!("{timestamp} {event}: {detail}"));
+        push_postmortem_table_row(
+            out,
+            &headers,
+            &[timestamp.to_string(), event.to_string(), detail.to_string()],
+        );
     }
 }
 
@@ -3160,11 +3557,11 @@ fn render_postmortem_caveats(report: &serde_json::Value, out: &mut String) {
 }
 
 fn push_md_line(out: &mut String, label: &str, value: &str) {
-    out.push_str("- ");
-    out.push_str(label);
-    out.push_str(": ");
-    out.push_str(value);
-    out.push('\n');
+    out.push_str(&format!(
+        "  {:<24}  {}\n",
+        label,
+        postmortem_table_cell(value)
+    ));
 }
 
 fn push_md_bullet(out: &mut String, value: &str) {
