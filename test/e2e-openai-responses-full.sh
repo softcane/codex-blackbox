@@ -13,14 +13,14 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-RUN_ID="${CODITOR_FULL_E2E_RUN_ID:-openai-full-e2e-$(date +%s)-$$}"
-REPORT_DIR="${CODITOR_FULL_E2E_REPORT_DIR:-${TMPDIR:-/tmp}/coditor-phase9a-${RUN_ID}}"
+RUN_ID="${CODEX_BLACKBOX_FULL_E2E_RUN_ID:-openai-full-e2e-$(date +%s)-$$}"
+REPORT_DIR="${CODEX_BLACKBOX_FULL_E2E_REPORT_DIR:-${TMPDIR:-/tmp}/codex-blackbox-phase9a-${RUN_ID}}"
 REQUEST_DIR="$REPORT_DIR/requests"
 RESPONSE_DIR="$REPORT_DIR/responses"
 LOG_DIR="$REPORT_DIR/logs"
 REQUEST_MANIFEST="$REPORT_DIR/requests.tsv"
 DB_COPY_DIR="$REPORT_DIR/db"
-DB_SNAPSHOT="$DB_COPY_DIR/coditor.db"
+DB_SNAPSHOT="$DB_COPY_DIR/codex-blackbox.db"
 
 CORE_URL="http://localhost:9091"
 ENVOY_URL="http://localhost:10000"
@@ -59,15 +59,15 @@ compose() {
 }
 
 cleanup_stack_on_failure() {
-    if [ "$FULL_E2E_COMPLETED" = "1" ] || [ "${CODITOR_FULL_E2E_KEEP_STACK:-0}" = "1" ]; then
+    if [ "$FULL_E2E_COMPLETED" = "1" ] || [ "${CODEX_BLACKBOX_FULL_E2E_KEEP_STACK:-0}" = "1" ]; then
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null 2>&1 || true
 }
 
 cleanup_stack_on_success() {
-    if [ "${CODITOR_FULL_E2E_KEEP_STACK:-0}" = "1" ]; then
-        info "Leaving full fake E2E stack running because CODITOR_FULL_E2E_KEEP_STACK=1"
+    if [ "${CODEX_BLACKBOX_FULL_E2E_KEEP_STACK:-0}" = "1" ]; then
+        info "Leaving full fake E2E stack running because CODEX_BLACKBOX_FULL_E2E_KEEP_STACK=1"
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null
@@ -103,6 +103,16 @@ assert_file_contains() {
     grep -q "$needle" "$file" && pass "$label" || fail "$label missing '$needle' in $file"
 }
 
+assert_file_not_contains() {
+    local file=$1
+    local needle=$2
+    local label=$3
+    if grep -q "$needle" "$file"; then
+        fail "$label unexpectedly contained '$needle' in $file"
+    fi
+    pass "$label"
+}
+
 generate_requests() {
     RUN_ID="$RUN_ID" REQUEST_DIR="$REQUEST_DIR" REQUEST_MANIFEST="$REQUEST_MANIFEST" python3 - <<'PY'
 import json
@@ -113,7 +123,7 @@ run_id = os.environ["RUN_ID"]
 request_dir = Path(os.environ["REQUEST_DIR"])
 manifest = Path(os.environ["REQUEST_MANIFEST"])
 repo = str(Path.cwd())
-other_repo = "/tmp/coditor-phase9a-other-repo"
+other_repo = "/tmp/codex-blackbox-phase9a-other-repo"
 
 cases = [
     {
@@ -174,10 +184,10 @@ with manifest.open("w", encoding="utf-8") as out:
                 }
             ],
             "reasoning": {"effort": "medium", "summary": "auto"},
-            "prompt_cache_key": f"coditor-phase9a:{item['cwd']}",
+            "prompt_cache_key": f"codex-blackbox-phase9a:{item['cwd']}",
             "metadata": {
                 "cwd": item["cwd"],
-                "coditor_fixture": metadata_fixture,
+                "codex_blackbox_fixture": metadata_fixture,
                 "phase": "9A",
                 "case": item["case"],
                 "run_id": run_id,
@@ -229,8 +239,8 @@ send_case() {
             -H "accept-encoding: gzip" \
             -H "session-id: $session_id" \
             -H "x-client-request-id: $request_id" \
-            -H "x-coditor-fixture: $fixture" \
-            -H "x-coditor-split-sse: 1" \
+            -H "x-codex-blackbox-fixture: $fixture" \
+            -H "x-codex-blackbox-split-sse: 1" \
             --data-binary @"$request_path" \
             "$ENVOY_URL/v1/responses" 2>"$error_path"); then
             printf "curl failed for %s; stderr in %s\n" "$case_name" "$error_path" >&2
@@ -245,7 +255,7 @@ send_case() {
             -H "accept-encoding: gzip" \
             -H "session-id: $session_id" \
             -H "x-client-request-id: $request_id" \
-            -H "x-coditor-fixture: $fixture" \
+            -H "x-codex-blackbox-fixture: $fixture" \
             --data-binary @"$request_path" \
             "$ENVOY_URL/v1/responses" 2>"$error_path"); then
             printf "curl failed for %s; stderr in %s\n" "$case_name" "$error_path" >&2
@@ -261,11 +271,11 @@ send_case() {
     case "$fixture" in
         completed)
             grep -q "response.completed" "$output_path" || return 1
-            grep -q "Workspace packages: coditor-core and coditor-cli." "$output_path" || return 1
+            grep -q "Workspace packages: codex-blackbox-core and codex-blackbox-cli." "$output_path" || return 1
             ;;
         failed)
             grep -q "response.failed" "$output_path" || return 1
-            grep -q "Fixture failure for Coditor contract tests." "$output_path" || return 1
+            grep -q "Fixture failure for Codex Blackbox contract tests." "$output_path" || return 1
             ;;
         incomplete)
             grep -q "response.incomplete" "$output_path" || return 1
@@ -351,8 +361,8 @@ assert_watch_replay() {
 
 copy_db_snapshot() {
     local container_id
-    container_id=$(compose ps -q coditor-core)
-    [ -n "$container_id" ] || fail "coditor-core container id unavailable for DB snapshot"
+    container_id=$(compose ps -q codex-blackbox-core)
+    [ -n "$container_id" ] || fail "codex-blackbox-core container id unavailable for DB snapshot"
     rm -rf "$DB_COPY_DIR"
     mkdir -p "$DB_COPY_DIR"
     docker cp "$container_id:/data/." "$DB_COPY_DIR/" >/dev/null
@@ -428,7 +438,7 @@ requests = {
         SELECT session_id, request_id, provider, requested_model, served_model, codex_status,
                codex_input_tokens, codex_cached_input_tokens, codex_uncached_input_tokens,
                codex_output_tokens, codex_reasoning_output_tokens, codex_total_tokens,
-               codex_prompt_excerpt
+               codex_prompt_excerpt, codex_failure_detail, codex_incomplete_detail
         FROM requests
         WHERE session_id IN ({placeholders})
         """,
@@ -441,7 +451,8 @@ turns = {
         f"""
         SELECT session_id, provider, codex_status, codex_input_tokens,
                codex_cached_input_tokens, codex_uncached_input_tokens,
-               codex_output_tokens, codex_total_tokens
+               codex_output_tokens, codex_total_tokens, codex_failure_detail,
+               codex_incomplete_detail
         FROM turn_snapshots
         WHERE session_id IN ({placeholders})
         """,
@@ -472,6 +483,14 @@ for case in cases:
         fail(f"{case['case']} did not persist provider=codex_responses")
     if req["codex_status"] != case["status"] or turn["codex_status"] != case["status"]:
         fail(f"{case['case']} status mismatch: request={req['codex_status']} turn={turn['codex_status']}")
+    if case["fixture"] == "failed":
+        expected = "Fixture failure for Codex Blackbox contract tests."
+        if req["codex_failure_detail"] != expected or turn["codex_failure_detail"] != expected:
+            fail(f"{case['case']} failed detail was not persisted in request and turn rows")
+    if case["fixture"] == "incomplete":
+        expected = "max_output_tokens"
+        if req["codex_incomplete_detail"] != expected or turn["codex_incomplete_detail"] != expected:
+            fail(f"{case['case']} incomplete detail was not persisted in request and turn rows")
     if case["prompt"] not in (req["codex_prompt_excerpt"] or ""):
         fail(f"{case['case']} request prompt excerpt did not include distinct first prompt")
     if case["prompt"] not in (session["initial_prompt"] or ""):
@@ -516,6 +535,37 @@ assert_diagnosis_api() {
     curl -fsS "$CORE_URL/api/diagnosis/$incomplete_session" >"$RESPONSE_DIR/diagnosis-incomplete.json"
     assert_file_contains "$RESPONSE_DIR/diagnosis-failed.json" "codex_response_failed" "diagnosis API reports failed response"
     assert_file_contains "$RESPONSE_DIR/diagnosis-incomplete.json" "codex_response_incomplete" "diagnosis API reports incomplete response"
+}
+
+assert_postmortem_api() {
+    while IFS=$'\t' read -r case_name session_id request_id fixture cwd prompt request_path split; do
+        local output_path="$RESPONSE_DIR/postmortem-${case_name}.json"
+        local status
+        status=$(expected_status_for_fixture "$fixture")
+        curl -fsS "$CORE_URL/api/postmortem/$session_id" >"$output_path"
+        assert_file_contains "$output_path" "\"report_type\": \"codex_responses_postmortem\"" "postmortem API returns Codex report for $case_name"
+        assert_file_contains "$output_path" "\"$status\": 1" "postmortem API reports $status status for $case_name"
+        assert_file_contains "$output_path" "\"redacted\": true" "postmortem API defaults to redacted report for $case_name"
+        assert_file_contains "$output_path" "\"input_tokens\"" "postmortem API includes token impact for $case_name"
+        assert_file_contains "$output_path" "\"cached_input_tokens\"" "postmortem API includes cached input impact for $case_name"
+        case "$fixture" in
+            failed)
+                assert_file_contains "$output_path" "Fixture failure for Codex Blackbox contract tests." "postmortem API preserves failed detail"
+                assert_file_contains "$output_path" "codex_response_failed" "postmortem API reports failed evidence"
+                ;;
+            incomplete)
+                assert_file_contains "$output_path" "max_output_tokens" "postmortem API preserves incomplete reason"
+                assert_file_contains "$output_path" "codex_response_incomplete" "postmortem API reports incomplete evidence"
+                ;;
+            completed)
+                assert_file_contains "$output_path" "\"completed\": 1" "postmortem API reports completed evidence"
+                ;;
+        esac
+        for forbidden in "tool_result" "tool result" "MCP lifecycle" "SkillEvent" "cache TTL" "cache rebuild" "quota" "provider cap"; do
+            assert_file_not_contains "$output_path" "$forbidden" "postmortem API avoids unsupported surface for $case_name"
+        done
+    done <"$REQUEST_MANIFEST"
+    pass "Postmortem API reports completed, failed, and incomplete fake Responses evidence"
 }
 
 assert_prometheus_and_grafana() {
@@ -567,32 +617,32 @@ def wait_until(label, predicate, timeout=90):
         fail(f"{label} did not become true: {last_error}")
     fail(f"{label} did not become true before timeout")
 
-wait_until("Prometheus scrape for coditor-core", lambda: prom_value('up{job="coditor-core"}') == 1.0)
+wait_until("Prometheus scrape for codex-blackbox-core", lambda: prom_value('up{job="codex-blackbox-core"}') == 1.0)
 wait_until(
     "Prometheus observed all Phase 9A requests",
-    lambda: (prom_value("sum(coditor_requests_total)") or 0.0) >= expected_requests,
+    lambda: (prom_value("sum(codex_blackbox_requests_total)") or 0.0) >= expected_requests,
 )
 wait_until(
     "Prometheus observed context fill samples",
-    lambda: (prom_value('sum(coditor_context_fill_percent_count{provider="codex_responses"})') or 0.0) >= expected_requests,
+    lambda: (prom_value('sum(codex_blackbox_context_fill_percent_count{provider="codex_responses"})') or 0.0) >= expected_requests,
 )
 wait_until(
     "Prometheus observed input tokens",
-    lambda: (prom_value('sum(coditor_tokens_total{kind="input"})') or 0.0) > 0,
+    lambda: (prom_value('sum(codex_blackbox_tokens_total{kind="input"})') or 0.0) > 0,
 )
 wait_until(
     "Prometheus observed output tokens",
-    lambda: (prom_value('sum(coditor_tokens_total{kind="output"})') or 0.0) > 0,
+    lambda: (prom_value('sum(codex_blackbox_tokens_total{kind="output"})') or 0.0) > 0,
 )
 
 required_metrics = [
-    "coditor_requests_total",
-    "coditor_tokens_total",
-    "coditor_turn_duration_seconds_count",
-    "coditor_context_fill_percent_count",
-    'coditor_sessions_degraded_total{cause_type="codex_response_failed"}',
-    'coditor_codex_response_status_total{status="failed"}',
-    'coditor_codex_response_status_total{status="incomplete"}',
+    "codex_blackbox_requests_total",
+    "codex_blackbox_tokens_total",
+    "codex_blackbox_turn_duration_seconds_count",
+    "codex_blackbox_context_fill_percent_count",
+    'codex_blackbox_sessions_degraded_total{cause_type="codex_response_failed"}',
+    'codex_blackbox_codex_response_status_total{status="failed"}',
+    'codex_blackbox_codex_response_status_total{status="incomplete"}',
 ]
 for expr in required_metrics:
     wait_until(f"metric {expr}", lambda expr=expr: len(prom_query(expr)) > 0)
@@ -602,7 +652,7 @@ series = get_json(
     prom_url,
     "/api/v1/series",
     {
-        "match[]": '{__name__=~"coditor_.*"}',
+        "match[]": '{__name__=~"codex_blackbox_.*"}',
         "start": str(now - 3600),
         "end": str(now),
     },
@@ -623,11 +673,11 @@ for item in series.get("data", []):
 health = get_json(grafana_url, "/api/health")
 if health.get("database") != "ok":
     fail(f"Grafana health failed: {health}")
-search = get_json(grafana_url, "/api/search", {"query": "Coditor"})
-if not any(item.get("uid") == "coditor-main" for item in search):
-    fail(f"Grafana did not provision coditor-main dashboard: {search}")
-dashboard = get_json(grafana_url, "/api/dashboards/uid/coditor-main").get("dashboard", {})
-if dashboard.get("uid") != "coditor-main":
+search = get_json(grafana_url, "/api/search", {"query": "Codex Blackbox"})
+if not any(item.get("uid") == "codex-blackbox-main" for item in search):
+    fail(f"Grafana did not provision codex-blackbox-main dashboard: {search}")
+dashboard = get_json(grafana_url, "/api/dashboards/uid/codex-blackbox-main").get("dashboard", {})
+if dashboard.get("uid") != "codex-blackbox-main":
     fail("Grafana dashboard uid mismatch")
 panel_titles = {panel.get("title") for panel in dashboard.get("panels", [])}
 required_panel_titles = {
@@ -644,7 +694,7 @@ for title in required_panel_titles:
 
 metric_names = {
     item["metric"]["__name__"]
-    for item in prom_query('{__name__=~"coditor_.*"}')
+    for item in prom_query('{__name__=~"codex_blackbox_.*"}')
     if item.get("metric", {}).get("__name__")
 }
 for panel in dashboard.get("panels", []):
@@ -652,7 +702,7 @@ for panel in dashboard.get("panels", []):
         continue
     for target in panel.get("targets", []) or []:
         expr = target.get("expr", "")
-        for metric_name in sorted(set(re.findall(r"\bcoditor_[A-Za-z_:][A-Za-z0-9_:]*", expr))):
+        for metric_name in sorted(set(re.findall(r"\bcodex_blackbox_[A-Za-z_:][A-Za-z0-9_:]*", expr))):
             if metric_name not in metric_names:
                 fail(f"Grafana panel {panel.get('title')!r} references missing metric {metric_name}")
 
@@ -677,22 +727,22 @@ PY
 }
 
 assert_cli_dry_run() {
-    local output_path="$REPORT_DIR/coditor-run-dry-run.txt"
-    cargo run -q -p coditor-cli -- run --dry-run -- codex exec "Phase 9A fake smoke" >"$output_path"
+    local output_path="$REPORT_DIR/codex-blackbox-run-dry-run.txt"
+    cargo run -q -p codex-blackbox-cli -- run --dry-run -- codex exec "Phase 9A fake smoke" >"$output_path"
     assert_file_contains "$output_path" "Mode: experimental Codex ChatGPT subscription proxy" "CLI dry-run uses subscription proxy mode"
     assert_file_contains "$output_path" "Config files: not modified" "CLI dry-run is read-only"
     assert_file_contains "$output_path" "chatgpt_base_url" "CLI dry-run prints ChatGPT backend proxy override"
-    assert_file_contains "$output_path" "model_provider=\"coditor-chatgpt\"" "CLI dry-run uses the Coditor ChatGPT subscription provider"
-    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.base_url=\"http://127.0.0.1:10000/backend-api/codex\"" "CLI dry-run routes model turns through Coditor"
-    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.requires_openai_auth=true" "CLI dry-run preserves ChatGPT auth"
-    assert_file_contains "$output_path" "model_providers.coditor-chatgpt.supports_websockets=false" "CLI dry-run forces HTTP Responses through Envoy"
+    assert_file_contains "$output_path" "model_provider=\"codex-blackbox-chatgpt\"" "CLI dry-run uses the Codex Blackbox ChatGPT subscription provider"
+    assert_file_contains "$output_path" "model_providers.codex-blackbox-chatgpt.base_url=\"http://127.0.0.1:10000/backend-api/codex\"" "CLI dry-run routes model turns through Codex Blackbox"
+    assert_file_contains "$output_path" "model_providers.codex-blackbox-chatgpt.requires_openai_auth=true" "CLI dry-run preserves ChatGPT auth"
+    assert_file_contains "$output_path" "model_providers.codex-blackbox-chatgpt.supports_websockets=false" "CLI dry-run forces HTTP Responses through Envoy"
     assert_file_contains "$output_path" "OPENAI_API_KEY is not used" "CLI dry-run labels subscription auth"
     assert_file_contains "$output_path" "Environment removals:" "CLI dry-run prints inherited Codex env removals"
     assert_file_contains "$output_path" "CODEX_THREAD_ID" "CLI dry-run removes parent Codex thread env"
     assert_file_contains "$output_path" "Child stdin: closed for Codex exec" "CLI dry-run closes Codex stdin for harness safety"
     assert_file_contains "$output_path" "features.enable_request_compression=false" "CLI dry-run disables request compression"
-    assert_file_contains "$output_path" "Post-run check: require Coditor to observe at least one Codex Responses request" "CLI dry-run labels observation gate"
-    if grep -q "forced_login_method\\|env_key\\|openai_base_url\\|coditor-openai\\|coditor-openai-responses" "$output_path"; then
+    assert_file_contains "$output_path" "Post-run check: require Codex Blackbox to observe at least one Codex Responses request" "CLI dry-run labels observation gate"
+    if grep -q "forced_login_method\\|env_key\\|openai_base_url\\|codex-blackbox-openai\\|codex-blackbox-openai-responses" "$output_path"; then
         fail "CLI dry-run should not print API-key or stale custom/fake-provider overrides"
     fi
     assert_file_contains "$output_path" "exec -c" "CLI dry-run attaches subscription overrides to Codex exec"
@@ -713,11 +763,11 @@ run_id = os.environ["RUN_ID"]
 path = os.environ["REQUEST_PATH"]
 body = {
     "model": "gpt-codex-fixture",
-    "instructions": "Local failure-open fixture after coditor-core is stopped.",
+    "instructions": "Local failure-open fixture after codex-blackbox-core is stopped.",
     "input": f"Phase 9A {run_id}: verify Envoy failure-open after core stop.",
     "metadata": {
-        "cwd": "/tmp/coditor-failure-open",
-        "coditor_fixture": "minimal_text",
+        "cwd": "/tmp/codex-blackbox-failure-open",
+        "codex_blackbox_fixture": "minimal_text",
         "phase": "9A",
         "case": "failure-open",
     },
@@ -731,8 +781,8 @@ with open(path, "w", encoding="utf-8") as handle:
     json.dump(body, handle, indent=2)
 PY
 
-    info "Stopping coditor-core to verify Envoy failure-open behavior"
-    compose stop coditor-core >/dev/null
+    info "Stopping codex-blackbox-core to verify Envoy failure-open behavior"
+    compose stop codex-blackbox-core >/dev/null
     local http_code
     if ! http_code=$(curl -sS --max-time 45 --no-buffer -N \
         -w "%{http_code}" \
@@ -741,27 +791,27 @@ PY
         -H "content-type: application/json" \
         -H "session-id: phase-9a-${RUN_ID}-failure-open" \
         -H "x-client-request-id: req-${RUN_ID}-failure-open" \
-        -H "x-coditor-fixture: completed" \
+        -H "x-codex-blackbox-fixture: completed" \
         --data-binary @"$request_path" \
         "$ENVOY_URL/v1/responses" 2>"$RESPONSE_DIR/failure-open.err"); then
-        fail "failure-open curl failed after coditor-core stop; see $RESPONSE_DIR/failure-open.err"
+        fail "failure-open curl failed after codex-blackbox-core stop; see $RESPONSE_DIR/failure-open.err"
     fi
     [ "$http_code" = "200" ] || fail "failure-open expected HTTP 200, got $http_code; see $response_path"
-    assert_file_contains "$response_path" "response.completed" "Envoy remains failure-open when coditor-core is stopped"
-    assert_file_contains "$response_path" "Workspace packages: coditor-core and coditor-cli." "failure-open response came from fake upstream"
+    assert_file_contains "$response_path" "response.completed" "Envoy remains failure-open when codex-blackbox-core is stopped"
+    assert_file_contains "$response_path" "Workspace packages: codex-blackbox-core and codex-blackbox-cli." "failure-open response came from fake upstream"
 }
 
-echo "=== Coditor full fake OpenAI Responses E2E Test ==="
+echo "=== Codex Blackbox full fake OpenAI Responses E2E Test ==="
 info "run_id=$RUN_ID"
 info "report_dir=$REPORT_DIR"
 
 generate_requests
 info "Starting Docker Compose with fake OpenAI, Prometheus, and Grafana..."
 compose down --remove-orphans -t 5 2>/dev/null || true
-compose up -d --build coditor-core envoy fake-openai prometheus grafana
+compose up -d --build codex-blackbox-core envoy fake-openai prometheus grafana
 
-info "Waiting for coditor-core, Envoy, Prometheus, and Grafana..."
-wait_for_http "coditor-core" "$CORE_URL/health"
+info "Waiting for codex-blackbox-core, Envoy, Prometheus, and Grafana..."
+wait_for_http "codex-blackbox-core" "$CORE_URL/health"
 wait_for_http "envoy" "$ENVOY_URL/health"
 wait_for_http "prometheus" "$PROMETHEUS_URL/-/ready"
 wait_for_http "grafana" "$GRAFANA_URL/api/health"
@@ -770,6 +820,7 @@ pass "Core, Envoy, Prometheus, and Grafana are reachable"
 send_parallel_requests
 assert_watch_replay
 assert_diagnosis_api
+assert_postmortem_api
 assert_sqlite_persistence
 assert_prometheus_and_grafana
 assert_cli_dry_run

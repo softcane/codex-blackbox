@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fake OpenAI Responses upstream for Coditor fixture E2E tests.
+"""Fake OpenAI Responses upstream for Codex Blackbox fixture E2E tests.
 
 This server is intentionally local-only test infrastructure. It accepts
 Responses-shaped requests and streams checked-in fixture SSE without contacting
@@ -27,14 +27,14 @@ SPLIT_STREAM_CHUNK_SIZE = 7
 
 
 def _scenario_from_request(headers, body: dict) -> str:
-    explicit = headers.get("x-coditor-fixture")
+    explicit = headers.get("x-codex-blackbox-fixture")
     if explicit in STREAM_FIXTURES:
         return explicit
 
     for key in ("metadata", "client_metadata"):
         value = body.get(key)
         if isinstance(value, dict):
-            fixture = value.get("coditor_fixture")
+            fixture = value.get("codex_blackbox_fixture")
             if fixture in {"failed", "incomplete"}:
                 return fixture
     return "completed"
@@ -105,7 +105,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("connection", "close")
         self.end_headers()
 
-        if self.headers.get("x-coditor-split-sse") == "1":
+        if self.headers.get("x-codex-blackbox-split-sse") == "1":
             for offset in range(0, len(stream), SPLIT_STREAM_CHUNK_SIZE):
                 self.wfile.write(stream[offset : offset + SPLIT_STREAM_CHUNK_SIZE])
                 self.wfile.flush()

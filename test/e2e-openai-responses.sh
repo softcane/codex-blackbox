@@ -24,7 +24,7 @@ for cmd in docker curl python3; do
     require_cmd "$cmd"
 done
 
-RUN_ID="${CODITOR_OPENAI_E2E_RUN_ID:-openai-e2e-$(date +%s)-$$}"
+RUN_ID="${CODEX_BLACKBOX_OPENAI_E2E_RUN_ID:-openai-e2e-$(date +%s)-$$}"
 SESSION_ID="phase-5a-${RUN_ID}"
 REQUEST_ID="req-${RUN_ID}"
 CORE_URL="http://localhost:9091"
@@ -37,15 +37,15 @@ compose() {
 }
 
 cleanup_e2e_stack_on_failure() {
-    if [ "$E2E_COMPLETED" = "1" ] || [ "${CODITOR_OPENAI_E2E_KEEP_STACK:-0}" = "1" ]; then
+    if [ "$E2E_COMPLETED" = "1" ] || [ "${CODEX_BLACKBOX_OPENAI_E2E_KEEP_STACK:-0}" = "1" ]; then
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null 2>&1 || true
 }
 
 cleanup_e2e_stack_on_success() {
-    if [ "${CODITOR_OPENAI_E2E_KEEP_STACK:-0}" = "1" ]; then
-        info "Leaving fake OpenAI Responses E2E stack running because CODITOR_OPENAI_E2E_KEEP_STACK=1"
+    if [ "${CODEX_BLACKBOX_OPENAI_E2E_KEEP_STACK:-0}" = "1" ]; then
+        info "Leaving fake OpenAI Responses E2E stack running because CODEX_BLACKBOX_OPENAI_E2E_KEEP_STACK=1"
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null
@@ -62,7 +62,7 @@ wait_for_core() {
         sleep 2
     done
     compose ps
-    fail "coditor-core did not become healthy"
+    fail "codex-blackbox-core did not become healthy"
 }
 
 wait_for_envoy() {
@@ -110,14 +110,14 @@ fetch_watch_for_session() {
     return 1
 }
 
-echo "=== Coditor fake OpenAI Responses E2E Test ==="
+echo "=== Codex Blackbox fake OpenAI Responses E2E Test ==="
 info "run_id=$RUN_ID"
 info "session_id=$SESSION_ID"
 info "Starting Docker Compose with fake OpenAI Responses upstream..."
 compose down --remove-orphans -t 5 2>/dev/null || true
-compose up -d --build coditor-core envoy fake-openai
+compose up -d --build codex-blackbox-core envoy fake-openai
 
-info "Waiting for coditor-core and envoy..."
+info "Waiting for codex-blackbox-core and envoy..."
 wait_for_core
 wait_for_envoy
 pass "Core and Envoy are reachable"
@@ -135,10 +135,10 @@ response=$(curl -fsS --max-time 30 --no-buffer -N \
 assert_contains "$response" "event: response.created" "Stream contains response.created"
 assert_contains "$response" "response.output_text.delta" "Stream contains text delta"
 assert_contains "$response" "response.completed" "Stream contains response.completed"
-assert_contains "$response" "Workspace packages: coditor-core and coditor-cli." "Stream contains fixture text"
+assert_contains "$response" "Workspace packages: codex-blackbox-core and codex-blackbox-cli." "Stream contains fixture text"
 pass "Envoy streamed fake OpenAI Responses SSE"
 
-info "Checking Coditor watch events for Codex finalization..."
+info "Checking Codex Blackbox watch events for Codex finalization..."
 watch_output=$(fetch_watch_for_session) || fail "/watch did not expose Codex SessionStart, turn summary, and ContextStatus for $SESSION_ID; output: $watch_output"
 assert_contains "$watch_output" '"type":"session_start"' "/watch exposes Codex SessionStart"
 assert_contains "$watch_output" '"type":"codex_turn_summary"' "/watch exposes Codex turn summary"
@@ -151,7 +151,17 @@ assert_not_contains "$watch_output" "cache_expires_at_epoch" "/watch has no cach
 assert_not_contains "$watch_output" "estimated_rebuild_cost_dollars" "/watch has no rebuild estimate for Codex"
 
 metrics=$(curl -fsS "$CORE_URL/metrics")
-assert_contains "$metrics" "coditor_requests_total" "Core metrics endpoint is live"
+assert_contains "$metrics" "codex_blackbox_requests_total" "Core metrics endpoint is live"
+
+postmortem=$(curl -fsS "$CORE_URL/api/postmortem/$SESSION_ID")
+assert_contains "$postmortem" '"report_type": "codex_responses_postmortem"' "Postmortem API returns Codex Responses report"
+assert_contains "$postmortem" '"redacted": true' "Postmortem API defaults to redacted output"
+assert_contains "$postmortem" '"completed": 1' "Postmortem API reports completed Responses status"
+assert_contains "$postmortem" '"cached_input_tokens"' "Postmortem API reports cached input accounting"
+assert_not_contains "$postmortem" "tool_result" "Postmortem API has no tool-result surface"
+assert_not_contains "$postmortem" "MCP lifecycle" "Postmortem API has no MCP lifecycle surface"
+assert_not_contains "$postmortem" "cache TTL" "Postmortem API has no cache TTL surface"
+assert_not_contains "$postmortem" "quota" "Postmortem API has no quota surface"
 
 echo ""
 echo "=== Fake OpenAI Responses E2E checks passed ==="

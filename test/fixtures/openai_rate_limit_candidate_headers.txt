@@ -1,7 +1,7 @@
 # Fixture-only candidate headers for future rate-limit boundary tests.
 #
 # These names and units are unverified for Codex/OpenAI Responses traffic
-# observed through Coditor. Do not parse them as production truth until a real
+# observed through Codex Blackbox. Do not parse them as production truth until a real
 # capture confirms exact names, presence, units, and reset semantics.
 
 x-ratelimit-limit-requests: 1000

@@ -6,7 +6,7 @@ services:
     ports:
       - "127.0.0.1:10000:10000"
     depends_on:
-      coditor-core:
+      codex-blackbox-core:
         condition: service_healthy
     healthcheck:
       test:
@@ -19,21 +19,21 @@ services:
       timeout: 3s
       retries: 5
 
-  coditor-core:
+  codex-blackbox-core:
     build:
       context: .
-      dockerfile: coditor-core/Dockerfile
+      dockerfile: codex-blackbox-core/Dockerfile
     expose:
       - "50051"
     ports:
       - "127.0.0.1:9091:9090"
     environment:
       - RUST_LOG=info
-      - CODITOR_SESSION_BUDGET_DOLLARS=0
-      - CODITOR_SESSION_BUDGET_TOKENS=0
-      - CODITOR_CIRCUIT_BREAKER_THRESHOLD=5
+      - CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS=0
+      - CODEX_BLACKBOX_SESSION_BUDGET_TOKENS=0
+      - CODEX_BLACKBOX_CIRCUIT_BREAKER_THRESHOLD=5
     volumes:
-      - coditor_data:/data
+      - codex_blackbox_data:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/health"]
       interval: 5s
@@ -53,7 +53,7 @@ services:
       - "--storage.tsdb.retention.time=30d"
       - "--web.enable-lifecycle"
     depends_on:
-      coditor-core:
+      codex-blackbox-core:
         condition: service_healthy
 
   grafana:
@@ -74,6 +74,6 @@ services:
       - prometheus
 
 volumes:
-  coditor_data:
+  codex_blackbox_data:
   prometheus_data:
   grafana_data:

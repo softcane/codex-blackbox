@@ -17,10 +17,10 @@
     "effort": "medium",
     "summary": "auto"
   },
-  "prompt_cache_key": "coditor-fixture:/Users/pradeepsingh/code/coditor",
+  "prompt_cache_key": "codex-blackbox-fixture:/Users/pradeepsingh/code/codex-blackbox",
   "metadata": {
-    "cwd": "/Users/pradeepsingh/code/coditor",
-    "coditor_fixture": "minimal_text"
+    "cwd": "/Users/pradeepsingh/code/codex-blackbox",
+    "codex_blackbox_fixture": "minimal_text"
   },
   "client_metadata": {
     "session_id": "codex-session-fixture-001",

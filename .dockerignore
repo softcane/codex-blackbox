@@ -1,7 +1,7 @@
 **
 !Cargo.toml
 !Cargo.lock
-!coditor-cli/
-!coditor-cli/**
-!coditor-core/
-!coditor-core/**
+!codex-blackbox-cli/
+!codex-blackbox-cli/**
+!codex-blackbox-core/
+!codex-blackbox-core/**

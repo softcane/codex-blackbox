@@ -41,10 +41,10 @@
   "reasoning": {
     "effort": "low"
   },
-  "prompt_cache_key": "coditor-fixture:/Users/pradeepsingh/code/coditor:tools",
+  "prompt_cache_key": "codex-blackbox-fixture:/Users/pradeepsingh/code/codex-blackbox:tools",
   "metadata": {
-    "cwd": "/Users/pradeepsingh/code/coditor",
-    "coditor_fixture": "tool_use"
+    "cwd": "/Users/pradeepsingh/code/codex-blackbox",
+    "codex_blackbox_fixture": "tool_use"
   },
   "client_metadata": {
     "session_id": "codex-session-fixture-tools-001",

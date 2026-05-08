@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Phase 9C real Codex multi-session dogfood feedback harness.
 #
-# In --mode real this launches real Codex sessions through Coditor's
+# In --mode real this launches real Codex sessions through Codex Blackbox's
 # ChatGPT/Codex subscription proxy path. It uses the existing local Codex
 # ChatGPT login, can contact chatgpt.com, and must not edit ~/.codex/config.toml.
 # Run the fake Phase 9A gate first:
@@ -25,11 +25,11 @@ OTHER_REPO=""
 REPORT_DIR=""
 SESSION_TIMEOUT_SECONDS=360
 
-CORE_URL="${CODITOR_CORE_URL:-http://127.0.0.1:9091}"
-ENVOY_URL="${CODITOR_ENVOY_PROXY_URL:-http://127.0.0.1:10000}"
-PROMETHEUS_URL="${CODITOR_PROMETHEUS_URL:-http://127.0.0.1:9092}"
-GRAFANA_URL="${CODITOR_GRAFANA_URL:-http://127.0.0.1:3000}"
-COMPOSE_PATH="${CODITOR_COMPOSE_FILE:-docker-compose.yml}"
+CORE_URL="${CODEX_BLACKBOX_CORE_URL:-http://127.0.0.1:9091}"
+ENVOY_URL="${CODEX_BLACKBOX_ENVOY_PROXY_URL:-http://127.0.0.1:10000}"
+PROMETHEUS_URL="${CODEX_BLACKBOX_PROMETHEUS_URL:-http://127.0.0.1:9092}"
+GRAFANA_URL="${CODEX_BLACKBOX_GRAFANA_URL:-http://127.0.0.1:3000}"
+COMPOSE_PATH="${CODEX_BLACKBOX_COMPOSE_FILE:-docker-compose.yml}"
 case "$COMPOSE_PATH" in
     /*) ;;
     *) COMPOSE_PATH="$(pwd)/$COMPOSE_PATH" ;;
@@ -136,9 +136,9 @@ WATCH_SSE="$REPORT_DIR/watch.sse"
 WATCH_NDJSON="$REPORT_DIR/watch.ndjson"
 SUMMARY_JSON="$REPORT_DIR/summary.json"
 SUMMARY_MD="$REPORT_DIR/summary.md"
-PROMPT_MARKER="CODITOR_DOGFOOD_${RUN_ID}"
+PROMPT_MARKER="CODEX_BLACKBOX_DOGFOOD_${RUN_ID}"
 CODEX_BIN="${CODEX_BIN:-codex}"
-CODITOR_BIN="${CODITOR_BIN:-}"
+CODEX_BLACKBOX_BIN="${CODEX_BLACKBOX_BIN:-}"
 STACK_ALREADY_READY=0
 WATCH_PID=""
 
@@ -219,7 +219,7 @@ wait_for_envoy_subscription_route() {
 }
 
 compose() {
-    env -u COMPOSE_FILE docker compose -p coditor -f "$COMPOSE_PATH" "$@"
+    env -u COMPOSE_FILE docker compose -p codex-blackbox -f "$COMPOSE_PATH" "$@"
 }
 
 capture_compose_logs() {
@@ -435,7 +435,7 @@ if api_sessions:
 else:
     add("missing", "api_sessions_query", "no sessions returned by /api/sessions")
 
-db_path = report_dir / "coditor.db"
+db_path = report_dir / "codex-blackbox.db"
 db_session_ids = set()
 if db_path.exists():
     try:
@@ -507,7 +507,7 @@ if db_path.exists():
     except Exception as exc:
         add("failed", "sqlite_query", str(exc))
 else:
-    add("missing", "sqlite_codex_persistence", "coditor.db was not copied from coditor-core")
+    add("missing", "sqlite_codex_persistence", "codex-blackbox.db was not copied from codex-blackbox-core")
 
 
 def get_json(base_url, path, params=None, timeout=8):
@@ -534,42 +534,42 @@ prometheus_checks = {}
 try:
     deadline = time.time() + 90
     while time.time() < deadline:
-        value = prom_value('sum(coditor_requests_total{provider="codex_responses"})')
+        value = prom_value('sum(codex_blackbox_requests_total{provider="codex_responses"})')
         if value and value >= 1:
             break
         time.sleep(2)
     prometheus_checks["codex_requests_total"] = prom_value(
-        'sum(coditor_requests_total{provider="codex_responses"})'
+        'sum(codex_blackbox_requests_total{provider="codex_responses"})'
     )
     token_kinds = ["input", "cached_input", "uncached_input", "output", "reasoning_output", "total"]
     token_values = {
-        kind: prom_value(f'sum(coditor_tokens_total{{provider="codex_responses",kind="{kind}"}})')
+        kind: prom_value(f'sum(codex_blackbox_tokens_total{{provider="codex_responses",kind="{kind}"}})')
         for kind in token_kinds
     }
     prometheus_checks["token_values"] = token_values
     if prometheus_checks["codex_requests_total"] and prometheus_checks["codex_requests_total"] >= 1:
         add("passed", "prometheus_codex_requests", str(prometheus_checks["codex_requests_total"]))
     else:
-        add("missing", "prometheus_codex_requests", "coditor_requests_total provider=codex_responses missing")
+        add("missing", "prometheus_codex_requests", "codex_blackbox_requests_total provider=codex_responses missing")
     missing_tokens = [kind for kind, value in token_values.items() if value is None]
     if missing_tokens:
         add("missing", "prometheus_token_kinds", ", ".join(missing_tokens))
     else:
         add("passed", "prometheus_token_kinds", json.dumps(token_values, sort_keys=True))
-    if prom_query("coditor_turn_duration_seconds_count"):
-        add("passed", "prometheus_duration_metric", "coditor_turn_duration_seconds_count")
+    if prom_query("codex_blackbox_turn_duration_seconds_count"):
+        add("passed", "prometheus_duration_metric", "codex_blackbox_turn_duration_seconds_count")
     else:
-        add("missing", "prometheus_duration_metric", "coditor_turn_duration_seconds_count")
-    if prom_query('coditor_context_fill_percent_count{provider="codex_responses"}'):
-        add("passed", "prometheus_context_metric", "coditor_context_fill_percent_count")
+        add("missing", "prometheus_duration_metric", "codex_blackbox_turn_duration_seconds_count")
+    if prom_query('codex_blackbox_context_fill_percent_count{provider="codex_responses"}'):
+        add("passed", "prometheus_context_metric", "codex_blackbox_context_fill_percent_count")
     else:
-        add("missing", "prometheus_context_metric", "coditor_context_fill_percent_count")
+        add("missing", "prometheus_context_metric", "codex_blackbox_context_fill_percent_count")
     now = int(time.time())
     series = get_json(
         prom_url,
         "/api/v1/series",
         {
-            "match[]": '{__name__=~"coditor_.*"}',
+            "match[]": '{__name__=~"codex_blackbox_.*"}',
             "start": str(now - 3600),
             "end": str(now),
         },
@@ -588,7 +588,7 @@ try:
     if leaks:
         add("failed", "prometheus_no_session_labels", json.dumps(leaks[:3], sort_keys=True))
     else:
-        add("passed", "prometheus_no_session_labels", "no session ids in coditor_* metric labels")
+        add("passed", "prometheus_no_session_labels", "no session ids in codex_blackbox_* metric labels")
 except Exception as exc:
     add("failed", "prometheus_query", str(exc))
 
@@ -599,8 +599,8 @@ except Exception as exc:
 
 try:
     health = get_json(grafana_url, "/api/health")
-    search = get_json(grafana_url, "/api/search", {"query": "Coditor"})
-    dashboard_payload = get_json(grafana_url, "/api/dashboards/uid/coditor-main")
+    search = get_json(grafana_url, "/api/search", {"query": "Codex Blackbox"})
+    dashboard_payload = get_json(grafana_url, "/api/dashboards/uid/codex-blackbox-main")
     dashboard = dashboard_payload.get("dashboard", {})
     grafana_result = {
         "health": health,
@@ -616,17 +616,17 @@ try:
         add("passed", "grafana_health", "database ok")
     else:
         add("failed", "grafana_health", json.dumps(health, sort_keys=True))
-    if any(item.get("uid") == "coditor-main" for item in search):
-        add("passed", "grafana_dashboard_search", "coditor-main")
+    if any(item.get("uid") == "codex-blackbox-main" for item in search):
+        add("passed", "grafana_dashboard_search", "codex-blackbox-main")
     else:
-        add("missing", "grafana_dashboard_search", "coditor-main not found")
-    if dashboard.get("uid") == "coditor-main":
+        add("missing", "grafana_dashboard_search", "codex-blackbox-main not found")
+    if dashboard.get("uid") == "codex-blackbox-main":
         add("passed", "grafana_dashboard_uid", dashboard.get("title", ""))
     else:
         add("missing", "grafana_dashboard_uid", str(dashboard.get("uid")))
     metric_names = {
         item.get("metric", {}).get("__name__")
-        for item in prom_query('{__name__=~"coditor_.*"}')
+        for item in prom_query('{__name__=~"codex_blackbox_.*"}')
         if item.get("metric", {}).get("__name__")
     }
     missing_panel_metrics = []
@@ -636,7 +636,7 @@ try:
             continue
         for target in panel.get("targets", []) or []:
             expr = target.get("expr", "")
-            for metric_name in sorted(set(re.findall(r"\bcoditor_[A-Za-z_:][A-Za-z0-9_:]*", expr))):
+            for metric_name in sorted(set(re.findall(r"\bcodex_blackbox_[A-Za-z_:][A-Za-z0-9_:]*", expr))):
                 if metric_name not in metric_names:
                     missing_panel_metrics.append({"panel": title, "metric": metric_name})
     if missing_panel_metrics:
@@ -664,7 +664,7 @@ elif checks["missing"]:
 
 summary = {
     "status": status,
-    "run_id": os.environ.get("PROMPT_MARKER", "").replace("CODITOR_DOGFOOD_", ""),
+    "run_id": os.environ.get("PROMPT_MARKER", "").replace("CODEX_BLACKBOX_DOGFOOD_", ""),
     "prompt_marker": prompt_marker,
     "report_dir": str(report_dir),
     "expected_sessions": expected_sessions,
@@ -679,7 +679,7 @@ summary = {
 summary_json_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
 lines = [
-    f"# Coditor Phase 9C Dogfood Report",
+    f"# Codex Blackbox Phase 9C Dogfood Report",
     "",
     f"- Status: `{status}`",
     f"- Prompt marker: `{prompt_marker}`",
@@ -717,22 +717,22 @@ done
 
 if [ "$MODE" = "fixture" ]; then
     record skipped "real_codex_sessions" "--mode fixture delegates to Phase 9A fake e2e"
-    CODITOR_FULL_E2E_REPORT_DIR="$REPORT_DIR/phase9a" ./test/e2e-openai-responses-full.sh
+    CODEX_BLACKBOX_FULL_E2E_REPORT_DIR="$REPORT_DIR/phase9a" ./test/e2e-openai-responses-full.sh
     record passed "phase9a_fake_e2e" "see $REPORT_DIR/phase9a"
     finish_and_exit 0
 fi
 
-if [ -z "$CODITOR_BIN" ]; then
+if [ -z "$CODEX_BLACKBOX_BIN" ]; then
     require_cmd cargo
-    cargo build -q -p coditor-cli
-    CODITOR_BIN="target/debug/coditor"
+    cargo build -q -p codex-blackbox-cli
+    CODEX_BLACKBOX_BIN="target/debug/codex-blackbox"
 fi
 
-if [ ! -x "$CODITOR_BIN" ]; then
-    record failed "coditor_binary" "$CODITOR_BIN is not executable"
+if [ ! -x "$CODEX_BLACKBOX_BIN" ]; then
+    record failed "codex_blackbox_binary" "$CODEX_BLACKBOX_BIN is not executable"
     finish_and_exit 1
 fi
-record passed "coditor_binary" "$CODITOR_BIN"
+record passed "codex_blackbox_binary" "$CODEX_BLACKBOX_BIN"
 
 CODEX_VERSION="$("$CODEX_BIN" --version 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
 printf "%s\n" "$CODEX_VERSION" >"$REPORT_DIR/codex-version.txt"
@@ -755,13 +755,13 @@ if curl -fsS --max-time 2 "$CORE_URL/health" >/dev/null 2>&1 \
 fi
 if [ "$STACK_ALREADY_READY" = "0" ]; then
     compose down --remove-orphans -t 5 >"$REPORT_DIR/compose-preclean.log" 2>&1 || true
-    record passed "stack_preclean" "removed stale Coditor Compose services before real smoke"
+    record passed "stack_preclean" "removed stale Codex Blackbox Compose services before real smoke"
 fi
 
 SMOKE_PROMPT="$PROMPT_MARKER preflight: Read AGENTS.md and docs/remaining-phases.md, then summarize the current next phase in 3 bullets. Do not edit files."
 preflight_cmd=(
-    env -u COMPOSE_FILE CODITOR_COMPOSE_FILE="$COMPOSE_PATH"
-    "$CODITOR_BIN" preflight codex-subscription --
+    env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
+    "$CODEX_BLACKBOX_BIN" preflight codex-subscription --
     "$CODEX_BIN" exec
     --cd "$SAME_REPO"
     --sandbox read-only
@@ -775,7 +775,7 @@ else
     finish_and_exit 1
 fi
 
-wait_for_http "coditor_core" "$CORE_URL/health" || finish_and_exit 1
+wait_for_http "codex_blackbox_core" "$CORE_URL/health" || finish_and_exit 1
 wait_for_envoy_subscription_route || finish_and_exit 1
 wait_for_http "prometheus" "$PROMETHEUS_URL/-/ready" || true
 wait_for_http "grafana" "$GRAFANA_URL/api/health" || true
@@ -783,7 +783,7 @@ wait_for_http "grafana" "$GRAFANA_URL/api/health" || true
 if [ "$REPOS" = "mixed" ] && [ -z "$OTHER_REPO" ]; then
     OTHER_REPO="$REPORT_DIR/other-repo"
     mkdir -p "$OTHER_REPO"
-    printf "# Coditor dogfood other repo\n\nRun marker: %s\n" "$PROMPT_MARKER" >"$OTHER_REPO/README.md"
+    printf "# Codex Blackbox dogfood other repo\n\nRun marker: %s\n" "$PROMPT_MARKER" >"$OTHER_REPO/README.md"
     printf "dogfood-marker=%s\n" "$PROMPT_MARKER" >"$OTHER_REPO/project.txt"
     if command -v git >/dev/null 2>&1; then
         git -C "$OTHER_REPO" init -q || true
@@ -859,8 +859,8 @@ for index in $(seq 0 $((SESSIONS - 1))); do
     stderr_path="$REPORT_DIR/session-${case_name}.stderr"
     exit_path="$REPORT_DIR/session-${case_name}.exit"
     session_cmd=(
-        env -u COMPOSE_FILE CODITOR_COMPOSE_FILE="$COMPOSE_PATH"
-        "$CODITOR_BIN" run --
+        env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
+        "$CODEX_BLACKBOX_BIN" run --
         "$CODEX_BIN" exec
         --cd "$repo_path"
         --sandbox read-only
@@ -896,11 +896,11 @@ curl -fsS --max-time 10 "$CORE_URL/metrics" >"$REPORT_DIR/metrics.prom" 2>"$REPO
     && record passed "core_metrics_artifact" "$REPORT_DIR/metrics.prom" \
     || record missing "core_metrics_artifact" "failed to fetch /metrics"
 
-container_id="$(compose ps -q coditor-core 2>/dev/null || true)"
+container_id="$(compose ps -q codex-blackbox-core 2>/dev/null || true)"
 if [ -n "$container_id" ] && docker cp "$container_id:/data/." "$REPORT_DIR/" >/dev/null 2>&1; then
-    record passed "sqlite_artifact" "$REPORT_DIR/coditor.db"
+    record passed "sqlite_artifact" "$REPORT_DIR/codex-blackbox.db"
 else
-    record missing "sqlite_artifact" "failed to copy /data from coditor-core"
+    record missing "sqlite_artifact" "failed to copy /data from codex-blackbox-core"
 fi
 
 capture_compose_logs

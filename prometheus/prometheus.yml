@@ -3,8 +3,8 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: coditor-core
+  - job_name: codex-blackbox-core
     metrics_path: /metrics
     static_configs:
       - targets:
-          - coditor-core:9090
+          - codex-blackbox-core:9090

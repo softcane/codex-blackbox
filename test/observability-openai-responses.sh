@@ -24,7 +24,7 @@ for cmd in docker curl python3; do
     require_cmd "$cmd"
 done
 
-RUN_ID="${CODITOR_OBSERVABILITY_RUN_ID:-observability-openai-$(date +%s)-$$}"
+RUN_ID="${CODEX_BLACKBOX_OBSERVABILITY_RUN_ID:-observability-openai-$(date +%s)-$$}"
 SESSION_ID="phase-8b-${RUN_ID}"
 REQUEST_ID="req-${RUN_ID}"
 CORE_URL="http://localhost:9091"
@@ -39,15 +39,15 @@ compose() {
 }
 
 cleanup_stack_on_failure() {
-    if [ "$OBS_COMPLETED" = "1" ] || [ "${CODITOR_OBSERVABILITY_KEEP_STACK:-0}" = "1" ]; then
+    if [ "$OBS_COMPLETED" = "1" ] || [ "${CODEX_BLACKBOX_OBSERVABILITY_KEEP_STACK:-0}" = "1" ]; then
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null 2>&1 || true
 }
 
 cleanup_stack_on_success() {
-    if [ "${CODITOR_OBSERVABILITY_KEEP_STACK:-0}" = "1" ]; then
-        info "Leaving observability stack running because CODITOR_OBSERVABILITY_KEEP_STACK=1"
+    if [ "${CODEX_BLACKBOX_OBSERVABILITY_KEEP_STACK:-0}" = "1" ]; then
+        info "Leaving observability stack running because CODEX_BLACKBOX_OBSERVABILITY_KEEP_STACK=1"
         return
     fi
     compose down --remove-orphans -t 5 >/dev/null
@@ -76,15 +76,15 @@ assert_contains() {
     grep -q "$needle" <<<"$haystack" && pass "$label" || fail "$label missing '$needle'"
 }
 
-echo "=== Coditor fake OpenAI Responses Observability Test ==="
+echo "=== Codex Blackbox fake OpenAI Responses Observability Test ==="
 info "run_id=$RUN_ID"
 info "session_id=$SESSION_ID"
 info "Starting Docker Compose with fake OpenAI, Prometheus, and Grafana..."
 compose down --remove-orphans -t 5 2>/dev/null || true
-compose up -d --build coditor-core envoy fake-openai prometheus grafana
+compose up -d --build codex-blackbox-core envoy fake-openai prometheus grafana
 
-info "Waiting for coditor-core, Envoy, Prometheus, and Grafana..."
-wait_for_http "coditor-core" "$CORE_URL/health"
+info "Waiting for codex-blackbox-core, Envoy, Prometheus, and Grafana..."
+wait_for_http "codex-blackbox-core" "$CORE_URL/health"
 wait_for_http "envoy" "$ENVOY_URL/health"
 wait_for_http "prometheus" "$PROMETHEUS_URL/-/ready"
 wait_for_http "grafana" "$GRAFANA_URL/api/health"
@@ -103,8 +103,8 @@ response=$(curl -fsS --max-time 30 --no-buffer -N \
 assert_contains "$response" "response.completed" "Envoy streamed fixture completion"
 
 core_metrics=$(curl -fsS "$CORE_URL/metrics")
-assert_contains "$core_metrics" "coditor_context_fill_percent" "Core metrics expose context fill histogram"
-assert_contains "$core_metrics" "coditor_sessions_degraded_total" "Core metrics expose diagnosis counters"
+assert_contains "$core_metrics" "codex_blackbox_context_fill_percent" "Core metrics expose context fill histogram"
+assert_contains "$core_metrics" "codex_blackbox_sessions_degraded_total" "Core metrics expose diagnosis counters"
 
 info "Checking Prometheus and Grafana observability contract..."
 CORE_URL="$CORE_URL" \
@@ -169,30 +169,30 @@ def wait_until(label, predicate, timeout=90):
 
 
 wait_until(
-    "Prometheus scrape for coditor-core",
-    lambda: prom_value('up{job="coditor-core"}') == 1.0,
+    "Prometheus scrape for codex-blackbox-core",
+    lambda: prom_value('up{job="codex-blackbox-core"}') == 1.0,
 )
 wait_until(
     "Prometheus observed fake Codex request",
-    lambda: (prom_value("sum(coditor_requests_total)") or 0.0) >= 1.0,
+    lambda: (prom_value("sum(codex_blackbox_requests_total)") or 0.0) >= 1.0,
 )
 wait_until(
     "Prometheus observed fake Codex input tokens",
-    lambda: (prom_value('sum(coditor_tokens_total{kind="input"})') or 0.0) > 0.0,
+    lambda: (prom_value('sum(codex_blackbox_tokens_total{kind="input"})') or 0.0) > 0.0,
 )
 wait_until(
     "Prometheus observed fake Codex output tokens",
-    lambda: (prom_value('sum(coditor_tokens_total{kind="output"})') or 0.0) > 0.0,
+    lambda: (prom_value('sum(codex_blackbox_tokens_total{kind="output"})') or 0.0) > 0.0,
 )
 
 required_metrics = {
-    "request counter": "coditor_requests_total",
-    "token counter": "coditor_tokens_total",
-    "turn duration histogram": "coditor_turn_duration_seconds_count",
-    "context fill histogram": "coditor_context_fill_percent_count",
-    "context fill bucket": "coditor_context_fill_percent_bucket",
-    "diagnosis counter": 'coditor_sessions_degraded_total{cause_type="codex_response_failed"}',
-    "Codex response status counter": "coditor_codex_response_status_total",
+    "request counter": "codex_blackbox_requests_total",
+    "token counter": "codex_blackbox_tokens_total",
+    "turn duration histogram": "codex_blackbox_turn_duration_seconds_count",
+    "context fill histogram": "codex_blackbox_context_fill_percent_count",
+    "context fill bucket": "codex_blackbox_context_fill_percent_bucket",
+    "diagnosis counter": 'codex_blackbox_sessions_degraded_total{cause_type="codex_response_failed"}',
+    "Codex response status counter": "codex_blackbox_codex_response_status_total",
 }
 for label, expr in required_metrics.items():
     wait_until(label, lambda expr=expr: len(prom_query(expr)) > 0)
@@ -202,7 +202,7 @@ series = get_json(
     prom_url,
     "/api/v1/series",
     {
-        "match[]": '{__name__=~"coditor_.*"}',
+        "match[]": '{__name__=~"codex_blackbox_.*"}',
         "start": str(now - 3600),
         "end": str(now),
     },
@@ -233,16 +233,16 @@ if health.get("database") != "ok":
 wait_until(
     "Grafana dashboard provisioning",
     lambda: any(
-        item.get("uid") == "coditor-main"
-        for item in get_json(grafana_url, "/api/search", {"query": "Coditor"})
+        item.get("uid") == "codex-blackbox-main"
+        for item in get_json(grafana_url, "/api/search", {"query": "Codex Blackbox"})
     ),
 )
-dashboard_payload = get_json(grafana_url, "/api/dashboards/uid/coditor-main")
+dashboard_payload = get_json(grafana_url, "/api/dashboards/uid/codex-blackbox-main")
 dashboard = dashboard_payload.get("dashboard") or {}
-if dashboard.get("uid") != "coditor-main":
-    fail(f"Grafana did not load coditor-main dashboard: {dashboard_payload}")
+if dashboard.get("uid") != "codex-blackbox-main":
+    fail(f"Grafana did not load codex-blackbox-main dashboard: {dashboard_payload}")
 
-local_dashboard = json.loads(Path("grafana/dashboards/coditor.json").read_text())
+local_dashboard = json.loads(Path("grafana/dashboards/codex-blackbox.json").read_text())
 panels = local_dashboard.get("panels", [])
 required_panel_titles = {
     "Codex Responses requests since start",
@@ -253,11 +253,11 @@ required_panel_titles = {
 panels_by_title = {panel.get("title"): panel for panel in panels}
 missing = sorted(required_panel_titles - set(panels_by_title))
 if missing:
-    fail(f"Coditor dashboard is missing Phase 8B panels: {missing}")
+    fail(f"Codex Blackbox dashboard is missing Phase 8B panels: {missing}")
 
 metric_names = {
     item["metric"]["__name__"]
-    for item in prom_query('{__name__=~"coditor_.*"}')
+    for item in prom_query('{__name__=~"codex_blackbox_.*"}')
     if item.get("metric", {}).get("__name__")
 }
 for title in sorted(required_panel_titles):
@@ -270,7 +270,7 @@ for title in sorted(required_panel_titles):
     if not exprs:
         fail(f"Panel {title!r} has no Prometheus expression")
     for expr in exprs:
-        refs = sorted(set(re.findall(r"\bcoditor_[A-Za-z_:][A-Za-z0-9_:]*", expr)))
+        refs = sorted(set(re.findall(r"\bcodex_blackbox_[A-Za-z_:][A-Za-z0-9_:]*", expr)))
         missing_refs = [name for name in refs if name not in metric_names]
         if missing_refs:
             fail(f"Panel {title!r} references missing metrics {missing_refs} in {expr!r}")
@@ -279,7 +279,7 @@ print("Prometheus and Grafana observability assertions passed")
 PY
 pass "Prometheus exposes bounded Codex request/token/context/diagnosis metrics"
 pass "Prometheus labels do not leak session ids"
-pass "Grafana provisioning loads Coditor dashboard and Phase 8B panels"
+pass "Grafana provisioning loads Codex Blackbox dashboard and Phase 8B panels"
 
 echo ""
 echo "=== Fake OpenAI Responses observability checks passed ==="

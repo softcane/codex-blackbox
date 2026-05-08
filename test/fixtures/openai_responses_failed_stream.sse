@@ -1,5 +1,5 @@
 event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_failed_001","object":"response","created_at":1777411320,"status":"in_progress","model":"gpt-codex-fixture","output":[],"usage":null,"metadata":{"coditor_fixture":"failed"}}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_failed_001","object":"response","created_at":1777411320,"status":"in_progress","model":"gpt-codex-fixture","output":[],"usage":null,"metadata":{"codex_blackbox_fixture":"failed"}}}
 
 event: response.failed
-data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_fixture_failed_001","object":"response","created_at":1777411320,"completed_at":null,"status":"failed","error":{"code":"server_error","message":"Fixture failure for Coditor contract tests."},"incomplete_details":null,"model":"gpt-codex-fixture","output":[],"usage":null,"metadata":{"coditor_fixture":"failed"}}}
+data: {"type":"response.failed","sequence_number":1,"response":{"id":"resp_fixture_failed_001","object":"response","created_at":1777411320,"completed_at":null,"status":"failed","error":{"code":"server_error","message":"Fixture failure for Codex Blackbox contract tests."},"incomplete_details":null,"model":"gpt-codex-fixture","output":[],"usage":null,"metadata":{"codex_blackbox_fixture":"failed"}}}

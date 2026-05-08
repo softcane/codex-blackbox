@@ -12,7 +12,7 @@ target/
 *~
 
 # Runtime state and local volumes
-coditor_data/
+codex_blackbox_data/
 prometheus_data/
 grafana_data/
 reports/
@@ -28,6 +28,11 @@ docker-compose.override.yml
 .env.local
 *.log
 
-# External agent/runtime state
+# Internal planning docs and external agent/runtime state
+internal_docs/
+doc_internal/
+docs/internal/
+wiki/*
+CLAUDE.md
 .claude/
 .omx/

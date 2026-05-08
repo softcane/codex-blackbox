@@ -1,12 +1,12 @@
-# Coditor Agent Instructions
+# Codex Blackbox Agent Instructions
 
 These instructions apply to the whole repository unless a deeper `AGENTS.md`
 overrides them.
 
 ## Product Boundary
 
-- Coditor observes Codex traffic through a local Envoy proxy, `coditor-core`,
-  and the `coditor` CLI.
+- Codex Blackbox observes Codex traffic through a local Envoy proxy, `codex-blackbox-core`,
+  and the `codex-blackbox` CLI.
 - Fake OpenAI Responses fixtures validate local contracts only. Do not turn a
   fake e2e result into a live Codex support claim.
 - Live support claims require explicit real smoke or dogfood evidence.
@@ -15,14 +15,14 @@ overrides them.
 
 ## Implementation Map
 
-- Request parsing: `coditor-core/src/codex_request.rs`
-- Response SSE accumulation: `coditor-core/src/codex_response.rs`
-- Turn accounting: `coditor-core/src/codex_accounting.rs`
-- Pricing: `coditor-core/src/pricing.rs`
-- Runtime, persistence, hooks, and Envoy ext_proc: `coditor-core/src/main.rs`
-- Watch event types: `coditor-core/src/watch.rs`
-- Metrics: `coditor-core/src/metrics.rs`
-- CLI wrapper, preflight, watch rendering: `coditor-cli/src/main.rs`
+- Request parsing: `codex-blackbox-core/src/codex_request.rs`
+- Response SSE accumulation: `codex-blackbox-core/src/codex_response.rs`
+- Turn accounting: `codex-blackbox-core/src/codex_accounting.rs`
+- Pricing: `codex-blackbox-core/src/pricing.rs`
+- Runtime, persistence, hooks, and Envoy ext_proc: `codex-blackbox-core/src/main.rs`
+- Watch event types: `codex-blackbox-core/src/watch.rs`
+- Metrics: `codex-blackbox-core/src/metrics.rs`
+- CLI wrapper, preflight, watch rendering: `codex-blackbox-cli/src/main.rs`
 
 ## Worktree Rules
 
@@ -36,7 +36,7 @@ overrides them.
 
 ## Codex Routing
 
-- `coditor run -- codex ...` uses the experimental ChatGPT subscription proxy
+- `codex-blackbox run -- codex ...` uses the experimental ChatGPT subscription proxy
   path.
 - The default Envoy listener routes `/backend-api` to `chatgpt.com`.
 - Codex model turns use command-line config overrides:
@@ -48,7 +48,7 @@ overrides them.
   spawning child Codex processes.
 - `OPENAI_API_KEY` is not used for ChatGPT subscription proxy mode.
 - A successful `codex exec` child run must still fail the wrapper if
-  `coditor-core` observes no new `provider="codex_responses"` request.
+  `codex-blackbox-core` observes no new `provider="codex_responses"` request.
 
 ## Request Parsing
 
@@ -90,11 +90,12 @@ overrides them.
 ## Watch And Hooks
 
 - Proxy-observed model responses are authoritative for durable Codex turns.
-- Codex hook payloads may create provisional watch, session, tool, and MCP
-  events, but hook failures must not affect model traffic.
-- Suppress duplicate tool and MCP events when proxy and hooks report the same
-  signal.
-- Codex cached input does not produce TTL/rebuild `CacheEvent` behavior.
+- Do not use Codex hooks, local JSON stdout, or app-server hook endpoints as
+  Codex telemetry sources.
+- Watch `ToolUse` events are Envoy-observed model-side custom tool-call intent,
+  not proof of tool result success.
+- Do not expose `ToolResult`, `SkillEvent`, `McpEvent`, `CacheEvent`, cache TTL,
+  cache rebuild, or provider quota/cap state in Codex watch or tmux surfaces.
 - `CodexTurnSummary` is the Codex-native per-turn watch event.
 - Watch replay and duplicate suppression are correctness behavior, not UI
   polish; keep them tested.
@@ -106,7 +107,8 @@ overrides them.
 - Keep request rows immutable and derived session totals repairable.
 - Preserve failed and incomplete response statuses even with partial usage or
   output.
-- Persist tool summaries without inventing cache events.
+- Persist Envoy-observed tool-call intent without inventing tool outcomes,
+  MCP lifecycle events, skill lifecycle events, or cache events.
 - Prometheus labels must stay bounded.
 - Never use session ids, cwd values, prompts, request ids, response ids, or raw
   tool inputs as metric labels.
@@ -124,8 +126,8 @@ overrides them.
 - Parser/accounting tests must cover failed streams, incomplete streams, split
   SSE chunks, served-model headers, cached-input subset math, and unknown
   pricing.
-- Watch/hook tests must cover replay, duplicate suppression, tool failures,
-  MCP events, and no cache events for Codex cached input.
+- Watch tests must cover replay, duplicate suppression, Codex turn summaries,
+  context status, and no cache/lifecycle watch events for Codex cached input.
 - Envoy `failure_mode_allow` only proves runtime failure-open after Envoy is
   already running; startup behavior is a separate compose/config concern.
 - If a capability is absent or unverified, call it unknown, missing, skipped,

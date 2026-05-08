@@ -27,11 +27,11 @@ services:
     volumes:
       - ./test/envoy.openai-responses.e2e.yaml:/etc/envoy/envoy.yaml:ro
     depends_on:
-      coditor-core:
+      codex-blackbox-core:
         condition: service_healthy
       fake-openai:
         condition: service_healthy
 
-  coditor-core:
+  codex-blackbox-core:
     environment:
-      - CODITOR_SESSION_TIMEOUT_MINUTES=1
+      - CODEX_BLACKBOX_SESSION_TIMEOUT_MINUTES=1

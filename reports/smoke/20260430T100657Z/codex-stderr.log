@@ -1,6 +1,0 @@
-Coditor: launching Codex with experimental manual OpenAI API-key proxy settings.
-Coditor: proxy base URL http://127.0.0.1:10000/v1
-Coditor: command-line config overrides only; ~/.codex/config.toml is not modified.
-Coditor: request compression disabled via features.enable_request_compression=false.
-Coditor: ChatGPT-auth Codex backend routing is not supported or verified.
-API key login is required, but ChatGPT is currently being used. Logging out.

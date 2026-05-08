@@ -1,7 +1,0 @@
-Coditor: launching Codex with experimental manual OpenAI API-key proxy settings.
-Coditor: proxy base URL http://127.0.0.1:10000/v1
-Coditor: command-line config overrides only; ~/.codex/config.toml is not modified.
-Coditor: request compression disabled via features.enable_request_compression=false.
-Coditor: ChatGPT-auth Codex backend routing is not supported or verified.
-Reading additional input from stdin...
-2026-04-30T10:08:59.488619Z  WARN codex_core::plugins::manager: failed to warm featured plugin ids cache error=remote plugin sync request to https://chatgpt.com/backend-api/plugins/featured failed with status 401 Unauthorized: {"detail":"Unauthorized"}

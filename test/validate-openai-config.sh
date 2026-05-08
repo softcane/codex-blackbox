@@ -14,7 +14,7 @@ require_cmd() {
 require_cmd docker
 require_cmd rg
 
-docker compose -f docker-compose.yml config >/tmp/coditor-codex-compose-config.txt
+docker compose -f docker-compose.yml config >/tmp/codex-blackbox-codex-compose-config.txt
 
 rg -n 'failure_mode_allow:\s*true' envoy/envoy.yaml >/dev/null
 rg -n 'request_body_mode:\s*BUFFERED' envoy/envoy.yaml >/dev/null

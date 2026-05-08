@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Show tool versions
+        run: |
+          rustc --version
+          cargo --version
+          docker --version
+          docker compose version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run unit and integration tests
+        run: cargo test --workspace
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  fake-responses:
+    name: Fake Responses contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Show tool versions
+        run: |
+          rustc --version
+          cargo --version
+          docker --version
+          docker compose version
+
+      - name: Validate default ChatGPT/Codex Envoy config
+        run: ./test/validate-openai-config.sh
+
+      - name: Run narrow fake Responses proxy test
+        run: ./test/e2e-openai-responses.sh
+
+      - name: Run fake observability validation
+        run: ./test/observability-openai-responses.sh
+
+      - name: Run broad fake Responses regression
+        run: ./test/e2e-openai-responses-full.sh
+
+      - name: Capture docker compose state on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/codex-blackbox-ci
+          docker compose ps > /tmp/codex-blackbox-ci/compose-ps.txt 2>&1 || true
+          docker compose logs --no-color > /tmp/codex-blackbox-ci/compose-logs.txt 2>&1 || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: docker-compose-logs
+          path: /tmp/codex-blackbox-ci
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -t 5 || true
+
+  installer:
+    name: Installer syntax
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check install.sh syntax
+        run: sh -n install.sh

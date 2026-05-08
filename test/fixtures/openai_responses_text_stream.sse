@@ -1,5 +1,5 @@
 event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_text_001","object":"response","created_at":1777411200,"status":"in_progress","model":"gpt-codex-fixture","instructions":"You are Codex running inside a local fixture contract.","output":[],"usage":null,"metadata":{"cwd":"/Users/pradeepsingh/code/coditor","coditor_fixture":"minimal_text"}}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fixture_text_001","object":"response","created_at":1777411200,"status":"in_progress","model":"gpt-codex-fixture","instructions":"You are Codex running inside a local fixture contract.","output":[],"usage":null,"metadata":{"cwd":"/Users/pradeepsingh/code/codex-blackbox","codex_blackbox_fixture":"minimal_text"}}}
 
 event: response.output_item.added
 data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_fixture_text_001","type":"message","role":"assistant","status":"in_progress","content":[]}}
@@ -8,10 +8,10 @@ event: response.output_text.delta
 data: {"type":"response.output_text.delta","sequence_number":2,"item_id":"msg_fixture_text_001","output_index":0,"content_index":0,"delta":"Workspace packages: "}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_fixture_text_001","output_index":0,"content_index":0,"delta":"coditor-core and coditor-cli."}
+data: {"type":"response.output_text.delta","sequence_number":3,"item_id":"msg_fixture_text_001","output_index":0,"content_index":0,"delta":"codex-blackbox-core and codex-blackbox-cli."}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"msg_fixture_text_001","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Workspace packages: coditor-core and coditor-cli.","annotations":[]}]}}
+data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"msg_fixture_text_001","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Workspace packages: codex-blackbox-core and codex-blackbox-cli.","annotations":[]}]}}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_fixture_text_001","object":"response","created_at":1777411200,"completed_at":1777411201,"status":"completed","model":"gpt-codex-fixture","output":[{"id":"msg_fixture_text_001","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Workspace packages: coditor-core and coditor-cli.","annotations":[]}]}],"usage":{"input_tokens":1280,"input_tokens_details":{"cached_tokens":512},"output_tokens":96,"output_tokens_details":{"reasoning_tokens":32},"total_tokens":1376},"metadata":{"cwd":"/Users/pradeepsingh/code/coditor","coditor_fixture":"minimal_text"}}}
+data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_fixture_text_001","object":"response","created_at":1777411200,"completed_at":1777411201,"status":"completed","model":"gpt-codex-fixture","output":[{"id":"msg_fixture_text_001","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Workspace packages: codex-blackbox-core and codex-blackbox-cli.","annotations":[]}]}],"usage":{"input_tokens":1280,"input_tokens_details":{"cached_tokens":512},"output_tokens":96,"output_tokens_details":{"reasoning_tokens":32},"total_tokens":1376},"metadata":{"cwd":"/Users/pradeepsingh/code/codex-blackbox","codex_blackbox_fixture":"minimal_text"}}}

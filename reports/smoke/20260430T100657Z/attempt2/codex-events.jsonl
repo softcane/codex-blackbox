@@ -1,4 +1,0 @@
-{"type":"thread.started","thread_id":"019ddddc-f80f-7170-a8be-8c167a5ef4a1"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Workspace packages: coditor-core and coditor-cli."}}
-{"type":"turn.completed","usage":{"input_tokens":1280,"cached_input_tokens":512,"output_tokens":96}}
