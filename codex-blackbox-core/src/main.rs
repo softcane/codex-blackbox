@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use rusqlite::{Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -1510,6 +1510,72 @@ fn session_has_codex_evidence(conn: &Connection, session_id: &str) -> rusqlite::
         |row| row.get::<_, i64>(0),
     )
     .map(|value| value != 0)
+}
+
+#[derive(Debug, Serialize)]
+struct CodexObservationSnapshot {
+    provider: &'static str,
+    after_request_rowid: i64,
+    latest_request_rowid: i64,
+    request_count: u64,
+    matching_request_count: u64,
+    matched: bool,
+}
+
+fn load_codex_observation_snapshot(
+    conn: &Connection,
+    after_request_rowid: i64,
+    session_id: Option<&str>,
+    prompt_excerpt: Option<&str>,
+) -> rusqlite::Result<CodexObservationSnapshot> {
+    let after_request_rowid = after_request_rowid.max(0);
+    let latest_request_rowid = conn.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM requests WHERE provider = 'codex_responses'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let request_count = conn.query_row(
+        "SELECT COUNT(*) FROM requests \
+         WHERE provider = 'codex_responses' AND rowid > ?1",
+        rusqlite::params![after_request_rowid],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
+    let prompt_excerpt = prompt_excerpt
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let matching_request_count = if let Some(session_id) = session_id {
+        conn.query_row(
+            "SELECT COUNT(*) FROM requests \
+             WHERE provider = 'codex_responses' \
+               AND rowid > ?1 \
+               AND session_id = ?2",
+            rusqlite::params![after_request_rowid, session_id],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else if let Some(prompt_excerpt) = prompt_excerpt {
+        conn.query_row(
+            "SELECT COUNT(*) FROM requests \
+             WHERE provider = 'codex_responses' \
+               AND rowid > ?1 \
+               AND codex_prompt_excerpt = ?2",
+            rusqlite::params![after_request_rowid, prompt_excerpt],
+            |row| row.get::<_, i64>(0),
+        )?
+    } else {
+        request_count
+    };
+    let request_count = request_count.max(0) as u64;
+    let matching_request_count = matching_request_count.max(0) as u64;
+
+    Ok(CodexObservationSnapshot {
+        provider: "codex_responses",
+        after_request_rowid,
+        latest_request_rowid,
+        request_count,
+        matching_request_count,
+        matched: matching_request_count > 0,
+    })
 }
 
 fn postmortem_command_for_session(session_id: &str) -> String {
@@ -4151,6 +4217,60 @@ async fn handle_guard_state() -> impl IntoResponse {
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct CodexObservationRequest {
+    #[serde(default)]
+    after_request_rowid: i64,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    prompt_excerpt: Option<String>,
+}
+
+async fn handle_codex_observations(
+    Json(request): Json<CodexObservationRequest>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(db_path())?;
+        load_codex_observation_snapshot(
+            &conn,
+            request.after_request_rowid,
+            request.session_id.as_deref(),
+            request.prompt_excerpt.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(snapshot)) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+        )
+            .into_response(),
+        Ok(Err(err)) => {
+            warn!(error = %err, "Codex observation query failed");
+            let body = serde_json::json!({"error": "db unavailable"});
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/json")],
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "Codex observation query task failed");
+            let body = serde_json::json!({"error": "internal error"});
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [("content-type", "application/json")],
+                serde_json::to_string_pretty(&body).unwrap_or_default(),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn handle_watch(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::sse::Sse<
@@ -5302,6 +5422,7 @@ async fn http_server() {
         .route("/metrics", get(handle_metrics))
         .route("/api/summary", get(handle_summary))
         .route("/api/guard-state", get(handle_guard_state))
+        .route("/api/observations/codex", post(handle_codex_observations))
         .route("/api/recall", get(handle_recall))
         .route(
             "/api/billing-reconciliations",
@@ -5517,13 +5638,14 @@ mod tests {
         drop_legacy_lifecycle_tables, ensure_codex_persistence_columns, ensure_session_columns,
         ensure_session_diagnosis_columns, epoch_to_iso8601, event_matches_session, extract_header,
         extract_headers, filter_codex_envoy_diagnosis_payload, history_contains_session_start,
-        infer_context_window_tokens, load_degradation_view_from_db,
-        load_persisted_watch_replay_events, load_recent_codex_session_rows,
-        load_turn_snapshots_from_db, looks_like_machine_recall_line, make_block_response,
-        maybe_broadcast_postmortem_ready, metrics, normalize_search_text, now_epoch_secs,
-        parse_request_body_metadata, persist_billing_reconciliation,
-        persist_session_diagnosis_report, persisted_session_display_name, policy_block_message,
-        postmortem, pricing, query_historical_metrics, query_summary, record_codex_turn_command,
+        infer_context_window_tokens, load_codex_observation_snapshot,
+        load_degradation_view_from_db, load_persisted_watch_replay_events,
+        load_recent_codex_session_rows, load_turn_snapshots_from_db,
+        looks_like_machine_recall_line, make_block_response, maybe_broadcast_postmortem_ready,
+        metrics, normalize_search_text, now_epoch_secs, parse_request_body_metadata,
+        persist_billing_reconciliation, persist_session_diagnosis_report,
+        persisted_session_display_name, policy_block_message, postmortem, pricing,
+        query_historical_metrics, query_summary, record_codex_turn_command,
         repair_persisted_session_artifacts, repair_session_diagnosis_envoy_causes,
         repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
         score_recall_doc, seed_live_metric_labels_from_db, session_has_codex_evidence,
@@ -8826,6 +8948,104 @@ mod tests {
         assert_eq!(session_ids, vec!["codex-session"]);
         assert!(!session_has_codex_evidence(&conn, "legacy-session").expect("legacy evidence"));
         assert!(session_has_codex_evidence(&conn, "codex-session").expect("codex evidence"));
+    }
+
+    #[test]
+    fn codex_observation_snapshot_is_rowid_session_and_prompt_scoped() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "session-observed-a",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:00:01Z"),
+            "gpt-5.5",
+            None,
+        );
+        insert_codex_request(
+            &conn,
+            "req-observed-a",
+            "session-observed-a",
+            "2026-01-01T00:00:00Z",
+            "gpt-5.5",
+            100,
+            20,
+            10,
+        );
+        conn.execute(
+            "UPDATE requests SET codex_prompt_excerpt = 'first prompt' WHERE request_id = 'req-observed-a'",
+            [],
+        )
+        .expect("set first prompt");
+        let before = load_codex_observation_snapshot(&conn, 0, None, None)
+            .expect("initial observation snapshot");
+
+        insert_session(
+            &conn,
+            "session-observed-b",
+            "2026-01-01T00:00:02Z",
+            Some("2026-01-01T00:00:03Z"),
+            "gpt-5.5",
+            None,
+        );
+        insert_codex_request(
+            &conn,
+            "req-observed-b",
+            "session-observed-b",
+            "2026-01-01T00:00:02Z",
+            "gpt-5.5",
+            200,
+            40,
+            20,
+        );
+        conn.execute(
+            "UPDATE requests SET codex_prompt_excerpt = 'second prompt' WHERE request_id = 'req-observed-b'",
+            [],
+        )
+        .expect("set second prompt");
+
+        let unrelated = load_codex_observation_snapshot(
+            &conn,
+            before.latest_request_rowid,
+            None,
+            Some("first prompt"),
+        )
+        .expect("unrelated prompt snapshot");
+        assert_eq!(unrelated.request_count, 1);
+        assert_eq!(unrelated.matching_request_count, 0);
+        assert!(!unrelated.matched);
+
+        let matched = load_codex_observation_snapshot(
+            &conn,
+            before.latest_request_rowid,
+            None,
+            Some("second prompt"),
+        )
+        .expect("matched prompt snapshot");
+        assert_eq!(matched.request_count, 1);
+        assert_eq!(matched.matching_request_count, 1);
+        assert!(matched.matched);
+
+        let wrong_session = load_codex_observation_snapshot(
+            &conn,
+            before.latest_request_rowid,
+            Some("session-observed-a"),
+            Some("second prompt"),
+        )
+        .expect("wrong session snapshot");
+        assert_eq!(wrong_session.request_count, 1);
+        assert_eq!(wrong_session.matching_request_count, 0);
+        assert!(!wrong_session.matched);
+
+        let matched_session = load_codex_observation_snapshot(
+            &conn,
+            before.latest_request_rowid,
+            Some("session-observed-b"),
+            Some("first prompt"),
+        )
+        .expect("matched session snapshot");
+        assert_eq!(matched_session.request_count, 1);
+        assert_eq!(matched_session.matching_request_count, 1);
+        assert!(matched_session.matched);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, ErrorKind, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
@@ -1348,6 +1349,7 @@ struct ChildRunPlan {
     stdin_mode: ChildStdinMode,
     mode: RunMode,
     requires_codex_observation: bool,
+    observation_prompt_excerpt: Option<String>,
 }
 
 fn is_codex_command(command: &str) -> bool {
@@ -1455,6 +1457,86 @@ fn codex_command_requires_observation(command_args: &[String]) -> bool {
         .any(|arg| matches!(arg.as_str(), "exec" | "e"))
 }
 
+fn codex_exec_option_consumes_value(arg: &str) -> bool {
+    if arg.contains('=') {
+        return false;
+    }
+    matches!(
+        arg,
+        "-c" | "--config"
+            | "--enable"
+            | "--disable"
+            | "-i"
+            | "--image"
+            | "-m"
+            | "--model"
+            | "--local-provider"
+            | "-p"
+            | "--profile"
+            | "-s"
+            | "--sandbox"
+            | "-C"
+            | "--cd"
+            | "--add-dir"
+            | "-a"
+            | "--ask-for-approval"
+            | "--output-schema"
+            | "--color"
+            | "-o"
+            | "--output-last-message"
+    )
+}
+
+fn codex_observation_prompt_excerpt(prompt: &str) -> Option<String> {
+    const PROMPT_EXCERPT_MAX_CHARS: usize = 320;
+    let trimmed = prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() <= PROMPT_EXCERPT_MAX_CHARS {
+        Some(trimmed)
+    } else {
+        let mut out = trimmed
+            .chars()
+            .take(PROMPT_EXCERPT_MAX_CHARS)
+            .collect::<String>();
+        out.push_str("...");
+        Some(out)
+    }
+}
+
+fn codex_exec_prompt_hint(command_args: &[String]) -> Option<String> {
+    let exec_index = command_args
+        .iter()
+        .position(|arg| matches!(arg.as_str(), "exec" | "e"))?;
+    let mut idx = exec_index + 1;
+    while idx < command_args.len() {
+        let arg = &command_args[idx];
+        if arg == "--" {
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            if codex_exec_option_consumes_value(arg) {
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+            continue;
+        }
+        if matches!(arg.as_str(), "resume" | "review" | "help" | "-") {
+            return None;
+        }
+        return codex_observation_prompt_excerpt(arg);
+    }
+    None
+}
+
 fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String> {
     let Some(command) = child_command.first() else {
         return Err("missing command after `codex-blackbox run`".to_string());
@@ -1468,6 +1550,11 @@ fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String
             .iter()
             .any(|arg| matches!(arg.as_str(), "exec" | "e"));
         let requires_codex_observation = codex_command_requires_observation(command_args);
+        let observation_prompt_excerpt = if requires_codex_observation {
+            codex_exec_prompt_hint(command_args)
+        } else {
+            None
+        };
         let args = codex_child_args_with_subscription_overrides(
             command_args,
             &chatgpt_base_url,
@@ -1488,6 +1575,7 @@ fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String
             },
             mode: RunMode::CodexSubscriptionProxy,
             requires_codex_observation,
+            observation_prompt_excerpt,
         });
     }
 
@@ -1499,6 +1587,7 @@ fn build_child_run_plan(child_command: &[String]) -> Result<ChildRunPlan, String
         stdin_mode: ChildStdinMode::Inherit,
         mode: RunMode::PlainCommand,
         requires_codex_observation: false,
+        observation_prompt_excerpt: None,
     })
 }
 
@@ -1532,7 +1621,7 @@ fn render_child_run_plan(plan: &ChildRunPlan) -> String {
             );
             if plan.requires_codex_observation {
                 lines.push(
-                    "Post-run check: require Codex Blackbox to observe at least one Codex Responses request"
+                    "Post-run check: require Codex Blackbox to observe run-scoped Codex Responses evidence"
                         .to_string(),
                 );
             }
@@ -1608,7 +1697,7 @@ fn print_child_run_status(plan: &ChildRunPlan) {
                 );
             }
             if plan.requires_codex_observation {
-                eprintln!("Codex Blackbox: will fail this run if codex-blackbox-core observes no Codex Responses request.");
+                eprintln!("Codex Blackbox: will fail this run if codex-blackbox-core observes no run-scoped Codex Responses request.");
             }
             if plan.stdin_mode == ChildStdinMode::Null {
                 eprintln!("Codex Blackbox: child stdin is closed for Codex exec.");
@@ -1620,13 +1709,19 @@ fn print_child_run_status(plan: &ChildRunPlan) {
     }
 }
 
+#[derive(Debug)]
+struct ChildProcessResult {
+    exit_code: i32,
+    codex_session_id: Option<String>,
+}
+
 fn run_command_with_env(
     command: &str,
     args: &[String],
     envs: &[(String, String)],
     env_removals: &[String],
     stdin_mode: &ChildStdinMode,
-) -> Result<i32, String> {
+) -> Result<ChildProcessResult, String> {
     let mut child = Command::new(command);
     child.args(args);
     for key in env_removals {
@@ -1644,7 +1739,23 @@ fn run_command_with_env(
         .wait()
         .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
 
-    Ok(exit_code(status))
+    Ok(ChildProcessResult {
+        exit_code: exit_code(status),
+        codex_session_id: None,
+    })
+}
+
+fn parse_codex_session_id_line(line: &str) -> Option<String> {
+    let value = line.trim().strip_prefix("session id:")?.trim();
+    let valid_uuid_shape = value.len() == 36
+        && value.chars().enumerate().all(|(idx, ch)| {
+            if matches!(idx, 8 | 13 | 18 | 23) {
+                ch == '-'
+            } else {
+                ch.is_ascii_hexdigit()
+            }
+        });
+    valid_uuid_shape.then(|| value.to_string())
 }
 
 fn run_codex_command_with_filtered_stderr(
@@ -1653,7 +1764,7 @@ fn run_codex_command_with_filtered_stderr(
     envs: &[(String, String)],
     env_removals: &[String],
     stdin_mode: &ChildStdinMode,
-) -> Result<i32, String> {
+) -> Result<ChildProcessResult, String> {
     let mut child = Command::new(command);
     child.args(args);
     for key in env_removals {
@@ -1673,12 +1784,21 @@ fn run_codex_command_with_filtered_stderr(
         .stderr
         .take()
         .ok_or_else(|| "failed to capture child stderr".to_string())?;
+    let codex_session_id = Arc::new(Mutex::new(None::<String>));
+    let stderr_session_id = codex_session_id.clone();
     let stderr_thread = std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             match line {
                 Ok(line) if should_suppress_codex_stderr_line(&line) => {}
-                Ok(line) => eprintln!("{line}"),
+                Ok(line) => {
+                    if let Some(session_id) = parse_codex_session_id_line(&line) {
+                        if let Ok(mut captured) = stderr_session_id.lock() {
+                            *captured = Some(session_id);
+                        }
+                    }
+                    eprintln!("{line}");
+                }
                 Err(err) => {
                     eprintln!("Codex Blackbox: failed to read Codex stderr: {err}");
                     break;
@@ -1692,7 +1812,11 @@ fn run_codex_command_with_filtered_stderr(
         .map_err(|err| format!("failed while waiting for {command}: {err}"))?;
     let _ = stderr_thread.join();
 
-    Ok(exit_code(status))
+    let codex_session_id = codex_session_id.lock().ok().and_then(|value| value.clone());
+    Ok(ChildProcessResult {
+        exit_code: exit_code(status),
+        codex_session_id,
+    })
 }
 
 fn should_suppress_codex_stderr_line(line: &str) -> bool {
@@ -1701,62 +1825,66 @@ fn should_suppress_codex_stderr_line(line: &str) -> bool {
         || line.contains("write_stdin failed: stdin is closed for this session")
 }
 
-fn parse_codex_requests_total(metrics: &str) -> Option<f64> {
-    let mut total = 0.0;
-    let mut found = false;
-
-    for line in metrics.lines().map(str::trim) {
-        if line.starts_with("codex_blackbox_requests_total{")
-            && line.contains(r#"provider="codex_responses""#)
-        {
-            let Some(value) = line
-                .rsplit_once(' ')
-                .and_then(|(_, value)| value.parse::<f64>().ok())
-            else {
-                continue;
-            };
-            total += value;
-            found = true;
-        }
-    }
-
-    found.then_some(total)
+#[derive(Debug, Deserialize)]
+struct CodexObservationSnapshot {
+    #[serde(default)]
+    latest_request_rowid: i64,
+    #[serde(default)]
+    matched: bool,
 }
 
-async fn fetch_codex_requests_total() -> Result<f64, String> {
+#[derive(Debug, Serialize)]
+struct CodexObservationRequest<'a> {
+    after_request_rowid: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_excerpt: Option<&'a str>,
+}
+
+async fn fetch_codex_observation_snapshot(
+    after_request_rowid: i64,
+    session_id: Option<&str>,
+    prompt_excerpt: Option<&str>,
+) -> Result<CodexObservationSnapshot, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
-        .map_err(|err| format!("failed to build metrics client: {err}"))?;
-    let metrics_url = format!(
-        "{}/metrics",
+        .map_err(|err| format!("failed to build observation client: {err}"))?;
+    let url = format!(
+        "{}/api/observations/codex",
         codex_blackbox_core_url().trim_end_matches('/')
     );
     let resp = client
-        .get(&metrics_url)
+        .post(&url)
+        .json(&CodexObservationRequest {
+            after_request_rowid,
+            session_id,
+            prompt_excerpt,
+        })
         .send()
         .await
-        .map_err(|err| format!("failed to fetch {metrics_url}: {err}"))?;
+        .map_err(|err| format!("failed to fetch {url}: {err}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "failed to fetch {metrics_url}: HTTP {}",
-            resp.status()
-        ));
+        return Err(format!("failed to fetch {url}: HTTP {}", resp.status()));
     }
-    let body = resp
-        .text()
+    resp.json::<CodexObservationSnapshot>()
         .await
-        .map_err(|err| format!("failed to read {metrics_url}: {err}"))?;
-    parse_codex_requests_total(&body).ok_or_else(|| {
-        "codex_blackbox_requests_total for provider=\"codex_responses\" is missing".to_string()
-    })
+        .map_err(|err| format!("failed to parse {url}: {err}"))
 }
 
-async fn wait_for_codex_observation_delta(before: f64, timeout: Duration) -> Result<bool, String> {
+async fn wait_for_codex_observation_after(
+    after_request_rowid: i64,
+    session_id: Option<&str>,
+    prompt_excerpt: Option<&str>,
+    timeout: Duration,
+) -> Result<bool, String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        let after = fetch_codex_requests_total().await?;
-        if after > before {
+        let snapshot =
+            fetch_codex_observation_snapshot(after_request_rowid, session_id, prompt_excerpt)
+                .await?;
+        if snapshot.matched {
             return Ok(true);
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1764,15 +1892,29 @@ async fn wait_for_codex_observation_delta(before: f64, timeout: Duration) -> Res
     Ok(false)
 }
 
-fn codex_observation_missing_error() -> &'static str {
-    "Codex exited successfully, but codex-blackbox-core did not observe any new provider=\"codex_responses\" request. Treating this as a failed Codex Blackbox proxy run."
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexObservationScope {
+    SessionId,
+    Prompt,
+    ProcessStart,
 }
 
-fn enforce_codex_observation_delta(observed: bool) -> Result<(), String> {
+fn codex_observation_missing_error(scope: CodexObservationScope) -> String {
+    let scope = match scope {
+        CodexObservationScope::SessionId => "matching the child Codex session id",
+        CodexObservationScope::Prompt => "matching this codex exec prompt",
+        CodexObservationScope::ProcessStart => "after this child process started",
+    };
+    format!(
+        "Codex exited successfully, but codex-blackbox-core did not observe any new provider=\"codex_responses\" request {scope}. Treating this as a failed Codex Blackbox proxy run."
+    )
+}
+
+fn enforce_codex_observation(observed: bool, scope: CodexObservationScope) -> Result<(), String> {
     if observed {
         Ok(())
     } else {
-        Err(codex_observation_missing_error().to_string())
+        Err(codex_observation_missing_error(scope))
     }
 }
 
@@ -1806,7 +1948,7 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
     }
 
     let observed_before = if plan.requires_codex_observation {
-        match fetch_codex_requests_total().await {
+        match fetch_codex_observation_snapshot(0, None, None).await {
             Ok(value) => Some(value),
             Err(err) => {
                 eprintln!("Error: Codex Blackbox observation pre-check failed: {err}");
@@ -1852,12 +1994,29 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
     }
 
     match result {
-        Ok(code) => {
-            if code == 0 {
+        Ok(child_result) => {
+            if child_result.exit_code == 0 {
                 if let Some(before) = observed_before {
-                    match wait_for_codex_observation_delta(before, Duration::from_secs(5)).await {
+                    let session_id = child_result.codex_session_id.as_deref();
+                    let prompt_excerpt = plan.observation_prompt_excerpt.as_deref();
+                    let observation_scope = if session_id.is_some() {
+                        CodexObservationScope::SessionId
+                    } else if prompt_excerpt.is_some() {
+                        CodexObservationScope::Prompt
+                    } else {
+                        CodexObservationScope::ProcessStart
+                    };
+                    match wait_for_codex_observation_after(
+                        before.latest_request_rowid,
+                        session_id,
+                        prompt_excerpt,
+                        Duration::from_secs(5),
+                    )
+                    .await
+                    {
                         Ok(observed) => {
-                            if let Err(err) = enforce_codex_observation_delta(observed) {
+                            if let Err(err) = enforce_codex_observation(observed, observation_scope)
+                            {
                                 eprintln!("Error: {err}");
                                 return 1;
                             }
@@ -1869,7 +2028,7 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
                     }
                 }
             }
-            code
+            child_result.exit_code
         }
         Err(err) => {
             eprintln!("Error: {err}");
@@ -5073,16 +5232,17 @@ async fn connect_and_stream(
 mod tests {
     use super::{
         build_child_run_plan, chatgpt_codex_proxy_base_url, codex_command_requires_observation,
-        codex_model_proxy_base_url, codex_subscription_config_overrides, codex_turn_summary_line,
-        compact_datetime_from_iso, context_status_line, enforce_codex_observation_delta,
-        event_session_id, extract_run_watch, format_duration_coarse, format_tokens,
-        guard_report_to_decision, local_time_from_iso, model_change_line,
-        parse_codex_requests_total, parse_mcp_tool_name, push_unique, render_child_run_plan,
+        codex_exec_prompt_hint, codex_model_proxy_base_url, codex_subscription_config_overrides,
+        codex_turn_summary_line, compact_datetime_from_iso, context_status_line,
+        enforce_codex_observation, event_session_id, extract_run_watch, format_duration_coarse,
+        format_tokens, guard_report_to_decision, local_time_from_iso, model_change_line,
+        parse_codex_session_id_line, parse_mcp_tool_name, push_unique, render_child_run_plan,
         render_codex_config_preview, render_decision_footer, render_decision_footer_json,
         render_decision_footer_plain, shell_join, shell_quote, should_suppress_codex_stderr_line,
         status_report_to_facts, tmux_orchestrator_watch_url, truncate_for_box, watch_model_label,
-        yaml_quote, ActiveSessions, ChildStdinMode, Cli, CodexTurnSummaryLine, ColorMode, Commands,
-        ConfigCommands, RunMode, WatchEvent, WatchRenderOptions, WatchRetryLog, WatchRuntimeState,
+        yaml_quote, ActiveSessions, ChildStdinMode, Cli, CodexObservationScope,
+        CodexTurnSummaryLine, ColorMode, Commands, ConfigCommands, RunMode, WatchEvent,
+        WatchRenderOptions, WatchRetryLog, WatchRuntimeState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
@@ -6090,6 +6250,7 @@ mod tests {
             "model_providers.codex-blackbox-chatgpt.supports_websockets=false"
         ));
         assert!(plan.requires_codex_observation);
+        assert_eq!(plan.observation_prompt_excerpt.as_deref(), Some("hello"));
         assert_eq!(plan.stdin_mode, ChildStdinMode::Null);
         assert!(!plan.args.iter().any(|arg| arg.contains("OPENAI_API_KEY")));
         assert!(!plan
@@ -6120,6 +6281,7 @@ mod tests {
         assert!(plan.env_removals.contains(&"CODEX_THREAD_ID".to_string()));
         assert_eq!(plan.stdin_mode, ChildStdinMode::Inherit);
         assert!(!plan.requires_codex_observation);
+        assert_eq!(plan.observation_prompt_excerpt, None);
         assert!(plan.args.ends_with(&["--help".to_string()]));
     }
 
@@ -6140,6 +6302,44 @@ mod tests {
             "login".to_string(),
             "status".to_string()
         ]));
+    }
+
+    #[test]
+    fn codex_exec_prompt_hint_extracts_prompt_after_options() {
+        assert_eq!(
+            codex_exec_prompt_hint(&[
+                "exec".to_string(),
+                "--sandbox".to_string(),
+                "read-only".to_string(),
+                "-m".to_string(),
+                "gpt-5.5".to_string(),
+                "Read README.md\n\nSummarize it.".to_string()
+            ])
+            .as_deref(),
+            Some("Read README.md Summarize it.")
+        );
+        assert_eq!(
+            codex_exec_prompt_hint(&["e".to_string(), "resume".to_string(), "--last".to_string()]),
+            None
+        );
+        assert_eq!(
+            codex_exec_prompt_hint(&["exec".to_string(), "-".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_session_id_line_parser_accepts_only_uuid_shape() {
+        assert_eq!(
+            parse_codex_session_id_line("session id: 019e32db-c479-7562-a331-6dcbd248b780")
+                .as_deref(),
+            Some("019e32db-c479-7562-a331-6dcbd248b780")
+        );
+        assert_eq!(
+            parse_codex_session_id_line("user: session id: 019e32db-c479-7562-a331-6dcbd248b780"),
+            None
+        );
+        assert_eq!(parse_codex_session_id_line("session id: not-a-uuid"), None);
     }
 
     #[test]
@@ -6217,7 +6417,7 @@ mod tests {
         assert!(preview.contains("Known Codex rollout-recording warning: suppressed"));
         assert!(preview.contains("OPENAI_API_KEY is not used"));
         assert!(preview.contains(
-            "Post-run check: require Codex Blackbox to observe at least one Codex Responses request"
+            "Post-run check: require Codex Blackbox to observe run-scoped Codex Responses evidence"
         ));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api"));
         assert!(preview.contains("http://127.0.0.1:10000/backend-api/codex"));
@@ -6226,26 +6426,22 @@ mod tests {
     }
 
     #[test]
-    fn codex_request_metric_parser_sums_codex_provider() {
-        let metrics = r#"
-# HELP codex_blackbox_requests_total Total requests
-# TYPE codex_blackbox_requests_total counter
-codex_blackbox_requests_total{model="gpt-5.5",provider="codex_responses"} 2
-codex_blackbox_requests_total{model="gpt-5.4",provider="codex_responses"} 3
-codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 99
-"#;
-
-        assert_eq!(parse_codex_requests_total(metrics), Some(5.0));
-        assert_eq!(parse_codex_requests_total("other_metric 1"), None);
-    }
-
-    #[test]
     fn observation_gate_fails_successful_codex_run_without_new_codex_responses_request() {
-        let err = enforce_codex_observation_delta(false).expect_err("missing observation fails");
+        let err = enforce_codex_observation(false, CodexObservationScope::ProcessStart)
+            .expect_err("missing observation fails");
 
         assert!(err.contains("Codex exited successfully"));
         assert!(err.contains("provider=\"codex_responses\""));
-        assert!(enforce_codex_observation_delta(true).is_ok());
+        assert!(err.contains("after this child process started"));
+
+        let prompt_err = enforce_codex_observation(false, CodexObservationScope::Prompt)
+            .expect_err("missing prompt match fails");
+        assert!(prompt_err.contains("matching this codex exec prompt"));
+
+        let session_err = enforce_codex_observation(false, CodexObservationScope::SessionId)
+            .expect_err("missing session match fails");
+        assert!(session_err.contains("matching the child Codex session id"));
+        assert!(enforce_codex_observation(true, CodexObservationScope::SessionId).is_ok());
     }
 
     #[test]

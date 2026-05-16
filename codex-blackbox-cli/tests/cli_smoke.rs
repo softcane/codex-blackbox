@@ -208,7 +208,7 @@ fn codex_dry_run_prints_overrides_and_preserves_user_args() {
     assert!(out.contains("Known Codex rollout-recording warning: suppressed"));
     assert!(out.contains("OPENAI_API_KEY is not used"));
     assert!(out.contains(
-        "Post-run check: require Codex Blackbox to observe at least one Codex Responses request"
+        "Post-run check: require Codex Blackbox to observe run-scoped Codex Responses evidence"
     ));
     assert!(!out.contains("forced_login_method"));
     assert!(!out.contains("openai_base_url"));

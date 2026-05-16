@@ -741,7 +741,7 @@ assert_cli_dry_run() {
     assert_file_contains "$output_path" "CODEX_THREAD_ID" "CLI dry-run removes parent Codex thread env"
     assert_file_contains "$output_path" "Child stdin: closed for Codex exec" "CLI dry-run closes Codex stdin for harness safety"
     assert_file_contains "$output_path" "features.enable_request_compression=false" "CLI dry-run disables request compression"
-    assert_file_contains "$output_path" "Post-run check: require Codex Blackbox to observe at least one Codex Responses request" "CLI dry-run labels observation gate"
+    assert_file_contains "$output_path" "Post-run check: require Codex Blackbox to observe run-scoped Codex Responses evidence" "CLI dry-run labels observation gate"
     if grep -q "forced_login_method\\|env_key\\|openai_base_url\\|codex-blackbox-openai\\|codex-blackbox-openai-responses" "$output_path"; then
         fail "CLI dry-run should not print API-key or stale custom/fake-provider overrides"
     fi
