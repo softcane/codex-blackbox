@@ -441,6 +441,22 @@ mod tests {
     }
 
     #[test]
+    fn decision_selects_stop_for_critical_context_pressure() {
+        let mut facts = observed();
+        facts.max_context_fill_percent = Some(85.0);
+
+        let decision = decide(&facts);
+
+        assert_eq!(decision.state, DecisionState::Stop);
+        assert_eq!(decision.primary_reason, "context 85%");
+        assert_eq!(decision.next_action, "inspect postmortem");
+        assert_eq!(
+            decision.drill_down_command.as_deref(),
+            Some("codex-blackbox postmortem session_decision")
+        );
+    }
+
+    #[test]
     fn decision_selects_stop_for_failed_incomplete_or_anomalous_responses() {
         let mut failed = observed();
         failed.failed_responses = 1;
@@ -456,6 +472,40 @@ mod tests {
         anomalous.accounting_anomalies = 1;
         assert_eq!(decide(&anomalous).state, DecisionState::Stop);
         assert_eq!(decide(&anomalous).primary_reason, "accounting anomaly");
+    }
+
+    #[test]
+    fn decision_precedence_keeps_harder_stops_above_advisory_states() {
+        let mut blocked = observed();
+        blocked.failed_responses = 1;
+        blocked.cooldown = Some(CooldownFacts {
+            reason: "upstream errors".to_string(),
+            retry_after_seconds: Some(60),
+        });
+        blocked.policy_block = Some(PolicyBlockFacts {
+            rule: "session_token_budget".to_string(),
+            reason: "token budget exceeded".to_string(),
+            current: Some("125000 tokens".to_string()),
+            limit: Some("120000 tokens".to_string()),
+            session_id: Some("session_decision".to_string()),
+            recovery_action: "restart narrower".to_string(),
+        });
+        assert_eq!(decide(&blocked).state, DecisionState::Blocked);
+
+        let mut cooldown = observed();
+        cooldown.failed_responses = 1;
+        cooldown.cooldown = Some(CooldownFacts {
+            reason: "upstream errors".to_string(),
+            retry_after_seconds: Some(60),
+        });
+        assert_eq!(decide(&cooldown).state, DecisionState::Cooldown);
+
+        let mut failed = observed();
+        failed.failed_responses = 1;
+        failed.ended = true;
+        failed.max_context_fill_percent = Some(90.0);
+        failed.local_estimate_trusted_for_budget_enforcement = Some(false);
+        assert_eq!(decide(&failed).state, DecisionState::Stop);
     }
 
     #[test]
@@ -613,6 +663,10 @@ mod tests {
     fn decision_output_omits_unsupported_surfaces() {
         let rendered = serde_json::to_string(&decide(&observed())).expect("decision json");
 
+        assert!(
+            !rendered.contains("\x1b["),
+            "decision JSON must not contain ANSI escapes: {rendered}"
+        );
         for forbidden in [
             "tool_result",
             "tool results",
@@ -626,6 +680,28 @@ mod tests {
                 !rendered.to_ascii_lowercase().contains(forbidden),
                 "decision output must not expose unsupported surface {forbidden}: {rendered}"
             );
+        }
+    }
+
+    #[test]
+    fn decision_json_contract_is_stable_and_uncolored() {
+        let mut facts = observed();
+        facts.max_context_fill_percent = None;
+        let rendered = serde_json::to_string(&decide(&facts)).expect("decision json");
+
+        assert_eq!(
+            rendered,
+            r#"{"state":"healthy","primary_reason":"Codex Responses observed","secondary_reasons":[],"next_action":"continue","correlation":{"session_id":"session_decision","observed_codex_responses":true,"ended":false,"total_turns":2,"total_tokens":12345}}"#
+        );
+        assert!(!rendered.contains("\x1b["));
+        for forbidden in [
+            "tool_result",
+            "mcp_lifecycle",
+            "skill_lifecycle",
+            "cache_lifecycle",
+            "provider_quota",
+        ] {
+            assert!(!rendered.contains(forbidden));
         }
     }
 }
