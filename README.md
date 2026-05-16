@@ -13,6 +13,9 @@ important signals, and a practical next step.
 It is built for local debugging. The database, metrics, dashboard, and CLI run
 on your machine.
 
+The demo image below is fixture-backed example output, not live support
+evidence.
+
 ![demo](docs/demo.gif)
 
 ## Quick Start
@@ -42,6 +45,21 @@ Read the latest report:
 codex-blackbox postmortem last
 ```
 
+Render the latest advisory decision as a one-line footer or JSON:
+
+```bash
+codex-blackbox status
+codex-blackbox status --json
+codex-blackbox guard --json
+```
+
+Or opt in to automatic postmortem rendering when watch sees a completed idle
+session:
+
+```bash
+codex-blackbox watch --postmortem
+```
+
 For a quick one-shot check instead of an interactive Codex session:
 
 ```bash
@@ -62,25 +80,21 @@ The postmortem is redacted by default. It shows:
 - input, cached input, uncached input, output, and reasoning tokens
 - local token and cost estimates
 - important signals, like high context use or model mismatch
-- tool calls the model tried to make
+- tool-call intent the model emitted, not proof that a tool succeeded
 
-Example:
+Example terminal display (fixture-style redacted sample, not live evidence):
 
-```markdown
-# Codex Responses Postmortem
+```text
+┌─[ Codex Responses Postmortem ]────────────────────────────────────────────┐
+│ Session   019e0743-63c2-7c61-b326-8088e4ae0c7b (redacted)                │
+│ Outcome   Likely Completed; 3 turns                                      │
+│ Model     gpt-5.5                                                        │
+│ Impact    54841 local tokens; local $0.10                                │
+└──────────────────────────────────────────────────────────────────────────┘
 
-## Snapshot
-- Session: 019e0743-63c2-7c61-b326-8088e4ae0c7b
-- State: final or persisted snapshot
-- Outcome: Likely Completed
-- Requested Model: gpt-5.5
-- Served Model: gpt-5.5
-- Turns: 3
-- Tokens: input 54231, cached 41600, uncached 12631, output 610, reasoning 445, local total 54841
-- Local Estimate: $0.10
-
-## Recommendations
-- Continue from the latest response summary if it matches the intended task.
+┌─[ Recommendations ]───────────────────────────────────────────────────────┐
+│ 1. Continue from the latest response summary.                             │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 For a specific session:
@@ -101,6 +115,8 @@ To write the report to a file:
 codex-blackbox postmortem last --output report.md
 ```
 
+The terminal view is styled for scanning; `--output` writes plain Markdown.
+
 ## What It Can Tell You
 
 Codex Blackbox can report what it observed during the model run:
@@ -119,34 +135,49 @@ Codex Blackbox can report what it observed during the model run:
 codex-blackbox doctor
 codex-blackbox up
 codex-blackbox watch --url http://127.0.0.1:9091
+codex-blackbox watch --postmortem
+codex-blackbox status --json
+codex-blackbox guard --json
 codex-blackbox sessions --limit 20 --days 7
 codex-blackbox postmortem last
 codex-blackbox postmortem last --no-redact
 ```
+
+Guard checks are local and advisory by default. A configured token budget or
+trusted cost budget can block only the next request before it is sent; it cannot
+interrupt an already-streaming model response. If a guard policy file cannot be
+loaded, Codex Blackbox fails open and reports the policy issue.
 
 API shortcuts:
 
 ```bash
 curl -s 'http://127.0.0.1:9091/api/sessions?limit=5'
 curl -s 'http://127.0.0.1:9091/api/postmortem/last'
+curl -s 'http://127.0.0.1:9091/api/guard-state'
 curl -s http://127.0.0.1:9091/metrics
 ```
 
 ## Testing
 
-Local fake tests:
+Evidence categories:
+
+- Fake fixtures validate local parser, persistence, watch, status, guard, and
+  postmortem contracts. They do not contact OpenAI and do not prove live Codex
+  support.
+- Preflight checks validate local configuration and login state without
+  launching a Codex model turn.
+- Dogfood evidence means a real local Codex run was intentionally routed
+  through `codex-blackbox run -- codex ...` and observed by
+  `codex-blackbox-core`.
+- Live support claims require real observed Codex Responses traffic persisted
+  with `provider="codex_responses"`.
+
+Local fake and static checks:
 
 ```bash
 ./test/validate-openai-config.sh
 ./test/e2e-openai-responses-full.sh
 ```
-
-These tests use fake Responses fixtures. They do not contact OpenAI, and they
-do not prove live Codex support.
-
-Live or dogfood evidence means a real Codex CLI run went through
-`codex-blackbox run -- codex ...` and Codex Blackbox saved at least one real
-Codex Responses request for that run.
 
 ## Development
 

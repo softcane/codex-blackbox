@@ -36,6 +36,8 @@ pub fn bootstrap_into_tmux(
     url: &str,
     no_signals: bool,
     tmux_max_panes: usize,
+    postmortem: bool,
+    no_redact: bool,
 ) -> Result<(), String> {
     if std::env::var("TMUX").is_ok() {
         return Ok(());
@@ -67,6 +69,12 @@ pub fn bootstrap_into_tmux(
     ];
     if no_signals {
         args.push("--no-signals".into());
+    }
+    if postmortem {
+        args.push("--postmortem".into());
+    }
+    if no_redact {
+        args.push("--no-redact".into());
     }
 
     use std::os::unix::process::CommandExt;
@@ -316,6 +324,8 @@ fn build_child_watch_command(
     session_id: &str,
     watch_url: &str,
     no_signals: bool,
+    postmortem: bool,
+    no_redact: bool,
 ) -> String {
     let mut cmd_parts = vec![
         cli_path.to_string(),
@@ -327,6 +337,12 @@ fn build_child_watch_command(
     ];
     if no_signals {
         cmd_parts.push("--no-signals".to_string());
+    }
+    if postmortem {
+        cmd_parts.push("--postmortem".to_string());
+    }
+    if no_redact {
+        cmd_parts.push("--no-redact".to_string());
     }
     shell_join(&cmd_parts)
 }
@@ -359,11 +375,19 @@ pub struct TmuxOrchestrator {
     watch_url: String,
     cli_path: String,
     no_signals: bool,
+    postmortem: bool,
+    no_redact: bool,
     max_panes: usize,
 }
 
 impl TmuxOrchestrator {
-    pub fn new(watch_url: String, no_signals: bool, max_panes: usize) -> Result<Self, String> {
+    pub fn new(
+        watch_url: String,
+        no_signals: bool,
+        max_panes: usize,
+        postmortem: bool,
+        no_redact: bool,
+    ) -> Result<Self, String> {
         let own_pane_id = get_own_pane_id()?;
         let own_window_id = get_own_window_id()?;
         let cli_path = resolve_cli_path();
@@ -375,6 +399,8 @@ impl TmuxOrchestrator {
             watch_url,
             cli_path,
             no_signals,
+            postmortem,
+            no_redact,
             max_panes,
         };
         orchestrator.configure_pane_borders();
@@ -389,8 +415,14 @@ impl TmuxOrchestrator {
         model: &str,
     ) -> Result<String, String> {
         // Build child command.
-        let child_cmd =
-            build_child_watch_command(&self.cli_path, session_id, &self.watch_url, self.no_signals);
+        let child_cmd = build_child_watch_command(
+            &self.cli_path,
+            session_id,
+            &self.watch_url,
+            self.no_signals,
+            self.postmortem,
+            self.no_redact,
+        );
 
         // Determine split strategy.
         // Always target a specific pane so the split happens in the orchestrator's window.
@@ -877,7 +909,7 @@ impl TmuxOrchestrator {
 
             _ => {
                 // For other event types, ensure the session has a pane (lazy discovery)
-                // but don't re-render status on every cache/signal event.
+                // but don't re-render status on every low-signal event.
                 if let Some(sid) = event_session_id(event) {
                     self.ensure_pane_exists(sid, cleanup_pane_ids);
                 }
@@ -1040,6 +1072,8 @@ mod tests {
             watch_url: "http://localhost:9091".to_string(),
             cli_path: "codex-blackbox".to_string(),
             no_signals: false,
+            postmortem: false,
+            no_redact: false,
             max_panes,
         }
     }
@@ -1111,6 +1145,8 @@ mod tests {
                 "session_a",
                 "http://localhost:9091",
                 false,
+                false,
+                false,
             ),
             "codex-blackbox watch --session session_a --url http://localhost:9091"
         );
@@ -1121,8 +1157,10 @@ mod tests {
                 "session with spaces",
                 "http://localhost:9091/watch?session=session with spaces",
                 true,
+                true,
+                true,
             ),
-            "'/tmp/codex-blackbox cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-signals"
+            "'/tmp/codex-blackbox cli' watch --session 'session with spaces' --url 'http://localhost:9091/watch?session=session with spaces' --no-signals --postmortem --no-redact"
         );
     }
 

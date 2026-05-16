@@ -1,15 +1,22 @@
 mod tmux;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, IsTerminal, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use codex_blackbox_core::decision::{
+    decide, CooldownFacts, Decision, DecisionState, ObservedSessionFacts,
+};
+use codex_blackbox_core::guard_policy::{
+    evaluate_guard_policy, load_guard_policy_from_env, load_guard_policy_from_path,
+    GuardCooldownEvidence, GuardEvidence, GuardPolicy, GuardPolicyIssue,
+};
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +58,13 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Check local developer prerequisites and stack health
@@ -88,6 +102,18 @@ enum Commands {
         #[arg(long)]
         no_signals: bool,
 
+        /// Render the deterministic local postmortem when a session becomes ready
+        #[arg(long)]
+        postmortem: bool,
+
+        /// Show unredacted automatic postmortems in watch --postmortem
+        #[arg(long)]
+        no_redact: bool,
+
+        /// Footer color mode
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+
         /// Filter to a specific session ID
         #[arg(long)]
         session: Option<String>,
@@ -114,6 +140,56 @@ enum Commands {
         /// Days to look back
         #[arg(long, default_value = "7")]
         days: u32,
+    },
+
+    /// Render the current Codex decision footer or JSON
+    Status {
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Emit machine-readable uncolored decision JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Footer color mode
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+
+        /// Render width for footer degradation tests or fixed-width terminals
+        #[arg(long)]
+        width: Option<usize>,
+
+        /// "last" or a specific session ID
+        #[arg(default_value = "last")]
+        target: String,
+    },
+
+    /// Render the advisory guard decision for the next Codex request
+    Guard {
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Optional TOML guard policy file
+        #[arg(long)]
+        policy: Option<PathBuf>,
+
+        /// Emit machine-readable uncolored decision JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Footer color mode
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
+
+        /// Render width for footer degradation tests or fixed-width terminals
+        #[arg(long)]
+        width: Option<usize>,
+
+        /// "last" or a specific session ID
+        #[arg(default_value = "last")]
+        target: String,
     },
 
     /// Search across past session prompts and final summaries
@@ -240,6 +316,13 @@ pub(crate) enum WatchEvent {
         session_id: String,
         report: DiagnosisReport,
     },
+    PostmortemReady {
+        session_id: String,
+        total_turns: u32,
+        total_tokens: u64,
+        reason: String,
+        postmortem_command: String,
+    },
     ModelFallback {
         session_id: String,
         requested: String,
@@ -266,6 +349,11 @@ pub(crate) enum WatchEvent {
         context_window_tokens: Option<u64>,
         #[serde(default)]
         turns_to_compact: Option<u32>,
+    },
+    Cooldown {
+        reason: String,
+        #[serde(default)]
+        retry_after_seconds: Option<u64>,
     },
     // For the "lagged" pseudo-event from the server.
     #[serde(rename = "lagged")]
@@ -1676,6 +1764,18 @@ async fn wait_for_codex_observation_delta(before: f64, timeout: Duration) -> Res
     Ok(false)
 }
 
+fn codex_observation_missing_error() -> &'static str {
+    "Codex exited successfully, but codex-blackbox-core did not observe any new provider=\"codex_responses\" request. Treating this as a failed Codex Blackbox proxy run."
+}
+
+fn enforce_codex_observation_delta(observed: bool) -> Result<(), String> {
+    if observed {
+        Ok(())
+    } else {
+        Err(codex_observation_missing_error().to_string())
+    }
+}
+
 async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>) -> i32 {
     let (watch, child_command) = extract_run_watch(watch_flag, command);
     if child_command.is_empty() {
@@ -1756,10 +1856,11 @@ async fn run_child_command(watch_flag: bool, dry_run: bool, command: Vec<String>
             if code == 0 {
                 if let Some(before) = observed_before {
                     match wait_for_codex_observation_delta(before, Duration::from_secs(5)).await {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            eprintln!("Error: Codex exited successfully, but codex-blackbox-core did not observe any new provider=\"codex_responses\" request. Treating this as a failed Codex Blackbox proxy run.");
-                            return 1;
+                        Ok(observed) => {
+                            if let Err(err) = enforce_codex_observation_delta(observed) {
+                                eprintln!("Error: {err}");
+                                return 1;
+                            }
                         }
                         Err(err) => {
                             eprintln!("Error: Codex Blackbox observation post-check failed: {err}");
@@ -2016,11 +2117,18 @@ pub(crate) fn event_session_id(event: &WatchEvent) -> Option<&str> {
         | WatchEvent::FrustrationSignal { session_id, .. }
         | WatchEvent::CompactionLoop { session_id, .. }
         | WatchEvent::Diagnosis { session_id, .. }
+        | WatchEvent::PostmortemReady { session_id, .. }
         | WatchEvent::ModelFallback { session_id, .. }
         | WatchEvent::CodexTurnSummary { session_id, .. }
         | WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
-        WatchEvent::Lagged { .. } => None,
+        WatchEvent::Cooldown { .. } | WatchEvent::Lagged { .. } => None,
     }
+}
+
+fn event_matches_session_filter(event: &WatchEvent, session_filter: &Option<String>) -> bool {
+    session_filter
+        .as_ref()
+        .is_none_or(|filter| event_session_id(event).is_none_or(|session_id| session_id == filter))
 }
 
 /// Tracks active sessions for prefix tag display.
@@ -2062,6 +2170,148 @@ impl ActiveSessions {
             .map(|s| s.as_str())
             .unwrap_or("?");
         format!("[{:width$}]  ", name, width = max_width)
+    }
+}
+
+#[derive(Default)]
+struct DecisionSessionTracker {
+    facts: HashMap<String, ObservedSessionFacts>,
+}
+
+impl DecisionSessionTracker {
+    fn update(&mut self, event: &WatchEvent) -> Option<Decision> {
+        if let WatchEvent::Cooldown {
+            reason,
+            retry_after_seconds,
+        } = event
+        {
+            let facts = self
+                .facts
+                .entry("__codex_blackbox_cooldown__".to_string())
+                .or_insert_with(ObservedSessionFacts::default);
+            facts.cooldown = Some(codex_blackbox_core::decision::CooldownFacts {
+                reason: reason.clone(),
+                retry_after_seconds: *retry_after_seconds,
+            });
+            return Some(decide(facts));
+        }
+
+        let session_id = event_session_id(event)?.to_string();
+        let facts = self
+            .facts
+            .entry(session_id.clone())
+            .or_insert_with(|| ObservedSessionFacts {
+                session_id: Some(session_id),
+                ..Default::default()
+            });
+
+        match event {
+            WatchEvent::SessionStart { .. } => {
+                facts.observed_codex_responses = true;
+            }
+            WatchEvent::CodexTurnSummary {
+                status,
+                total_tokens,
+                ..
+            } => {
+                facts.observed_codex_responses = true;
+                facts.total_turns = facts.total_turns.saturating_add(1);
+                facts.total_tokens = facts.total_tokens.saturating_add(*total_tokens);
+                match status.as_str() {
+                    "failed" => facts.failed_responses = facts.failed_responses.saturating_add(1),
+                    "incomplete" => {
+                        facts.incomplete_responses = facts.incomplete_responses.saturating_add(1)
+                    }
+                    "unknown" => {
+                        facts.unknown_responses = facts.unknown_responses.saturating_add(1)
+                    }
+                    _ => {}
+                }
+            }
+            WatchEvent::ContextStatus { fill_percent, .. } => {
+                facts.max_context_fill_percent = Some(
+                    facts
+                        .max_context_fill_percent
+                        .map(|current| current.max(*fill_percent))
+                        .unwrap_or(*fill_percent),
+                );
+            }
+            WatchEvent::ModelFallback { .. } => {
+                facts.model_mismatch = true;
+            }
+            WatchEvent::SessionEnd {
+                total_tokens,
+                total_turns,
+                ..
+            } => {
+                facts.observed_codex_responses = *total_turns > 0;
+                facts.ended = true;
+                facts.total_turns = *total_turns;
+                facts.total_tokens = *total_tokens;
+            }
+            WatchEvent::PostmortemReady {
+                total_turns,
+                total_tokens,
+                ..
+            } => {
+                facts.observed_codex_responses = true;
+                facts.ended = true;
+                facts.total_turns = *total_turns;
+                facts.total_tokens = *total_tokens;
+            }
+            WatchEvent::ToolUse { .. }
+            | WatchEvent::FrustrationSignal { .. }
+            | WatchEvent::CompactionLoop { .. }
+            | WatchEvent::Diagnosis { .. }
+            | WatchEvent::Cooldown { .. }
+            | WatchEvent::Lagged { .. } => return None,
+        }
+
+        Some(decide(facts))
+    }
+}
+
+struct WatchRenderOptions {
+    base_url: String,
+    no_signals: bool,
+    session_filter: Option<String>,
+    postmortem: bool,
+    redact_postmortem: bool,
+    color_mode: ColorMode,
+}
+
+struct WatchRuntimeState {
+    active: ActiveSessions,
+    decisions: DecisionSessionTracker,
+    last_rendered_decisions: HashMap<String, Decision>,
+    rendered_postmortems: HashSet<String>,
+}
+
+impl WatchRuntimeState {
+    fn new() -> Self {
+        Self {
+            active: ActiveSessions::new(),
+            decisions: DecisionSessionTracker::default(),
+            last_rendered_decisions: HashMap::new(),
+            rendered_postmortems: HashSet::new(),
+        }
+    }
+
+    fn remember_decision_if_changed(&mut self, event: &WatchEvent, decision: &Decision) -> bool {
+        let key = match event {
+            WatchEvent::Cooldown { .. } => Some("__codex_blackbox_cooldown__".to_string()),
+            _ => event_session_id(event).map(ToString::to_string),
+        };
+        let Some(key) = key else {
+            return true;
+        };
+        match self.last_rendered_decisions.get(&key) {
+            Some(previous) if previous == decision => false,
+            _ => {
+                self.last_rendered_decisions.insert(key, decision.clone());
+                true
+            }
+        }
     }
 }
 
@@ -2173,6 +2423,169 @@ fn codex_turn_summary_line(summary: CodexTurnSummaryLine<'_>) -> String {
         reasoning_part,
         format_tokens(summary.total_tokens)
     )
+}
+
+fn stdout_is_terminal() -> bool {
+    io::stdout().is_terminal()
+}
+
+fn state_ansi_prefix(state: DecisionState) -> &'static str {
+    match state {
+        DecisionState::Healthy => "\x1b[32m",
+        DecisionState::Watching => "\x1b[36m",
+        DecisionState::Careful => "\x1b[33m",
+        DecisionState::Stop => "\x1b[31m",
+        DecisionState::Blocked => "\x1b[1;31m",
+        DecisionState::Cooldown => "\x1b[33m",
+        DecisionState::Ended => "\x1b[2;90m",
+    }
+}
+
+fn color_enabled(mode: ColorMode, stdout_is_tty: bool, no_color: bool) -> bool {
+    match mode {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => stdout_is_tty && !no_color,
+    }
+}
+
+fn one_line_segment(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_ascii(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let mut out: String = value.chars().take(max_chars - 3).collect();
+    out.push_str("...");
+    out
+}
+
+fn compact_decision_reason(reason: &str, width: usize) -> String {
+    let reason = one_line_segment(reason);
+    if reason.len() <= width {
+        return reason;
+    }
+
+    let lower = reason.to_ascii_lowercase();
+    let compact = if lower.contains("waiting for first observed codex responses request") {
+        if width >= 19 {
+            "waiting for request"
+        } else {
+            "waiting"
+        }
+    } else if lower.contains("waiting for first observed codex responses turn") {
+        if width >= 16 {
+            "waiting for turn"
+        } else {
+            "waiting"
+        }
+    } else if lower == "core unavailable" {
+        if width >= 16 {
+            "core unavailable"
+        } else {
+            "core down"
+        }
+    } else if lower == "response failed" {
+        "failed"
+    } else if lower == "response incomplete" {
+        "incomplete"
+    } else if lower == "accounting anomaly" {
+        if width >= 18 {
+            "accounting anomaly"
+        } else {
+            "accounting"
+        }
+    } else if lower == "served model changed" {
+        "model changed"
+    } else if lower == "unknown response status" {
+        "unknown status"
+    } else if lower == "local estimate untrusted" {
+        if width >= 18 {
+            "untrusted estimate"
+        } else {
+            "untrusted"
+        }
+    } else if lower == "token budget exceeded" {
+        if width >= 15 {
+            "budget exceeded"
+        } else {
+            "budget"
+        }
+    } else if lower == "upstream errors" {
+        if width >= 15 {
+            "upstream errors"
+        } else {
+            "upstream"
+        }
+    } else if lower.contains(" turns, ") && lower.ends_with(" tokens") {
+        reason.trim_end_matches(" tokens")
+    } else {
+        reason.as_str()
+    };
+
+    if compact.len() <= width {
+        compact.to_string()
+    } else {
+        truncate_ascii(compact, width)
+    }
+}
+
+fn render_decision_footer_plain(decision: &Decision, width: usize) -> String {
+    let width = width.max(1);
+    let state = decision.state.label();
+    let reason = one_line_segment(&decision.primary_reason);
+    let action = one_line_segment(&decision.next_action);
+    let command = decision
+        .drill_down_command
+        .as_deref()
+        .map(one_line_segment)
+        .filter(|value| !value.is_empty());
+
+    let mut candidates = Vec::new();
+    if let Some(command) = command.as_ref() {
+        candidates.push(format!(
+            "codex-blackbox: {state} | {reason} | {action} | {command}"
+        ));
+    }
+    candidates.push(format!("codex-blackbox: {state} | {reason} | {action}"));
+    candidates.push(format!("codex-blackbox: {state} | {reason}"));
+    candidates.push(format!("cbb: {state} | {reason}"));
+    candidates.push(format!("{state} | {reason}"));
+
+    if let Some(candidate) = candidates.into_iter().find(|line| line.len() <= width) {
+        return candidate;
+    }
+
+    let prefix = format!("{state} | ");
+    if prefix.len() >= width {
+        return truncate_ascii(&prefix, width);
+    }
+    let reason_width = width - prefix.len();
+    format!("{prefix}{}", compact_decision_reason(&reason, reason_width))
+}
+
+fn render_decision_footer(
+    decision: &Decision,
+    width: usize,
+    color_mode: ColorMode,
+    stdout_is_tty: bool,
+    no_color: bool,
+) -> String {
+    let plain = render_decision_footer_plain(decision, width);
+    if color_enabled(color_mode, stdout_is_tty, no_color) {
+        format!("{}{}\x1b[0m", state_ansi_prefix(decision.state), plain)
+    } else {
+        plain
+    }
+}
+
+fn render_decision_footer_json(decision: &Decision) -> Result<String, serde_json::Error> {
+    serde_json::to_string(decision)
 }
 
 fn parse_mcp_tool_name(tool_name: &str) -> Option<(&str, &str)> {
@@ -2482,6 +2895,20 @@ fn render_event(
             );
         }
 
+        WatchEvent::PostmortemReady {
+            reason,
+            postmortem_command,
+            ..
+        } => {
+            let _ = (reason, postmortem_command);
+            // `watch --postmortem` handles this event outside the ordinary
+            // event renderer. Plain watch remains quiet by default.
+        }
+
+        WatchEvent::Cooldown { .. } => {
+            // The shared decision footer renders cooldown state.
+        }
+
         WatchEvent::Diagnosis {
             session_id: _,
             report,
@@ -2583,6 +3010,9 @@ async fn main() {
         Commands::Watch {
             url,
             no_signals,
+            postmortem,
+            no_redact,
+            color,
             session,
             tmux,
             tmux_max_panes,
@@ -2591,18 +3021,29 @@ async fn main() {
                 // Tmux orchestrator mode. Self-bootstrap into a tmux session
                 // if we're not already inside one, so the user just runs
                 // `codex-blackbox watch --tmux` once.
-                if let Err(e) = tmux::bootstrap_into_tmux(&url, no_signals, tmux_max_panes) {
+                if let Err(e) = tmux::bootstrap_into_tmux(
+                    &url,
+                    no_signals,
+                    tmux_max_panes,
+                    postmortem,
+                    no_redact,
+                ) {
                     eprintln!("{}", e.red());
                     std::process::exit(1);
                 }
-                let orchestrator =
-                    match tmux::TmuxOrchestrator::new(url.clone(), no_signals, tmux_max_panes) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            eprintln!("{}", format!("tmux init failed: {}", e).red());
-                            std::process::exit(1);
-                        }
-                    };
+                let orchestrator = match tmux::TmuxOrchestrator::new(
+                    url.clone(),
+                    no_signals,
+                    tmux_max_panes,
+                    postmortem,
+                    no_redact,
+                ) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        eprintln!("{}", format!("tmux init failed: {}", e).red());
+                        std::process::exit(1);
+                    }
+                };
                 let watch_url = tmux_orchestrator_watch_url(&url);
                 if let Err(e) = orchestrator.run(&watch_url).await {
                     eprintln!("{}", format!("Orchestrator error: {}", e).red());
@@ -2619,11 +3060,19 @@ async fn main() {
                     None => format!("{}/watch", url.trim_end_matches('/')),
                 };
                 println!("Connecting to {}...", watch_url);
-                let mut active = ActiveSessions::new();
+                let mut state = WatchRuntimeState::new();
+                let options = WatchRenderOptions {
+                    base_url: url.clone(),
+                    no_signals,
+                    session_filter: session.clone(),
+                    postmortem,
+                    redact_postmortem: !no_redact,
+                    color_mode: color,
+                };
                 let mut retry_log = WatchRetryLog::default();
 
                 loop {
-                    match connect_and_stream(&watch_url, no_signals, &session, &mut active).await {
+                    match connect_and_stream(&watch_url, &options, &mut state).await {
                         Ok(()) => {
                             retry_log.reset();
                             eprintln!(
@@ -2660,6 +3109,33 @@ async fn main() {
                 }
             }
         }
+        Commands::Status {
+            url,
+            json,
+            color,
+            width,
+            target,
+        } => match fetch_status(&url, &target, json, color, width).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).red());
+                std::process::exit(1);
+            }
+        },
+        Commands::Guard {
+            url,
+            policy,
+            json,
+            color,
+            width,
+            target,
+        } => match fetch_guard(&url, &target, policy.as_deref(), json, color, width).await {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{}", format!("Error: {}", e).red());
+                std::process::exit(1);
+            }
+        },
         Commands::Recall {
             url,
             limit,
@@ -2867,6 +3343,22 @@ async fn fetch_postmortem(
     redact: bool,
     output: Option<&Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let report = fetch_postmortem_report_json(base_url, target, redact).await?;
+    if let Some(path) = output {
+        let markdown = render_postmortem_markdown(&report);
+        fs::write(path, markdown)
+            .map_err(|err| format!("failed to write {}: {}", path.display(), err))?;
+    } else {
+        print_postmortem_terminal_report(&report);
+    }
+    Ok(())
+}
+
+async fn fetch_postmortem_report_json(
+    base_url: &str,
+    target: &str,
+    redact: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let target_path = if target == "last" {
         "last".to_string()
     } else {
@@ -2885,13 +3377,268 @@ async fn fetch_postmortem(
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()).into());
     }
-    let report: serde_json::Value = resp.json().await?;
-    let markdown = render_postmortem_markdown(&report);
-    if let Some(path) = output {
-        fs::write(path, markdown)
-            .map_err(|err| format!("failed to write {}: {}", path.display(), err))?;
+    Ok(resp.json().await?)
+}
+
+async fn fetch_guard_state_json(
+    base_url: &str,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let url = format!("{}/api/guard-state", base_url.trim_end_matches('/'));
+    let resp = reqwest::Client::new().get(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()).into());
+    }
+    Ok(resp.json().await?)
+}
+
+fn cooldown_from_guard_state(state: &serde_json::Value) -> Option<CooldownFacts> {
+    let cooldown = state.get("cooldown")?;
+    if cooldown.is_null() {
+        return None;
+    }
+    let reason = cooldown
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("upstream errors")
+        .to_string();
+    Some(CooldownFacts {
+        reason,
+        retry_after_seconds: cooldown
+            .get("retry_after_seconds")
+            .and_then(|value| value.as_u64()),
+    })
+}
+
+fn guard_cooldown_evidence(state: Option<&serde_json::Value>) -> Option<GuardCooldownEvidence> {
+    state
+        .and_then(cooldown_from_guard_state)
+        .map(|cooldown| GuardCooldownEvidence {
+            reason: cooldown.reason,
+            retry_after_seconds: cooldown.retry_after_seconds,
+        })
+}
+
+fn apply_guard_state_to_facts(facts: &mut ObservedSessionFacts, state: Option<&serde_json::Value>) {
+    if let Some(cooldown) = state.and_then(cooldown_from_guard_state) {
+        facts.cooldown = Some(cooldown);
+    }
+}
+
+fn status_count(report: &serde_json::Value, status: &str) -> u32 {
+    report
+        .get("signals")
+        .and_then(|signals| signals.get("response_statuses"))
+        .and_then(|statuses| statuses.get(status))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
+fn status_report_to_facts(report: &serde_json::Value) -> ObservedSessionFacts {
+    let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
+    let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
+    let signals = report.get("signals").unwrap_or(&serde_json::Value::Null);
+    let diagnosis = report.get("diagnosis").unwrap_or(&serde_json::Value::Null);
+    let total_turns = summary
+        .get("turn_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    let primary_cause_type = json_str(diagnosis, "primary_cause_type").unwrap_or("");
+    let report_partial = report
+        .get("partial")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let has_ended_at = json_str(summary, "ended_at").is_some_and(|value| !value.trim().is_empty());
+
+    ObservedSessionFacts {
+        session_id: json_str(report, "session_id").map(ToString::to_string),
+        observed_codex_responses: true,
+        ended: has_ended_at || !report_partial,
+        total_turns,
+        total_tokens: impact
+            .get("local_total_tokens")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        max_context_fill_percent: signals
+            .get("context_fill")
+            .and_then(|context| context.get("max_percent"))
+            .and_then(|value| value.as_f64()),
+        failed_responses: status_count(report, "failed"),
+        incomplete_responses: status_count(report, "incomplete"),
+        unknown_responses: status_count(report, "unknown"),
+        model_mismatch: signals
+            .get("model_mismatches")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty())
+            || primary_cause_type == "codex_model_mismatch",
+        accounting_anomalies: signals
+            .get("accounting_anomaly_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        local_estimate_trusted_for_budget_enforcement: impact
+            .get("local_estimate_trusted_for_budget_enforcement")
+            .and_then(|value| value.as_bool()),
+        ..Default::default()
+    }
+}
+
+fn guard_report_to_evidence(
+    report: &serde_json::Value,
+    guard_state: Option<&serde_json::Value>,
+) -> GuardEvidence {
+    let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
+    let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
+    let total_turns = summary
+        .get("turn_count")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+
+    GuardEvidence {
+        session_id: json_str(report, "session_id").map(ToString::to_string),
+        observed_codex_responses: total_turns > 0,
+        applies_to_next_request: true,
+        session_total_tokens: impact
+            .get("local_total_tokens")
+            .and_then(|value| value.as_u64()),
+        session_estimated_cost_dollars: impact
+            .get("local_estimated_cost_dollars")
+            .or_else(|| impact.get("local_estimate_cost_dollars"))
+            .and_then(|value| value.as_f64()),
+        local_estimate_trusted_for_budget_enforcement: impact
+            .get("local_estimate_trusted_for_budget_enforcement")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        cooldown: guard_cooldown_evidence(guard_state),
+    }
+}
+
+fn guard_issue_reason(issue: &GuardPolicyIssue) -> String {
+    format!("{}: {}", issue.issue_type, issue.message)
+}
+
+fn guard_report_to_decision(
+    report: &serde_json::Value,
+    policy: &GuardPolicy,
+    policy_issues: Vec<GuardPolicyIssue>,
+    guard_state: Option<&serde_json::Value>,
+) -> Decision {
+    let mut facts = status_report_to_facts(report);
+    let mut evaluation =
+        evaluate_guard_policy(policy, &guard_report_to_evidence(report, guard_state));
+    evaluation.policy_issues.extend(policy_issues);
+    facts.policy_block = evaluation.block;
+    facts.cooldown = evaluation.cooldown;
+    facts.policy_issues = evaluation
+        .policy_issues
+        .iter()
+        .map(guard_issue_reason)
+        .collect();
+    decide(&facts)
+}
+
+fn load_cli_guard_policy(
+    policy_path: Option<&Path>,
+) -> codex_blackbox_core::guard_policy::GuardPolicyLoad {
+    match policy_path {
+        Some(path) => load_guard_policy_from_path(path),
+        None => load_guard_policy_from_env(|key| std::env::var(key).ok()),
+    }
+}
+
+async fn fetch_status(
+    base_url: &str,
+    target: &str,
+    json_output: bool,
+    color_mode: ColorMode,
+    width: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let decision = match fetch_postmortem_report_json(base_url, target, true).await {
+        Ok(report) => {
+            let guard_state = fetch_guard_state_json(base_url).await.ok();
+            let mut facts = status_report_to_facts(&report);
+            apply_guard_state_to_facts(&mut facts, guard_state.as_ref());
+            decide(&facts)
+        }
+        Err(err) => {
+            let guard_state = fetch_guard_state_json(base_url).await.ok();
+            let message = err.to_string();
+            let mut facts = if message.starts_with("HTTP 404") {
+                ObservedSessionFacts::default()
+            } else {
+                ObservedSessionFacts {
+                    core_unavailable: true,
+                    ..Default::default()
+                }
+            };
+            apply_guard_state_to_facts(&mut facts, guard_state.as_ref());
+            decide(&facts)
+        }
+    };
+
+    if json_output {
+        println!("{}", render_decision_footer_json(&decision)?);
     } else {
-        print_postmortem_terminal_block(&markdown);
+        println!(
+            "{}",
+            render_decision_footer(
+                &decision,
+                width.unwrap_or_else(terminal_width),
+                color_mode,
+                stdout_is_terminal(),
+                std::env::var_os("NO_COLOR").is_some(),
+            )
+        );
+    }
+    Ok(())
+}
+
+async fn fetch_guard(
+    base_url: &str,
+    target: &str,
+    policy_path: Option<&Path>,
+    json_output: bool,
+    color_mode: ColorMode,
+    width: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let loaded = load_cli_guard_policy(policy_path);
+    let decision = match fetch_postmortem_report_json(base_url, target, true).await {
+        Ok(report) => {
+            let guard_state = fetch_guard_state_json(base_url).await.ok();
+            guard_report_to_decision(&report, &loaded.policy, loaded.issues, guard_state.as_ref())
+        }
+        Err(err) => {
+            let guard_state = fetch_guard_state_json(base_url).await.ok();
+            let message = err.to_string();
+            let mut facts = if message.starts_with("HTTP 404") {
+                ObservedSessionFacts::default()
+            } else {
+                ObservedSessionFacts {
+                    core_unavailable: true,
+                    ..Default::default()
+                }
+            };
+            apply_guard_state_to_facts(&mut facts, guard_state.as_ref());
+            facts.policy_issues = loaded.issues.iter().map(guard_issue_reason).collect();
+            decide(&facts)
+        }
+    };
+
+    if json_output {
+        println!("{}", render_decision_footer_json(&decision)?);
+    } else {
+        println!(
+            "{}",
+            render_decision_footer(
+                &decision,
+                width.unwrap_or_else(terminal_width),
+                color_mode,
+                stdout_is_terminal(),
+                std::env::var_os("NO_COLOR").is_some(),
+            )
+        );
     }
     Ok(())
 }
@@ -2925,10 +3672,18 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
                 value.to_string()
             }
         }
-        "Requested Model" | "Served Model" => value.cyan().to_string(),
+        "Session" | "Prompt" | "Final Summary" => value.bright_white().to_string(),
+        "Requested Model" | "Served Model" | "Model" => value.cyan().to_string(),
         "Turns" => value.bright_white().to_string(),
-        "Tokens" => value.yellow().to_string(),
-        "Local Estimate" | "Billed" => value.magenta().to_string(),
+        "Tokens" | "Impact" => value.yellow().to_string(),
+        "Local Estimate" | "Billed" | "Cost" => value.magenta().to_string(),
+        "Redaction" => {
+            if lower.contains("unredacted") {
+                value.yellow().bold().to_string()
+            } else {
+                value.green().to_string()
+            }
+        }
         "Local Estimate Trust" => {
             if lower.contains("untrusted") {
                 value.red().bold().to_string()
@@ -2971,24 +3726,8 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
             None => value.to_string(),
         },
         "Tool-call intent" => value.cyan().to_string(),
-        "Prompt" | "Final Summary" => value.bright_white().to_string(),
         _ => value.to_string(),
     }
-}
-
-fn colorize_bullet_key_value_line(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("- ")?;
-    let (label, value) = rest.split_once(": ")?;
-    if label.is_empty() || value.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{} {}{} {}",
-        "-".bright_black(),
-        label.bright_blue().bold(),
-        ":".bright_black(),
-        colorize_postmortem_value(label, value)
-    ))
 }
 
 fn colorize_evidence_kind(kind: &str) -> String {
@@ -3000,118 +3739,663 @@ fn colorize_evidence_kind(kind: &str) -> String {
     }
 }
 
-fn colorize_evidence_bullet_line(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("- [")?;
-    let (kind, detail) = rest.split_once("] ")?;
-    Some(format!(
-        "{} [{}] {}",
-        "-".bright_black(),
-        colorize_evidence_kind(kind),
-        detail
-    ))
+#[derive(Clone, Copy)]
+enum PostmortemTone {
+    Header,
+    Good,
+    Warn,
+    Danger,
+    Info,
+    Muted,
 }
 
-fn colorize_aligned_key_value_line(line: &str) -> Option<String> {
-    let indent_len = line.len() - line.trim_start_matches(' ').len();
-    if indent_len == 0 {
-        return None;
-    }
-    let indent = &line[..indent_len];
-    let rest = &line[indent_len..];
-    let split_at = rest.find("  ")?;
-    let label_area = &rest[..split_at];
-    let label = label_area.trim_end();
-    if label.is_empty() {
-        return None;
-    }
-    let value_area = &rest[split_at..];
-    let value = value_area.trim_start();
-    if value.is_empty() {
-        return None;
-    }
-
-    let padding_len = (label_area.len() - label.len()) + (value_area.len() - value.len());
-    Some(format!(
-        "{}{}{}{}",
-        indent,
-        label.bright_blue().bold(),
-        " ".repeat(padding_len),
-        colorize_postmortem_value(label, value)
-    ))
+struct PostmortemTerminalLine {
+    plain: String,
+    styled: String,
 }
 
-fn colorize_table_row(line: &str) -> Option<String> {
-    let indent_len = line.len() - line.trim_start_matches(' ').len();
-    let indent = &line[..indent_len];
-    let rest = &line[indent_len..];
-    let first_end = rest.find(char::is_whitespace)?;
-    let first = &rest[..first_end];
-    if !matches!(first, "direct" | "heuristic" | "derived") {
-        return None;
+impl PostmortemTerminalLine {
+    fn styled(plain: impl Into<String>, styled: impl Into<String>) -> Self {
+        Self {
+            plain: plain.into(),
+            styled: styled.into(),
+        }
     }
-    Some(format!(
-        "{}{}{}",
-        indent,
-        colorize_evidence_kind(first),
-        &rest[first_end..]
-    ))
 }
 
-fn colorize_postmortem_line(line: &str) -> String {
-    let trimmed = line.trim_start();
-    if line.starts_with("# ") {
-        return line.bright_cyan().bold().to_string();
+fn postmortem_tone_text(value: &str, tone: PostmortemTone) -> String {
+    match tone {
+        PostmortemTone::Header => value.truecolor(245, 132, 46).bold().to_string(),
+        PostmortemTone::Good => value.green().to_string(),
+        PostmortemTone::Warn => value.yellow().to_string(),
+        PostmortemTone::Danger => value.red().to_string(),
+        PostmortemTone::Info => value.cyan().to_string(),
+        PostmortemTone::Muted => value.bright_black().to_string(),
     }
-    if line.starts_with("## ") {
-        return line.cyan().bold().to_string();
+}
+
+fn postmortem_visible_len(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn postmortem_terminal_width() -> usize {
+    terminal_width().clamp(60, 120)
+}
+
+fn postmortem_wrap_words(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in value.split_whitespace() {
+        let word_len = postmortem_visible_len(word);
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            let mut chunk = String::new();
+            for ch in word.chars() {
+                if postmortem_visible_len(&chunk) == width {
+                    lines.push(chunk);
+                    chunk = String::new();
+                }
+                chunk.push(ch);
+            }
+            if !chunk.is_empty() {
+                lines.push(chunk);
+            }
+            continue;
+        }
+
+        let next_len = if current.is_empty() {
+            word_len
+        } else {
+            postmortem_visible_len(&current) + 1 + word_len
+        };
+        if next_len <= width {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
     }
-    if line.starts_with("```") {
-        return line.bright_black().to_string();
+
+    if !current.is_empty() {
+        lines.push(current);
     }
-    if (trimmed.starts_with("Type") && trimmed.contains("Signal"))
-        || (trimmed.starts_with("Time") && trimmed.contains("Event"))
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn postmortem_top_border(title: &str, width: usize, tone: PostmortemTone) -> String {
+    let max_title_width = width.saturating_sub(10).max(1);
+    let title = truncate_for_box(title, max_title_width);
+    let prefix = format!("\u{250c}\u{2500}[ {title} ]");
+    let fill = width.saturating_sub(postmortem_visible_len(&prefix) + 1);
+    postmortem_tone_text(
+        &format!("{prefix}{}\u{2510}", "\u{2500}".repeat(fill)),
+        tone,
+    )
+}
+
+fn postmortem_bottom_border(width: usize, tone: PostmortemTone) -> String {
+    postmortem_tone_text(
+        &format!(
+            "\u{2514}{}\u{2518}",
+            "\u{2500}".repeat(width.saturating_sub(2))
+        ),
+        tone,
+    )
+}
+
+fn postmortem_box_line(
+    line: &PostmortemTerminalLine,
+    width: usize,
+    tone: PostmortemTone,
+) -> String {
+    let inner_width = width.saturating_sub(4);
+    let (content, visible_len) = if postmortem_visible_len(&line.plain) > inner_width {
+        let truncated = truncate_for_box(&line.plain, inner_width);
+        let visible_len = postmortem_visible_len(&truncated);
+        (truncated, visible_len)
+    } else {
+        (line.styled.clone(), postmortem_visible_len(&line.plain))
+    };
+    let padding = inner_width.saturating_sub(visible_len);
+    format!(
+        "{} {}{} {}",
+        postmortem_tone_text("\u{2502}", tone),
+        content,
+        " ".repeat(padding),
+        postmortem_tone_text("\u{2502}", tone),
+    )
+}
+
+fn print_postmortem_box(
+    title: &str,
+    lines: &[PostmortemTerminalLine],
+    tone: PostmortemTone,
+    width: usize,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    println!("{}", postmortem_top_border(title, width, tone));
+    for line in lines {
+        println!("{}", postmortem_box_line(line, width, tone));
+    }
+    println!("{}", postmortem_bottom_border(width, tone));
+}
+
+fn postmortem_key_value_lines(
+    rows: Vec<(&str, String)>,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    let label_width = rows
+        .iter()
+        .map(|(label, _)| label.len())
+        .max()
+        .unwrap_or(8)
+        .clamp(8, 28);
+    let value_width = content_width.saturating_sub(label_width + 2).max(12);
+    let mut lines = Vec::new();
+    for (label, value) in rows {
+        for (idx, chunk) in postmortem_wrap_words(&value, value_width)
+            .into_iter()
+            .enumerate()
+        {
+            let label_cell = if idx == 0 {
+                format!("{label:<label_width$}")
+            } else {
+                " ".repeat(label_width)
+            };
+            let plain = format!("{label_cell}  {chunk}");
+            let styled_label = if idx == 0 {
+                label_cell.bright_blue().bold().to_string()
+            } else {
+                label_cell
+            };
+            let styled = format!(
+                "{styled_label}  {}",
+                colorize_postmortem_value(label, &chunk)
+            );
+            lines.push(PostmortemTerminalLine::styled(plain, styled));
+        }
+    }
+    lines
+}
+
+fn postmortem_state(report: &serde_json::Value) -> &'static str {
+    if report
+        .get("partial")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
     {
-        return line.bright_black().bold().to_string();
+        "partial snapshot"
+    } else {
+        "final or persisted snapshot"
     }
-    if !trimmed.is_empty()
-        && trimmed
-            .chars()
-            .all(|ch| ch == '-' || ch.is_ascii_whitespace())
-    {
-        return line.bright_black().to_string();
-    }
-    if let Some(colored) = colorize_table_row(line) {
-        return colored;
-    }
-    if let Some(colored) = colorize_aligned_key_value_line(line) {
-        return colored;
-    }
-    if let Some(colored) = colorize_evidence_bullet_line(line) {
-        return colored;
-    }
-    if let Some(colored) = colorize_bullet_key_value_line(line) {
-        return colored;
-    }
-    if line.starts_with("- ") {
-        return format!(
-            "{} {}",
-            "-".bright_black(),
-            line.trim_start_matches("- ").bright_white()
-        );
-    }
-    line.to_string()
 }
 
-fn colorize_postmortem_for_terminal(markdown: &str) -> String {
-    let mut colored = markdown
-        .lines()
-        .map(colorize_postmortem_line)
-        .collect::<Vec<_>>()
-        .join("\n");
-    if markdown.ends_with('\n') {
-        colored.push('\n');
+fn postmortem_token_line(impact: &serde_json::Value) -> String {
+    format!(
+        "input {}, cached {}, uncached {}, output {}, reasoning {}, local total {}",
+        number_field(impact, "input_tokens"),
+        number_field(impact, "cached_input_tokens"),
+        number_field(impact, "uncached_input_tokens"),
+        number_field(impact, "output_tokens"),
+        number_field(impact, "reasoning_output_tokens"),
+        number_field(impact, "local_total_tokens"),
+    )
+}
+
+fn postmortem_model_line(summary: &serde_json::Value) -> Option<String> {
+    match (
+        json_str(summary, "requested_model"),
+        json_str(summary, "served_model"),
+    ) {
+        (Some(requested), Some(served)) if requested == served => Some(requested.to_string()),
+        (Some(requested), Some(served)) => Some(format!("{requested} -> {served}")),
+        (Some(requested), None) => Some(requested.to_string()),
+        (None, Some(served)) => Some(format!("served {served}")),
+        (None, None) => None,
     }
-    colored
+}
+
+fn postmortem_local_estimate_line(impact: &serde_json::Value) -> String {
+    let cost = impact
+        .get("local_estimated_cost_dollars")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let mut parts = vec![format!("local ${cost:.2}")];
+    if let Some(trusted) = impact
+        .get("local_estimate_trusted_for_budget_enforcement")
+        .and_then(|value| value.as_bool())
+    {
+        parts.push(if trusted {
+            "trusted for budget enforcement".to_string()
+        } else {
+            "untrusted for budget enforcement".to_string()
+        });
+    }
+    if let Some(source) = json_str(impact, "local_estimate_source") {
+        parts.push(source.to_string());
+    }
+    parts.join(", ")
+}
+
+fn postmortem_response_statuses_line(signals: &serde_json::Value) -> Option<String> {
+    signals
+        .get("response_statuses")
+        .and_then(|value| value.as_object())
+        .map(|statuses| {
+            statuses
+                .iter()
+                .filter_map(|(status, count)| count.as_u64().map(|count| (status, count)))
+                .filter(|(_, count)| *count > 0)
+                .map(|(status, count)| format!("{status}: {count}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|rendered| !rendered.is_empty())
+}
+
+fn postmortem_status_count(report: &serde_json::Value, status: &str) -> u64 {
+    report
+        .get("signals")
+        .and_then(|signals| signals.get("response_statuses"))
+        .and_then(|statuses| statuses.get(status))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0)
+}
+
+fn postmortem_report_tone(report: &serde_json::Value) -> PostmortemTone {
+    let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
+    let diagnosis = report.get("diagnosis").unwrap_or(&serde_json::Value::Null);
+    let outcome = json_str(summary, "outcome")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let primary_cause = json_str(diagnosis, "primary_cause")
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if postmortem_status_count(report, "failed") > 0
+        || outcome.contains("failed")
+        || outcome.contains("error")
+        || primary_cause.contains("failed")
+        || primary_cause.contains("error")
+    {
+        PostmortemTone::Danger
+    } else if postmortem_status_count(report, "incomplete") > 0
+        || outcome.contains("partial")
+        || outcome.contains("incomplete")
+        || (!primary_cause.is_empty() && primary_cause != "none")
+    {
+        PostmortemTone::Warn
+    } else {
+        PostmortemTone::Good
+    }
+}
+
+fn postmortem_terminal_header_lines(
+    report: &serde_json::Value,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
+    let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
+    let redaction = if report
+        .get("redacted")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+    {
+        "redacted"
+    } else {
+        "unredacted"
+    };
+
+    let mut rows = vec![
+        (
+            "Session",
+            format!(
+                "{} ({redaction})",
+                json_str(report, "session_id").unwrap_or("?")
+            ),
+        ),
+        (
+            "Outcome",
+            format!(
+                "{}; {} turns",
+                json_str(summary, "outcome").unwrap_or("?"),
+                summary
+                    .get("turn_count")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            ),
+        ),
+    ];
+    if let Some(model) = postmortem_model_line(summary) {
+        rows.push(("Model", model));
+    }
+    rows.push((
+        "Impact",
+        format!(
+            "{} local tokens; {}",
+            number_field(impact, "local_total_tokens"),
+            postmortem_local_estimate_line(impact)
+        ),
+    ));
+    rows.push((
+        "Boundary",
+        "Envoy-observed Codex Responses; tool calls are intent only".to_string(),
+    ));
+    postmortem_key_value_lines(rows, content_width)
+}
+
+fn postmortem_snapshot_terminal_lines(
+    report: &serde_json::Value,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
+    let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
+    let diagnosis = report.get("diagnosis").unwrap_or(&serde_json::Value::Null);
+    let cost = impact
+        .get("local_estimated_cost_dollars")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let mut rows = vec![
+        ("State", postmortem_state(report).to_string()),
+        ("Tokens", postmortem_token_line(impact)),
+        ("Local Estimate", format!("${cost:.2}")),
+        (
+            "Primary Cause",
+            json_str(diagnosis, "primary_cause")
+                .unwrap_or("none")
+                .to_string(),
+        ),
+    ];
+    if let Some(source) = json_str(impact, "local_estimate_source") {
+        rows.push(("Local Estimate Source", source.to_string()));
+    }
+    if let Some(trusted) = impact
+        .get("local_estimate_trusted_for_budget_enforcement")
+        .and_then(|value| value.as_bool())
+    {
+        rows.push((
+            "Local Estimate Trust",
+            if trusted {
+                "trusted for budget enforcement".to_string()
+            } else {
+                "untrusted for budget enforcement".to_string()
+            },
+        ));
+    }
+    if let Some(billed) = impact
+        .get("billed_reconciliation")
+        .and_then(|value| value.as_object())
+        .and_then(|map| map.get("billed_cost_dollars"))
+        .and_then(|value| value.as_f64())
+    {
+        rows.push(("Billed", format!("${billed:.2}")));
+    }
+    if let Some(prompt) = json_str(summary, "initial_prompt_excerpt") {
+        rows.push(("Prompt", prompt.to_string()));
+    }
+    if let Some(summary_text) = json_str(summary, "final_response_summary") {
+        rows.push(("Final Summary", summary_text.to_string()));
+    }
+    postmortem_key_value_lines(rows, content_width)
+}
+
+fn postmortem_signals_terminal_lines(
+    report: &serde_json::Value,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    let Some(signals) = report.get("signals") else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(&str, String)> = Vec::new();
+    if let Some(rendered) = postmortem_response_statuses_line(signals) {
+        rows.push(("Responses statuses", rendered));
+    }
+    if let Some(context) = signals.get("context_fill") {
+        let percent = context
+            .get("max_percent")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        rows.push(("Estimated context fill max", format!("{percent:.1}%")));
+    }
+    if let Some(cache) = signals.get("cached_input_reuse") {
+        if let Some(ratio) = cache.get("ratio").and_then(|value| value.as_f64()) {
+            rows.push(("Cached input reuse", format!("{:.0}%", ratio * 100.0)));
+        }
+    }
+    if let Some(reasoning) = signals.get("reasoning_output_share") {
+        if let Some(ratio) = reasoning.get("max_ratio").and_then(|value| value.as_f64()) {
+            rows.push((
+                "Max reasoning-output share",
+                format!("{:.0}%", ratio * 100.0),
+            ));
+        }
+    }
+    if let Some(counts) = signals
+        .get("tool_call_intent_counts")
+        .and_then(|value| value.as_object())
+    {
+        let rendered = counts
+            .iter()
+            .filter_map(|(tool, count)| count.as_u64().map(|count| (tool, count)))
+            .filter(|(_, count)| *count > 0)
+            .map(|(tool, count)| format!("{tool}: {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !rendered.is_empty() {
+            rows.push(("Tool-call intent", rendered));
+        }
+    }
+    postmortem_key_value_lines(rows, content_width)
+}
+
+fn postmortem_evidence_terminal_lines(report: &serde_json::Value) -> Vec<PostmortemTerminalLine> {
+    report
+        .get("evidence")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .take(12)
+        .enumerate()
+        .map(|(idx, row)| {
+            let kind = json_str(row, "type").unwrap_or("signal");
+            let signal = json_str(row, "signal").unwrap_or("unknown");
+            let turn = row
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let detail = postmortem_table_cell(json_str(row, "detail").unwrap_or(""));
+            let index = idx + 1;
+            let plain = format!("{index}. [{kind}] {signal} turn {turn}: {detail}");
+            let styled = format!(
+                "{} [{}] {} {} {}",
+                format!("{index}.").bright_white().bold(),
+                colorize_evidence_kind(kind),
+                signal.cyan(),
+                format!("turn {turn}:").bright_black(),
+                detail.bright_white()
+            );
+            PostmortemTerminalLine::styled(plain, styled)
+        })
+        .collect()
+}
+
+fn postmortem_timeline_terminal_lines(report: &serde_json::Value) -> Vec<PostmortemTerminalLine> {
+    report
+        .get("timeline")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .take(14)
+        .map(|row| {
+            let timestamp = json_str(row, "timestamp").unwrap_or("");
+            let event = json_str(row, "event").unwrap_or("event");
+            let detail = postmortem_table_cell(json_str(row, "detail").unwrap_or(""));
+            let plain = format!("{timestamp}  {event}  {detail}");
+            let styled = format!(
+                "{}  {}  {}",
+                timestamp.bright_black(),
+                event.cyan(),
+                detail.bright_white()
+            );
+            PostmortemTerminalLine::styled(plain, styled)
+        })
+        .collect()
+}
+
+fn postmortem_string_list_terminal_lines(
+    report: &serde_json::Value,
+    key: &str,
+    tone: PostmortemTone,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    let mut lines = Vec::new();
+    for (idx, item) in report
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.as_str())
+        .enumerate()
+    {
+        let index = idx + 1;
+        let item = postmortem_table_cell(item);
+        let prefix = format!("{index}. ");
+        let value_width = content_width
+            .saturating_sub(postmortem_visible_len(&prefix))
+            .max(12);
+        for (line_idx, chunk) in postmortem_wrap_words(&item, value_width)
+            .into_iter()
+            .enumerate()
+        {
+            let line_prefix = if line_idx == 0 {
+                prefix.clone()
+            } else {
+                " ".repeat(postmortem_visible_len(&prefix))
+            };
+            let plain = format!("{line_prefix}{chunk}");
+            let styled_item = match tone {
+                PostmortemTone::Warn => chunk.bright_cyan().bold().to_string(),
+                PostmortemTone::Muted => chunk.dimmed().to_string(),
+                _ => chunk.bright_white().to_string(),
+            };
+            let styled_prefix = if line_idx == 0 {
+                format!("{index}.").bright_white().bold().to_string() + " "
+            } else {
+                line_prefix
+            };
+            lines.push(PostmortemTerminalLine::styled(
+                plain,
+                format!("{styled_prefix}{styled_item}"),
+            ));
+        }
+    }
+    lines
+}
+
+fn postmortem_restart_prompt_terminal_lines(
+    report: &serde_json::Value,
+    content_width: usize,
+) -> Vec<PostmortemTerminalLine> {
+    json_str(report, "restart_prompt")
+        .filter(|value| !value.trim().is_empty())
+        .map(|prompt| {
+            postmortem_wrap_words(prompt, content_width)
+                .into_iter()
+                .map(|line| {
+                    PostmortemTerminalLine::styled(line.clone(), line.bright_cyan().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_postmortem_terminal_report(report: &serde_json::Value) {
+    let width = postmortem_terminal_width();
+    let content_width = width.saturating_sub(4);
+    let report_tone = postmortem_report_tone(report);
+    let signal_tone = match report_tone {
+        PostmortemTone::Good => PostmortemTone::Info,
+        other => other,
+    };
+
+    println!();
+    print_postmortem_box(
+        "Codex Responses Postmortem",
+        &postmortem_terminal_header_lines(report, content_width),
+        PostmortemTone::Header,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Snapshot",
+        &postmortem_snapshot_terminal_lines(report, content_width),
+        report_tone,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Signals",
+        &postmortem_signals_terminal_lines(report, content_width),
+        signal_tone,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Evidence",
+        &postmortem_evidence_terminal_lines(report),
+        signal_tone,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Timeline",
+        &postmortem_timeline_terminal_lines(report),
+        PostmortemTone::Info,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Recommendations",
+        &postmortem_string_list_terminal_lines(
+            report,
+            "recommendations",
+            PostmortemTone::Warn,
+            content_width,
+        ),
+        PostmortemTone::Warn,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Caveats",
+        &postmortem_string_list_terminal_lines(
+            report,
+            "caveats",
+            PostmortemTone::Muted,
+            content_width,
+        ),
+        PostmortemTone::Muted,
+        width,
+    );
+    println!();
+    print_postmortem_box(
+        "Restart Prompt",
+        &postmortem_restart_prompt_terminal_lines(report, content_width),
+        PostmortemTone::Info,
+        width,
+    );
 }
 
 #[cfg(unix)]
@@ -3178,24 +4462,6 @@ fn terminal_width() -> usize {
     terminal_width_from_stdout()
         .or_else(terminal_width_from_columns_env)
         .unwrap_or(100)
-}
-
-fn postmortem_separator_line_for_width(width: usize) -> String {
-    "\u{2501}".repeat(width.max(20))
-}
-
-fn postmortem_separator_line() -> String {
-    postmortem_separator_line_for_width(terminal_width())
-}
-
-fn print_postmortem_terminal_block(markdown: &str) {
-    println!();
-    println!("{}", postmortem_separator_line().dimmed());
-    print!("{}", colorize_postmortem_for_terminal(markdown));
-    if !markdown.ends_with('\n') {
-        println!();
-    }
-    println!("{}", postmortem_separator_line().dimmed());
 }
 
 fn encode_path_segment(value: &str) -> String {
@@ -3698,11 +4964,37 @@ async fn fetch_recall(
     Ok(())
 }
 
+async fn maybe_render_watch_postmortem(
+    event: &WatchEvent,
+    options: &WatchRenderOptions,
+    state: &mut WatchRuntimeState,
+) {
+    let WatchEvent::PostmortemReady { session_id, .. } = event else {
+        return;
+    };
+    if !options.postmortem || !state.rendered_postmortems.insert(session_id.clone()) {
+        return;
+    }
+
+    if let Err(err) = fetch_postmortem(
+        &options.base_url,
+        session_id,
+        options.redact_postmortem,
+        None,
+    )
+    .await
+    {
+        eprintln!(
+            "{}",
+            format!("Error: failed to render postmortem for {session_id}: {err}").red()
+        );
+    }
+}
+
 async fn connect_and_stream(
     url: &str,
-    no_signals: bool,
-    session_filter: &Option<String>,
-    active: &mut ActiveSessions,
+    options: &WatchRenderOptions,
+    state: &mut WatchRuntimeState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resp = reqwest::Client::new()
         .get(url)
@@ -3739,7 +5031,27 @@ async fn connect_and_stream(
                 continue;
             } else if line.is_empty() && !data_buffer.is_empty() {
                 if let Ok(event) = serde_json::from_str::<WatchEvent>(&data_buffer) {
-                    render_event(&event, no_signals, session_filter, active);
+                    if event_matches_session_filter(&event, &options.session_filter) {
+                        render_event(
+                            &event,
+                            options.no_signals,
+                            &options.session_filter,
+                            &mut state.active,
+                        );
+                        if let Some(decision) = state.decisions.update(&event) {
+                            if state.remember_decision_if_changed(&event, &decision) {
+                                let footer = render_decision_footer(
+                                    &decision,
+                                    terminal_width(),
+                                    options.color_mode,
+                                    stdout_is_terminal(),
+                                    std::env::var_os("NO_COLOR").is_some(),
+                                );
+                                println!("{footer}");
+                            }
+                        }
+                        maybe_render_watch_postmortem(&event, options, state).await;
+                    }
                 }
                 data_buffer.clear();
             }
@@ -3754,16 +5066,21 @@ mod tests {
     use super::{
         build_child_run_plan, chatgpt_codex_proxy_base_url, codex_command_requires_observation,
         codex_model_proxy_base_url, codex_subscription_config_overrides, codex_turn_summary_line,
-        compact_datetime_from_iso, context_status_line, event_session_id, extract_run_watch,
-        format_duration_coarse, format_tokens, local_time_from_iso, model_change_line,
+        compact_datetime_from_iso, context_status_line, enforce_codex_observation_delta,
+        event_session_id, extract_run_watch, format_duration_coarse, format_tokens,
+        guard_report_to_decision, local_time_from_iso, model_change_line,
         parse_codex_requests_total, parse_mcp_tool_name, push_unique, render_child_run_plan,
-        render_codex_config_preview, shell_join, shell_quote, should_suppress_codex_stderr_line,
-        tmux_orchestrator_watch_url, truncate_for_box, watch_model_label, yaml_quote,
-        ActiveSessions, ChildStdinMode, Cli, CodexTurnSummaryLine, Commands, ConfigCommands,
-        RunMode, WatchEvent, WatchRetryLog,
+        render_codex_config_preview, render_decision_footer, render_decision_footer_json,
+        render_decision_footer_plain, shell_join, shell_quote, should_suppress_codex_stderr_line,
+        status_report_to_facts, tmux_orchestrator_watch_url, truncate_for_box, watch_model_label,
+        yaml_quote, ActiveSessions, ChildStdinMode, Cli, CodexTurnSummaryLine, ColorMode, Commands,
+        ConfigCommands, RunMode, WatchEvent, WatchRenderOptions, WatchRetryLog, WatchRuntimeState,
     };
     use chrono::{DateTime, Local};
     use clap::Parser;
+    use codex_blackbox_core::decision::{
+        decide, CooldownFacts, Decision, DecisionState, ObservedSessionFacts, PolicyBlockFacts,
+    };
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3822,6 +5139,41 @@ mod tests {
                 stream.flush().expect("flush sse chunk");
                 thread::sleep(Duration::from_millis(5));
             }
+        });
+
+        (url, rx)
+    }
+
+    fn serve_json_once(body: &str) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind json server");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let body = body.to_string();
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept json request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buffer).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&request).into_owned())
+                .expect("send captured json request");
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write json response");
         });
 
         (url, rx)
@@ -3932,6 +5284,617 @@ mod tests {
         assert!(summary.contains("total 1K"));
         assert!(!summary.contains("expires"));
         assert!(!summary.contains("rebuild"));
+    }
+
+    fn footer_facts() -> ObservedSessionFacts {
+        ObservedSessionFacts {
+            session_id: Some("session_footer".to_string()),
+            observed_codex_responses: true,
+            total_turns: 3,
+            total_tokens: 42_000,
+            max_context_fill_percent: Some(31.0),
+            local_estimate_trusted_for_budget_enforcement: Some(true),
+            ..Default::default()
+        }
+    }
+
+    fn ansi_free(value: &str) -> String {
+        let mut out = String::new();
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                for ansi in chars.by_ref() {
+                    if ansi.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(ch);
+        }
+        out
+    }
+
+    fn assert_no_ansi(value: &str) {
+        assert!(
+            !value.contains("\x1b["),
+            "expected no ANSI escapes, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn footer_renders_all_decision_states_with_reason_and_action() {
+        let cases: Vec<(&str, Decision)> = vec![
+            ("Healthy", decide(&footer_facts())),
+            ("Watching", decide(&ObservedSessionFacts::default())),
+            {
+                let mut facts = footer_facts();
+                facts.max_context_fill_percent = Some(72.0);
+                ("Careful", decide(&facts))
+            },
+            {
+                let mut facts = footer_facts();
+                facts.failed_responses = 1;
+                ("Stop", decide(&facts))
+            },
+            (
+                "Blocked",
+                decide(&ObservedSessionFacts {
+                    session_id: Some("session_footer".to_string()),
+                    policy_block: Some(PolicyBlockFacts {
+                        rule: "session_token_budget".to_string(),
+                        reason: "token budget exceeded".to_string(),
+                        current: Some("125000 tokens".to_string()),
+                        limit: Some("120000 tokens".to_string()),
+                        session_id: Some("session_footer".to_string()),
+                        recovery_action: "restart narrower".to_string(),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "Cooldown",
+                decide(&ObservedSessionFacts {
+                    cooldown: Some(CooldownFacts {
+                        reason: "upstream errors".to_string(),
+                        retry_after_seconds: Some(30),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+            {
+                let mut facts = footer_facts();
+                facts.ended = true;
+                ("Ended", decide(&facts))
+            },
+        ];
+
+        for (state_word, decision) in cases {
+            let line = render_decision_footer_plain(&decision, 120);
+            assert!(line.contains(state_word), "{state_word}: {line}");
+            assert!(
+                line.contains(&decision.primary_reason),
+                "missing reason for {state_word}: {line}"
+            );
+            assert!(
+                line.contains(&decision.next_action),
+                "missing action for {state_word}: {line}"
+            );
+            assert!(!line.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn footer_color_modes_respect_state_no_color_and_tty() {
+        let states = [
+            (decide(&footer_facts()), "\x1b[32m"),
+            (decide(&ObservedSessionFacts::default()), "\x1b[36m"),
+            {
+                let mut facts = footer_facts();
+                facts.max_context_fill_percent = Some(72.0);
+                (decide(&facts), "\x1b[33m")
+            },
+            {
+                let mut facts = footer_facts();
+                facts.failed_responses = 1;
+                (decide(&facts), "\x1b[31m")
+            },
+            (
+                decide(&ObservedSessionFacts {
+                    policy_block: Some(PolicyBlockFacts {
+                        reason: "token budget exceeded".to_string(),
+                        recovery_action: "restart narrower".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "\x1b[1;31m",
+            ),
+            (
+                decide(&ObservedSessionFacts {
+                    cooldown: Some(CooldownFacts {
+                        reason: "upstream errors".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                "\x1b[33m",
+            ),
+            {
+                let mut facts = footer_facts();
+                facts.ended = true;
+                (decide(&facts), "\x1b[2;90m")
+            },
+        ];
+
+        for (decision, expected_prefix) in states {
+            let always = render_decision_footer(&decision, 120, ColorMode::Always, false, false);
+            assert!(
+                always.starts_with(expected_prefix),
+                "wrong color for {:?}: {always:?}",
+                decision.state
+            );
+            assert!(always.ends_with("\x1b[0m"));
+
+            assert_no_ansi(&render_decision_footer(
+                &decision,
+                120,
+                ColorMode::Never,
+                true,
+                false,
+            ));
+            assert_no_ansi(&render_decision_footer(
+                &decision,
+                120,
+                ColorMode::Auto,
+                true,
+                true,
+            ));
+            assert_no_ansi(&render_decision_footer(
+                &decision,
+                120,
+                ColorMode::Auto,
+                false,
+                false,
+            ));
+            assert!(
+                render_decision_footer(&decision, 120, ColorMode::Auto, true, false)
+                    .starts_with(expected_prefix)
+            );
+        }
+    }
+
+    #[test]
+    fn footer_degrades_by_width_without_losing_state_or_reason() {
+        let mut facts = footer_facts();
+        facts.max_context_fill_percent = Some(72.0);
+        let decision = decide(&facts);
+
+        for width in [120, 100, 80, 60, 44, 24] {
+            let rendered = render_decision_footer(&decision, width, ColorMode::Always, true, false);
+            let plain = ansi_free(&rendered);
+            assert!(
+                plain.len() <= width,
+                "width {width} produced {} chars: {plain}",
+                plain.len()
+            );
+            assert!(plain.contains("Careful"), "width {width}: {plain}");
+            assert!(plain.contains("context"), "width {width}: {plain}");
+            assert!(!plain.contains('\n'));
+        }
+    }
+
+    #[test]
+    fn footer_degrades_standard_reasons_without_obscuring_them() {
+        let cases = [
+            (
+                "Watching",
+                decide(&ObservedSessionFacts::default()),
+                ["waiting for request", "waiting"],
+            ),
+            {
+                let mut facts = footer_facts();
+                facts.failed_responses = 1;
+                (
+                    "Stop",
+                    decide(&facts),
+                    ["response failed", "response failed"],
+                )
+            },
+            (
+                "Blocked",
+                decide(&ObservedSessionFacts {
+                    policy_block: Some(PolicyBlockFacts {
+                        reason: "token budget exceeded".to_string(),
+                        recovery_action: "restart narrower".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ["budget exceeded", "budget"],
+            ),
+            (
+                "Cooldown",
+                decide(&ObservedSessionFacts {
+                    cooldown: Some(CooldownFacts {
+                        reason: "upstream errors".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ["upstream errors", "upstream"],
+            ),
+            {
+                let mut facts = footer_facts();
+                facts.local_estimate_trusted_for_budget_enforcement = Some(false);
+                (
+                    "Careful",
+                    decide(&facts),
+                    ["local estimate untrusted", "untrusted"],
+                )
+            },
+            {
+                let mut facts = footer_facts();
+                facts.ended = true;
+                ("Ended", decide(&facts), ["3 turns, 42K", "3 turns, 42K"])
+            },
+        ];
+
+        for (state, decision, expected_by_width) in cases {
+            for (width, expected) in [(44, expected_by_width[0]), (24, expected_by_width[1])] {
+                let plain = render_decision_footer_plain(&decision, width);
+                assert!(plain.len() <= width, "{state} width {width}: {plain}");
+                assert!(plain.contains(state), "{state} width {width}: {plain}");
+                assert!(
+                    plain.contains(expected),
+                    "{state} width {width} missing {expected:?}: {plain}"
+                );
+                assert!(!plain.contains("..."), "{state} width {width}: {plain}");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_includes_postmortem_command_for_risky_states_when_it_fits() {
+        let mut careful = footer_facts();
+        careful.max_context_fill_percent = Some(72.0);
+
+        let mut stop = footer_facts();
+        stop.failed_responses = 1;
+
+        let blocked = ObservedSessionFacts {
+            session_id: Some("session_footer".to_string()),
+            policy_block: Some(PolicyBlockFacts {
+                reason: "token budget exceeded".to_string(),
+                recovery_action: "restart narrower".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let cooldown = ObservedSessionFacts {
+            session_id: Some("session_footer".to_string()),
+            cooldown: Some(CooldownFacts {
+                reason: "upstream errors".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut ended = footer_facts();
+        ended.ended = true;
+
+        for decision in [
+            decide(&careful),
+            decide(&stop),
+            decide(&blocked),
+            decide(&cooldown),
+            decide(&ended),
+        ] {
+            let line = render_decision_footer_plain(&decision, 120);
+            assert!(
+                line.contains("codex-blackbox postmortem session_footer"),
+                "missing drill-down command for {:?}: {line}",
+                decision.state
+            );
+        }
+    }
+
+    #[test]
+    fn footer_json_output_is_uncolored_and_machine_readable() {
+        let mut facts = footer_facts();
+        facts.max_context_fill_percent = Some(72.0);
+        let decision = decide(&facts);
+        let json = render_decision_footer_json(&decision).expect("render decision json");
+
+        assert_no_ansi(&json);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("parse footer json");
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("careful"));
+        assert_eq!(
+            value.get("primary_reason").and_then(|v| v.as_str()),
+            Some("context 72%")
+        );
+        assert_eq!(
+            value.get("next_action").and_then(|v| v.as_str()),
+            Some("narrow next prompt")
+        );
+        assert_eq!(
+            value.get("drill_down_command").and_then(|v| v.as_str()),
+            Some("codex-blackbox postmortem session_footer")
+        );
+        assert_eq!(
+            value
+                .pointer("/correlation/session_id")
+                .and_then(|v| v.as_str()),
+            Some("session_footer")
+        );
+    }
+
+    #[test]
+    fn status_postmortem_report_maps_to_public_decision_json() {
+        let report = serde_json::json!({
+            "session_id": "session_status",
+            "partial": false,
+            "summary": {"turn_count": 3},
+            "impact": {
+                "local_total_tokens": 42000,
+                "local_estimate_trusted_for_budget_enforcement": true
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 2,
+                    "failed": 1,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 31.0},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": "codex_response_failed"}
+        });
+        let decision = decide(&status_report_to_facts(&report));
+        let rendered = render_decision_footer_json(&decision).expect("status json");
+
+        assert_no_ansi(&rendered);
+        assert!(rendered.contains("\"state\":\"stop\""));
+        assert!(rendered.contains("\"session_id\":\"session_status\""));
+        assert!(rendered.contains("codex-blackbox postmortem session_status"));
+    }
+
+    #[test]
+    fn status_report_uses_ended_at_even_when_report_is_partial() {
+        let report = serde_json::json!({
+            "session_id": "session_status",
+            "partial": true,
+            "summary": {
+                "turn_count": 1,
+                "ended_at": "2026-05-16T19:34:31Z"
+            },
+            "impact": {
+                "local_total_tokens": 18446,
+                "local_estimate_trusted_for_budget_enforcement": false
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 1,
+                    "failed": 0,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 9.2},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": "none"}
+        });
+        let decision = decide(&status_report_to_facts(&report));
+
+        assert_eq!(decision.state, DecisionState::Ended);
+        assert_eq!(decision.primary_reason, "1 turns, 18K tokens");
+    }
+
+    #[test]
+    fn guard_postmortem_report_maps_policy_block_to_shared_decision_json() {
+        let report = serde_json::json!({
+            "session_id": "session_guard",
+            "partial": false,
+            "summary": {"turn_count": 3},
+            "impact": {
+                "local_total_tokens": 125000,
+                "local_estimated_cost_dollars": 2.50,
+                "local_estimate_trusted_for_budget_enforcement": true
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 3,
+                    "failed": 0,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 31.0},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": null}
+        });
+        let decision = guard_report_to_decision(
+            &report,
+            &codex_blackbox_core::guard_policy::GuardPolicy {
+                session_token_budget: Some(120_000),
+                session_cost_budget_dollars: None,
+            },
+            Vec::new(),
+            None,
+        );
+        let rendered = render_decision_footer_json(&decision).expect("guard json");
+
+        assert_no_ansi(&rendered);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("guard decision");
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("blocked"));
+        assert_eq!(
+            value.pointer("/policy_block/rule").and_then(|v| v.as_str()),
+            Some("session_token_budget")
+        );
+        assert_eq!(
+            value
+                .pointer("/policy_block/current")
+                .and_then(|v| v.as_str()),
+            Some("125000 tokens")
+        );
+        assert_eq!(
+            value
+                .pointer("/policy_block/session_id")
+                .and_then(|v| v.as_str()),
+            Some("session_guard")
+        );
+    }
+
+    #[test]
+    fn guard_policy_load_failure_maps_to_advisory_decision() {
+        let report = serde_json::json!({
+            "session_id": "session_guard",
+            "partial": false,
+            "summary": {"turn_count": 1},
+            "impact": {
+                "local_total_tokens": 1000,
+                "local_estimated_cost_dollars": 0.01,
+                "local_estimate_trusted_for_budget_enforcement": true
+            },
+            "signals": {"response_statuses": {"completed": 1}},
+            "diagnosis": {}
+        });
+        let decision = guard_report_to_decision(
+            &report,
+            &codex_blackbox_core::guard_policy::GuardPolicy::default(),
+            vec![codex_blackbox_core::guard_policy::GuardPolicyIssue {
+                issue_type: "policy_load_failed".to_string(),
+                message: "failed to load guard policy /tmp/policy.toml".to_string(),
+                recovery_action: "fix policy or continue unguarded".to_string(),
+            }],
+            None,
+        );
+
+        assert_eq!(decision.state, DecisionState::Careful);
+        assert_eq!(decision.primary_reason, "guard policy issue");
+        assert!(decision.policy_block.is_none());
+        assert!(decision
+            .secondary_reasons
+            .iter()
+            .any(|reason| reason.contains("policy_load_failed")));
+    }
+
+    #[test]
+    fn guard_state_cooldown_maps_to_shared_decision() {
+        let report = serde_json::json!({
+            "session_id": "session_guard",
+            "partial": false,
+            "summary": {"turn_count": 1},
+            "impact": {
+                "local_total_tokens": 1000,
+                "local_estimated_cost_dollars": 0.01,
+                "local_estimate_trusted_for_budget_enforcement": true
+            },
+            "signals": {"response_statuses": {"completed": 1}},
+            "diagnosis": {}
+        });
+        let guard_state = serde_json::json!({
+            "cooldown": {
+                "reason": "upstream errors",
+                "retry_after_seconds": 30
+            }
+        });
+
+        let decision = guard_report_to_decision(
+            &report,
+            &codex_blackbox_core::guard_policy::GuardPolicy::default(),
+            Vec::new(),
+            Some(&guard_state),
+        );
+
+        assert_eq!(decision.state, DecisionState::Cooldown);
+        assert_eq!(decision.primary_reason, "upstream errors");
+        assert_eq!(decision.next_action, "wait before retry");
+    }
+
+    #[test]
+    fn decision_tracker_waits_for_turn_evidence_after_session_start() {
+        let mut tracker = super::DecisionSessionTracker::default();
+        let decision = tracker
+            .update(&WatchEvent::SessionStart {
+                session_id: "session_tracking".to_string(),
+                display_name: "api".to_string(),
+                model: "gpt-5.5".to_string(),
+                initial_prompt: None,
+            })
+            .expect("session start yields decision");
+
+        assert_eq!(decision.state, DecisionState::Watching);
+        assert_eq!(
+            decision.primary_reason,
+            "waiting for first observed Codex Responses turn"
+        );
+
+        let decision = tracker
+            .update(&WatchEvent::CodexTurnSummary {
+                session_id: "session_tracking".to_string(),
+                status: "completed".to_string(),
+                requested_model: "gpt-5.5".to_string(),
+                served_model: Some("gpt-5.5".to_string()),
+                input_tokens: 1000,
+                cached_input_tokens: 500,
+                uncached_input_tokens: 500,
+                output_tokens: 100,
+                reasoning_output_tokens: 20,
+                total_tokens: 1100,
+            })
+            .expect("turn summary yields decision");
+
+        assert_eq!(decision.state, DecisionState::Healthy);
+    }
+
+    #[test]
+    fn decision_tracker_renders_global_cooldown_event() {
+        let mut tracker = super::DecisionSessionTracker::default();
+        let decision = tracker
+            .update(&WatchEvent::Cooldown {
+                reason: "upstream errors".to_string(),
+                retry_after_seconds: Some(30),
+            })
+            .expect("cooldown decision");
+
+        assert_eq!(decision.state, DecisionState::Cooldown);
+        assert_eq!(decision.primary_reason, "upstream errors");
+        assert_eq!(
+            decision.drill_down_command.as_deref(),
+            Some("codex-blackbox postmortem last")
+        );
+    }
+
+    #[test]
+    fn watch_runtime_suppresses_duplicate_ended_footer_decisions() {
+        let mut state = WatchRuntimeState::new();
+        let end = WatchEvent::SessionEnd {
+            session_id: "session_done".to_string(),
+            outcome: "Likely Completed".to_string(),
+            total_tokens: 1100,
+            total_turns: 1,
+        };
+        let ready = WatchEvent::PostmortemReady {
+            session_id: "session_done".to_string(),
+            total_turns: 1,
+            total_tokens: 1100,
+            reason: "session idle enough to review".to_string(),
+            postmortem_command: "codex-blackbox postmortem session_done".to_string(),
+        };
+
+        let first = state.decisions.update(&end).expect("ended decision");
+        assert!(state.remember_decision_if_changed(&end, &first));
+
+        let second = state.decisions.update(&ready).expect("ready decision");
+        assert_eq!(first, second);
+        assert!(!state.remember_decision_if_changed(&ready, &second));
     }
 
     #[test]
@@ -4269,6 +6232,15 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
     }
 
     #[test]
+    fn observation_gate_fails_successful_codex_run_without_new_codex_responses_request() {
+        let err = enforce_codex_observation_delta(false).expect_err("missing observation fails");
+
+        assert!(err.contains("Codex exited successfully"));
+        assert!(err.contains("provider=\"codex_responses\""));
+        assert!(enforce_codex_observation_delta(true).is_ok());
+    }
+
+    #[test]
     fn codex_rollout_recording_warning_is_suppressed_narrowly() {
         assert!(should_suppress_codex_stderr_line(
             "2026-04-30T16:36:44Z ERROR codex_core::session: failed to record rollout items: thread missing"
@@ -4293,6 +6265,9 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
         let Commands::Watch {
             url,
             no_signals,
+            postmortem,
+            no_redact,
+            color,
             session,
             tmux,
             tmux_max_panes,
@@ -4302,9 +6277,48 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
         };
         assert_eq!(url, "http://localhost:9091");
         assert!(!no_signals);
+        assert!(!postmortem);
+        assert!(!no_redact);
+        assert_eq!(color, ColorMode::Auto);
         assert_eq!(session, None);
         assert!(!tmux);
         assert_eq!(tmux_max_panes, 8);
+
+        let cli = Cli::try_parse_from(["codex-blackbox", "status"]).expect("status parses");
+        let Commands::Status {
+            url,
+            json,
+            color,
+            width,
+            target,
+        } = cli.command
+        else {
+            panic!("expected status command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert!(!json);
+        assert_eq!(color, ColorMode::Auto);
+        assert_eq!(width, None);
+        assert_eq!(target, "last");
+
+        let cli = Cli::try_parse_from(["codex-blackbox", "guard"]).expect("guard parses");
+        let Commands::Guard {
+            url,
+            policy,
+            json,
+            color,
+            width,
+            target,
+        } = cli.command
+        else {
+            panic!("expected guard command");
+        };
+        assert_eq!(url, "http://localhost:9091");
+        assert_eq!(policy, None);
+        assert!(!json);
+        assert_eq!(color, ColorMode::Auto);
+        assert_eq!(width, None);
+        assert_eq!(target, "last");
 
         let cli = Cli::try_parse_from(["codex-blackbox", "sessions"]).expect("sessions parses");
         let Commands::Sessions { url, limit, days } = cli.command else {
@@ -4406,10 +6420,18 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
             .to_string(),
         ];
         let (url, request_rx) = serve_sse_chunks_once(chunks);
-        let mut active = ActiveSessions::new();
         let filter = Some("session_target".to_string());
+        let options = WatchRenderOptions {
+            base_url: url.clone(),
+            no_signals: false,
+            session_filter: filter,
+            postmortem: false,
+            redact_postmortem: true,
+            color_mode: ColorMode::Never,
+        };
+        let mut state = WatchRuntimeState::new();
 
-        super::connect_and_stream(&url, false, &filter, &mut active)
+        super::connect_and_stream(&url, &options, &mut state)
             .await
             .expect("watch stream closes cleanly");
 
@@ -4427,9 +6449,135 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
             "missing SSE accept header:\n{request}"
         );
         assert!(
-            active.sessions.is_empty(),
+            state.active.sessions.is_empty(),
             "target session should be removed after session_end"
         );
+        assert!(
+            !state.decisions.facts.contains_key("session_other"),
+            "filtered-out sessions must not affect decision state"
+        );
+        assert!(
+            state.decisions.facts.contains_key("session_target"),
+            "target session should update decision state"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_stream_ignores_postmortem_ready_without_opt_in() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_ready\",",
+            "\"total_turns\":1,\"total_tokens\":1100,",
+            "\"reason\":\"session idle enough to review\",",
+            "\"postmortem_command\":\"codex-blackbox postmortem session_ready\"}\n\n"
+        )
+        .to_string()];
+        let (url, _request_rx) = serve_sse_chunks_once(chunks);
+        let options = WatchRenderOptions {
+            base_url: "http://127.0.0.1:1".to_string(),
+            no_signals: false,
+            session_filter: None,
+            postmortem: false,
+            redact_postmortem: true,
+            color_mode: ColorMode::Never,
+        };
+        let mut state = WatchRuntimeState::new();
+
+        super::connect_and_stream(&url, &options, &mut state)
+            .await
+            .expect("watch stream closes cleanly");
+
+        assert!(state.rendered_postmortems.is_empty());
+    }
+
+    #[tokio::test]
+    async fn watch_postmortem_respects_session_filter_before_fetching() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_other\",",
+            "\"total_turns\":1,\"total_tokens\":1100,",
+            "\"reason\":\"session idle enough to review\",",
+            "\"postmortem_command\":\"codex-blackbox postmortem session_other\"}\n\n"
+        )
+        .to_string()];
+        let (url, _request_rx) = serve_sse_chunks_once(chunks);
+        let options = WatchRenderOptions {
+            base_url: "http://127.0.0.1:1".to_string(),
+            no_signals: false,
+            session_filter: Some("session_target".to_string()),
+            postmortem: true,
+            redact_postmortem: true,
+            color_mode: ColorMode::Never,
+        };
+        let mut state = WatchRuntimeState::new();
+
+        super::connect_and_stream(&url, &options, &mut state)
+            .await
+            .expect("filtered postmortem event should not fetch");
+
+        assert!(state.rendered_postmortems.is_empty());
+        assert!(!state.decisions.facts.contains_key("session_other"));
+    }
+
+    #[tokio::test]
+    async fn watch_postmortem_fetches_redacted_report_once_when_opted_in() {
+        let chunks = vec![concat!(
+            "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_ready\",",
+            "\"total_turns\":1,\"total_tokens\":1100,",
+            "\"reason\":\"session idle enough to review\",",
+            "\"postmortem_command\":\"codex-blackbox postmortem session_ready\"}\n\n",
+            "data: {\"type\":\"postmortem_ready\",\"session_id\":\"session_ready\",",
+            "\"total_turns\":1,\"total_tokens\":1100,",
+            "\"reason\":\"session idle enough to review\",",
+            "\"postmortem_command\":\"codex-blackbox postmortem session_ready\"}\n\n"
+        )
+        .to_string()];
+        let (watch_url, _watch_request_rx) = serve_sse_chunks_once(chunks);
+        let (api_url, api_request_rx) = serve_json_once(
+            r#"{
+              "schema_version": 1,
+              "session_id": "session_ready",
+              "redacted": true,
+              "partial": false,
+              "summary": {"outcome": "Likely Completed", "turn_count": 1},
+              "diagnosis": {"primary_cause": "none"},
+              "impact": {
+                "input_tokens": 1000,
+                "cached_input_tokens": 500,
+                "uncached_input_tokens": 500,
+                "output_tokens": 100,
+                "reasoning_output_tokens": 20,
+                "local_total_tokens": 1100,
+                "local_estimated_cost_dollars": 0.0
+              },
+              "signals": {"response_statuses": {"completed": 1}},
+              "evidence": [],
+              "timeline": [],
+              "recommendations": [],
+              "caveats": ["Evidence is limited to local Envoy-observed Codex Responses traffic."]
+            }"#,
+        );
+        let options = WatchRenderOptions {
+            base_url: api_url,
+            no_signals: false,
+            session_filter: None,
+            postmortem: true,
+            redact_postmortem: true,
+            color_mode: ColorMode::Never,
+        };
+        let mut state = WatchRuntimeState::new();
+
+        super::connect_and_stream(&watch_url, &options, &mut state)
+            .await
+            .expect("watch stream closes cleanly");
+
+        let request = api_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured postmortem request");
+        assert!(
+            request.starts_with("GET /api/postmortem/session_ready?redact=true "),
+            "unexpected postmortem request:\n{request}"
+        );
+        assert_eq!(state.rendered_postmortems.len(), 1);
+        assert!(state.rendered_postmortems.contains("session_ready"));
     }
 
     #[test]
@@ -4456,8 +6604,25 @@ codex_blackbox_requests_total{model="legacy_model",provider="legacy_provider"} 9
             }),
             Some("session_codex")
         );
+        assert_eq!(
+            event_session_id(&WatchEvent::PostmortemReady {
+                session_id: "session_ready".to_string(),
+                total_turns: 1,
+                total_tokens: 1100,
+                reason: "session idle enough to review".to_string(),
+                postmortem_command: "codex-blackbox postmortem session_ready".to_string(),
+            }),
+            Some("session_ready")
+        );
 
         assert_eq!(event_session_id(&WatchEvent::Lagged { missed: 3 }), None);
+        assert_eq!(
+            event_session_id(&WatchEvent::Cooldown {
+                reason: "upstream errors".to_string(),
+                retry_after_seconds: Some(30),
+            }),
+            None
+        );
     }
 
     #[test]

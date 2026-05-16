@@ -15,6 +15,8 @@ overrides them.
 
 ## Implementation Map
 
+- Architecture and harness map: `ARCHITECTURE.md`, `docs/index.md`,
+  `docs/harness.md`
 - Request parsing: `codex-blackbox-core/src/codex_request.rs`
 - Response SSE accumulation: `codex-blackbox-core/src/codex_response.rs`
 - Turn accounting: `codex-blackbox-core/src/codex_accounting.rs`
@@ -26,6 +28,8 @@ overrides them.
 
 ## Worktree Rules
 
+- For multi-step work, use `docs/PLANS.md` and keep active plans in
+  `docs/exec-plans/active/`.
 - Read the code path and nearby tests before changing behavior.
 - Use `rg`/`rg --files` for searches.
 - Check `git status --short` before and after meaningful edits.

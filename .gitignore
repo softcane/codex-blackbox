@@ -32,7 +32,11 @@ docker-compose.override.yml
 internal_docs/
 doc_internal/
 docs/internal/
+docs/
 wiki/*
 CLAUDE.md
 .claude/
 .omx/
+
+# Temporary OpenAI harness work
+test/harness-*.sh

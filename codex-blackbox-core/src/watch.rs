@@ -46,6 +46,15 @@ pub enum WatchEvent {
         session_id: String,
         report: DiagnosisReport,
     },
+    /// The session has been idle long enough that the persisted Codex
+    /// Responses evidence is ready for deterministic local postmortem review.
+    PostmortemReady {
+        session_id: String,
+        total_turns: u32,
+        total_tokens: u64,
+        reason: String,
+        postmortem_command: String,
+    },
     /// The served model differed from the user-requested model.
     ModelFallback {
         session_id: String,
@@ -76,6 +85,13 @@ pub enum WatchEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         context_window_tokens: Option<u64>,
         turns_to_compact: Option<u32>,
+    },
+    /// Process-wide upstream cooldown. This is observed from Envoy response
+    /// headers and applies only before a later request is sent.
+    Cooldown {
+        reason: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retry_after_seconds: Option<u64>,
     },
 }
 
@@ -301,5 +317,59 @@ mod tests {
         );
         assert!(json.get("cache_expires_at_epoch").is_none());
         assert!(json.get("estimated_rebuild_cost_dollars").is_none());
+    }
+
+    #[test]
+    fn postmortem_ready_serializes_review_command_without_unsupported_surfaces() {
+        let json = serde_json::to_value(WatchEvent::PostmortemReady {
+            session_id: "session_codex".to_string(),
+            total_turns: 3,
+            total_tokens: 42_000,
+            reason: "session idle enough to review".to_string(),
+            postmortem_command: "codex-blackbox postmortem session_codex".to_string(),
+        })
+        .expect("serialize postmortem-ready");
+
+        assert_eq!(
+            json.get("type").and_then(|v| v.as_str()),
+            Some("postmortem_ready")
+        );
+        assert_eq!(
+            json.get("postmortem_command").and_then(|v| v.as_str()),
+            Some("codex-blackbox postmortem session_codex")
+        );
+        let body = json.to_string().to_ascii_lowercase();
+        for forbidden in [
+            "tool_result",
+            "mcp_lifecycle",
+            "skill_lifecycle",
+            "cache_lifecycle",
+            "provider_quota",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "postmortem-ready event must not expose unsupported surface {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn cooldown_serializes_as_global_decision_evidence() {
+        let json = serde_json::to_value(WatchEvent::Cooldown {
+            reason: "upstream errors".to_string(),
+            retry_after_seconds: Some(30),
+        })
+        .expect("serialize cooldown");
+
+        assert_eq!(json.get("type").and_then(|v| v.as_str()), Some("cooldown"));
+        assert_eq!(
+            json.get("reason").and_then(|v| v.as_str()),
+            Some("upstream errors")
+        );
+        assert_eq!(
+            json.get("retry_after_seconds").and_then(|v| v.as_u64()),
+            Some(30)
+        );
+        assert!(json.get("session_id").is_none());
     }
 }

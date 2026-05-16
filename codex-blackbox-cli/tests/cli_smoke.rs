@@ -1,5 +1,5 @@
-// UNPORTED/DEFERRED: copied baseline from Phase 0A for workspace shape only.
-// This still validates legacy-provider behavior and is not Codex Blackbox validation.
+// CLI smoke tests for Codex Blackbox command surfaces.
+// Tests use fake/local HTTP fixtures unless explicitly stated otherwise.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -126,6 +126,7 @@ fn top_level_help_exposes_user_workflows() {
     assert!(out.contains("run"));
     assert!(out.contains("watch"));
     assert!(out.contains("sessions"));
+    assert!(out.contains("status"));
     assert!(out.contains("recall"));
     assert!(out.contains("postmortem"));
     assert!(out.contains("reconcile"));
@@ -278,6 +279,188 @@ fn watch_rejects_session_filter_with_tmux_mode() {
         err.contains("cannot be used with"),
         "expected clap conflict error, got:\n{err}"
     );
+}
+
+#[test]
+fn watch_help_documents_postmortem_and_color_options() {
+    let output = codex_blackbox(&["watch", "--help"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("--postmortem"));
+    assert!(out.contains("--no-redact"));
+    assert!(out.contains("--color"));
+}
+
+#[test]
+fn status_help_documents_json_color_and_width_options() {
+    let output = codex_blackbox(&["status", "--help"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("--json"));
+    assert!(out.contains("--color"));
+    assert!(out.contains("--width"));
+}
+
+#[test]
+fn guard_help_documents_policy_json_color_and_width_options() {
+    let output = codex_blackbox(&["guard", "--help"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("--policy"));
+    assert!(out.contains("--json"));
+    assert!(out.contains("--color"));
+    assert!(out.contains("--width"));
+}
+
+#[test]
+fn status_command_renders_uncolored_decision_json_from_postmortem_api() {
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "schema_version": 1,
+          "report_type": "codex_responses_postmortem",
+          "session_id": "session_status",
+          "redacted": true,
+          "partial": false,
+          "summary": {"outcome": "Likely Completed", "turn_count": 2},
+          "diagnosis": {"primary_cause": "none", "primary_cause_type": "none"},
+          "impact": {
+            "local_total_tokens": 1234,
+            "local_estimate_trusted_for_budget_enforcement": true
+          },
+          "signals": {
+            "response_statuses": {"completed": 2, "failed": 0, "incomplete": 0, "unknown": 0},
+            "context_fill": {"max_percent": 31.0},
+            "model_mismatches": [],
+            "accounting_anomaly_count": 0
+          }
+        }"#,
+    );
+
+    let output = codex_blackbox(&["status", "--url", &url, "--json"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/postmortem/last?redact=true "),
+        "unexpected request:\n{request}"
+    );
+    let out = stdout(&output);
+    assert!(!out.contains("\x1b["));
+    let value: serde_json::Value = serde_json::from_str(&out).expect("status json");
+    assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("ended"));
+    assert_eq!(
+        value
+            .pointer("/correlation/session_id")
+            .and_then(|v| v.as_str()),
+        Some("session_status")
+    );
+}
+
+#[test]
+fn guard_command_renders_policy_block_json_from_postmortem_api() {
+    let dir = unique_test_dir("guard-policy");
+    let policy_path = dir.join("policy.toml");
+    fs::write(&policy_path, "session_token_budget = 120000\n").expect("write policy");
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "schema_version": 1,
+          "report_type": "codex_responses_postmortem",
+          "session_id": "session_guard",
+          "redacted": true,
+          "partial": false,
+          "summary": {"outcome": "Likely Completed", "turn_count": 2},
+          "diagnosis": {"primary_cause": "none", "primary_cause_type": "none"},
+          "impact": {
+            "local_total_tokens": 125000,
+            "local_estimated_cost_dollars": 1.00,
+            "local_estimate_trusted_for_budget_enforcement": true
+          },
+          "signals": {
+            "response_statuses": {"completed": 2, "failed": 0, "incomplete": 0, "unknown": 0},
+            "context_fill": {"max_percent": 31.0},
+            "model_mismatches": [],
+            "accounting_anomaly_count": 0
+          }
+        }"#,
+    );
+
+    let output = codex_blackbox(&[
+        "guard",
+        "--url",
+        &url,
+        "--policy",
+        policy_path.to_str().expect("policy path"),
+        "--json",
+    ]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/postmortem/last?redact=true "),
+        "unexpected request:\n{request}"
+    );
+    let out = stdout(&output);
+    assert!(!out.contains("\x1b["));
+    let value: serde_json::Value = serde_json::from_str(&out).expect("guard json");
+    assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("blocked"));
+    assert_eq!(
+        value.pointer("/policy_block/rule").and_then(|v| v.as_str()),
+        Some("session_token_budget")
+    );
+    assert_eq!(
+        value
+            .pointer("/policy_block/session_id")
+            .and_then(|v| v.as_str()),
+        Some("session_guard")
+    );
+}
+
+#[test]
+fn status_command_renders_width_limited_footer_without_ansi_when_color_never() {
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "schema_version": 1,
+          "report_type": "codex_responses_postmortem",
+          "session_id": "session_status",
+          "redacted": true,
+          "partial": true,
+          "summary": {"outcome": "Active", "turn_count": 0},
+          "diagnosis": {"primary_cause": "none", "primary_cause_type": "none"},
+          "impact": {"local_total_tokens": 0},
+          "signals": {
+            "response_statuses": {"completed": 0, "failed": 0, "incomplete": 0, "unknown": 0},
+            "context_fill": {"max_percent": 0.0},
+            "model_mismatches": [],
+            "accounting_anomaly_count": 0
+          }
+        }"#,
+    );
+
+    let output = codex_blackbox(&[
+        "status",
+        "--url",
+        &url,
+        "--color",
+        "never",
+        "--width",
+        "24",
+        "session_status",
+    ]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/postmortem/session_status?redact=true "),
+        "unexpected request:\n{request}"
+    );
+    let out = stdout(&output);
+    assert!(!out.contains("\x1b["));
+    assert!(out.trim().len() <= 24, "{out:?}");
+    assert!(out.contains("Watching"), "{out:?}");
+    assert!(out.contains("waiting"), "{out:?}");
 }
 
 #[test]
@@ -459,14 +642,15 @@ fn postmortem_command_renders_redacted_markdown_from_api() {
         "unexpected request:\n{request}"
     );
     let out = stdout(&output);
-    assert!(out.contains("# Codex Responses Postmortem"));
-    assert!(out.contains("## Snapshot"));
-    assert!(out.contains("## Signals"));
-    assert!(out.contains("## Evidence"));
-    assert!(out.contains("## Timeline"));
-    assert!(out.contains("## Recommendations"));
-    assert!(out.contains("## Caveats"));
-    assert!(out.contains("## Restart Prompt"));
+    assert!(out.contains("\u{250c}\u{2500}[ Codex Responses Postmortem ]"));
+    assert!(out.contains("[ Snapshot ]"));
+    assert!(out.contains("[ Signals ]"));
+    assert!(out.contains("[ Evidence ]"));
+    assert!(out.contains("[ Timeline ]"));
+    assert!(out.contains("[ Recommendations ]"));
+    assert!(out.contains("[ Caveats ]"));
+    assert!(out.contains("[ Restart Prompt ]"));
+    assert!(!out.contains("# Codex Responses Postmortem"));
     assert!(out.contains("[redacted prompt excerpt]"));
     assert!(out.contains("Local Estimate Source"));
     assert!(out.contains("codex_unpriced:unknown_model:gpt-5.5"));

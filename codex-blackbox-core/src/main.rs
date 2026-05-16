@@ -53,7 +53,9 @@ pub mod envoy {
 pub mod codex_accounting;
 pub mod codex_request;
 pub mod codex_response;
+pub mod decision;
 pub mod diagnosis;
+pub mod guard_policy;
 pub mod metrics;
 pub mod postmortem;
 pub mod pricing;
@@ -219,76 +221,149 @@ struct SessionBudgetState {
     total_spend: f64,
     total_tokens: u64,
     request_count: u64,
-    estimated_cache_waste_dollars: f64,
 }
 
 static RUNTIME_STATE: LazyLock<Mutex<RuntimeState>> =
     LazyLock::new(|| Mutex::new(RuntimeState::new()));
 static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock::new(DashMap::new);
+static POSTMORTEM_READY_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Check if request should be blocked by the process-wide circuit breaker.
-fn check_circuit_breaker() -> Option<(&'static str, String)> {
+#[derive(Clone, Debug)]
+struct GuardBlockResponse {
+    error_type: &'static str,
+    message: String,
+    policy_block: Option<decision::PolicyBlockFacts>,
+    cooldown: Option<decision::CooldownFacts>,
+}
+
+/// Check if the next request should be blocked by the process-wide cooldown.
+fn check_circuit_breaker() -> Option<GuardBlockResponse> {
     let runtime = RUNTIME_STATE.lock().unwrap();
 
-    // Circuit breaker check.
     if let Some(until) = runtime.circuit_open_until {
         if Instant::now() < until {
             let remaining = until.duration_since(Instant::now()).as_secs();
-            return Some((
-                "circuit_breaker",
-                format!(
-                    "Codex Blackbox: circuit breaker open. {} consecutive errors detected. \
-                 Pausing requests for {}s to prevent runaway estimated cost.",
-                    runtime.consecutive_errors, remaining
-                ),
-            ));
+            let evaluation = guard_policy::evaluate_guard_policy(
+                &guard_policy::GuardPolicy::default(),
+                &guard_policy::GuardEvidence {
+                    applies_to_next_request: true,
+                    cooldown: Some(guard_policy::GuardCooldownEvidence {
+                        reason: "upstream errors".to_string(),
+                        retry_after_seconds: Some(remaining),
+                    }),
+                    ..Default::default()
+                },
+            );
+            if let Some(cooldown) = evaluation.cooldown {
+                return Some(GuardBlockResponse {
+                    error_type: "api_cooldown",
+                    message: format!(
+                        "Codex Blackbox: API cooldown active after {} consecutive errors. \
+                         Wait {}s before retrying. This applies only before the next request is sent; \
+                         it cannot interrupt an already-streaming model response.",
+                        runtime.consecutive_errors, remaining
+                    ),
+                    policy_block: None,
+                    cooldown: Some(cooldown),
+                });
+            }
         }
     }
 
     None
 }
 
-/// Check if the current session has exceeded its configured budget.
-fn check_session_budget(session_id: Option<&str>) -> Option<(&'static str, String)> {
-    let session_id = session_id?;
-    let state = SESSION_BUDGETS.get(session_id)?;
-
-    // Estimated-dollar budget check. These dollars are only enforced when the
-    // active price catalog is explicitly marked trusted for enforcement.
-    let budget = env_f64("CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS", 0.0);
-    if budget > 0.0 && state.total_spend >= budget && pricing::trusted_for_budget_enforcement() {
-        return Some(("budget_exceeded", format!(
-            "Codex Blackbox: estimated session budget exceeded (${:.2}). Estimated spend: ${:.2} across {} requests. \
-             Estimated cache rebuild waste: ${:.2}. Reset with CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS=0 or restart session.",
-            budget,
-            state.total_spend,
-            state.request_count,
-            state.estimated_cache_waste_dollars
-        )));
+fn current_cooldown_facts() -> Option<decision::CooldownFacts> {
+    let runtime = RUNTIME_STATE.lock().ok()?;
+    let until = runtime.circuit_open_until?;
+    let now = Instant::now();
+    if now >= until {
+        return None;
     }
-
-    // Token budget check.
-    let token_budget = env_u64("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS", 0);
-    if token_budget > 0 && state.total_tokens >= token_budget {
-        return Some((
-            "budget_exceeded",
-            format!(
-                "Codex Blackbox: token budget exceeded ({}). Used: {} tokens across {} requests. \
-             Reset with CODEX_BLACKBOX_SESSION_BUDGET_TOKENS=0 or restart session.",
-                token_budget, state.total_tokens, state.request_count
-            ),
-        ));
-    }
-
-    None
+    Some(decision::CooldownFacts {
+        reason: "upstream errors".to_string(),
+        retry_after_seconds: Some(until.duration_since(now).as_secs()),
+    })
 }
 
-fn make_block_response(error_type: &str, message: &str) -> ProcessingResponse {
+fn cooldown_watch_event(cooldown: &decision::CooldownFacts) -> watch::WatchEvent {
+    watch::WatchEvent::Cooldown {
+        reason: cooldown.reason.clone(),
+        retry_after_seconds: cooldown.retry_after_seconds,
+    }
+}
+
+fn load_process_guard_policy() -> guard_policy::GuardPolicyLoad {
+    guard_policy::load_guard_policy_from_env(|key| std::env::var(key).ok())
+}
+
+fn warn_guard_policy_issues(issues: &[guard_policy::GuardPolicyIssue]) {
+    for issue in issues {
+        warn!(
+            issue_type = %issue.issue_type,
+            recovery_action = %issue.recovery_action,
+            message = %issue.message,
+            "guard policy issue; failing open for local policy"
+        );
+    }
+}
+
+/// Check if the current session has exceeded an explicit local policy before
+/// allowing the next request.
+fn check_session_budget(session_id: Option<&str>) -> Option<GuardBlockResponse> {
+    let session_id = session_id?;
+    let state = SESSION_BUDGETS.get(session_id)?;
+    let loaded = load_process_guard_policy();
+    let mut evaluation = guard_policy::evaluate_guard_policy(
+        &loaded.policy,
+        &guard_policy::GuardEvidence {
+            session_id: Some(session_id.to_string()),
+            observed_codex_responses: state.request_count > 0,
+            applies_to_next_request: true,
+            session_total_tokens: Some(state.total_tokens),
+            session_estimated_cost_dollars: Some(state.total_spend),
+            local_estimate_trusted_for_budget_enforcement: pricing::trusted_for_budget_enforcement(
+            ),
+            cooldown: None,
+        },
+    );
+    evaluation.policy_issues.extend(loaded.issues);
+    warn_guard_policy_issues(&evaluation.policy_issues);
+
+    evaluation.block.map(|block| {
+        let message = policy_block_message(&block);
+        GuardBlockResponse {
+            error_type: "policy_block",
+            message,
+            policy_block: Some(block),
+            cooldown: None,
+        }
+    })
+}
+
+fn policy_block_message(block: &decision::PolicyBlockFacts) -> String {
+    let current = block.current.as_deref().unwrap_or("unknown");
+    let limit = block.limit.as_deref().unwrap_or("unknown");
+    let session = block.session_id.as_deref().unwrap_or("unknown");
+    format!(
+        "Codex Blackbox: {}. Rule: {}. Current: {}. Limit: {}. Session: {}. \
+         Recovery: {}. This applies only before the next request is sent; \
+         it cannot interrupt an already-streaming model response.",
+        block.reason, block.rule, current, limit, session, block.recovery_action
+    )
+}
+
+fn make_block_response(block: &GuardBlockResponse) -> ProcessingResponse {
     let body = serde_json::json!({
         "type": "error",
         "error": {
-            "type": error_type,
-            "message": message
+            "type": block.error_type,
+            "message": block.message,
+            "policy_block": block.policy_block,
+            "cooldown": block.cooldown,
+            "scope": "next_request_only",
+            "stream_interruption": false
         }
     })
     .to_string();
@@ -1139,17 +1214,18 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                      degradation_turn, causes_json, advice_json) \
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                     rusqlite::params![
-                        session_id,
-                        completed_at,
-                        outcome,
+                        &session_id,
+                        &completed_at,
+                        &outcome,
                         total_turns,
                         total_cost,
                         degraded as i32,
                         degradation_turn,
-                        causes_json,
-                        advice_json,
+                        &causes_json,
+                        &advice_json,
                     ],
                 );
+                maybe_broadcast_postmortem_ready(&conn, &session_id);
             }
             DbCommand::WriteRecall {
                 session_id,
@@ -1434,6 +1510,76 @@ fn session_has_codex_evidence(conn: &Connection, session_id: &str) -> rusqlite::
         |row| row.get::<_, i64>(0),
     )
     .map(|value| value != 0)
+}
+
+fn postmortem_command_for_session(session_id: &str) -> String {
+    if session_id.trim().is_empty() {
+        "codex-blackbox postmortem last".to_string()
+    } else {
+        format!("codex-blackbox postmortem {session_id}")
+    }
+}
+
+fn postmortem_ready_already_sent_or_remember(session_id: &str) -> bool {
+    let mut seen = POSTMORTEM_READY_SESSIONS.lock().unwrap();
+    if seen.contains(session_id) {
+        return true;
+    }
+    seen.insert(session_id.to_string());
+    false
+}
+
+fn postmortem_ready_totals_from_db(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<(u32, u64)>> {
+    let (turn_count, turn_tokens): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(codex_total_tokens), 0) \
+         FROM turn_snapshots \
+         WHERE session_id = ?1 AND provider = 'codex_responses'",
+        rusqlite::params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if turn_count > 0 {
+        return Ok(Some((turn_count.max(0) as u32, turn_tokens.max(0) as u64)));
+    }
+
+    let (request_count, request_tokens): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(codex_total_tokens), 0) \
+         FROM requests \
+         WHERE session_id = ?1 AND provider = 'codex_responses'",
+        rusqlite::params![session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if request_count > 0 {
+        Ok(Some((
+            request_count.max(0) as u32,
+            request_tokens.max(0) as u64,
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
+fn maybe_broadcast_postmortem_ready(conn: &Connection, session_id: &str) {
+    let Ok(true) = session_has_codex_evidence(conn, session_id) else {
+        return;
+    };
+    let Ok(Some((total_turns, total_tokens))) = postmortem_ready_totals_from_db(conn, session_id)
+    else {
+        return;
+    };
+    if total_turns == 0 || postmortem_ready_already_sent_or_remember(session_id) {
+        return;
+    }
+
+    watch::BROADCASTER.broadcast(watch::WatchEvent::PostmortemReady {
+        session_id: session_id.to_string(),
+        total_turns,
+        total_tokens,
+        reason: "session idle enough to review".to_string(),
+        postmortem_command: postmortem_command_for_session(session_id),
+    });
 }
 
 fn compute_estimated_costs_for_sessions(
@@ -2215,6 +2361,14 @@ fn record_codex_runtime_counters(accounting: &codex_accounting::CodexTurnAccount
         .then_some(accounting.pricing.cost_dollars)
         .flatten()
         .unwrap_or(0.0);
+    let session_id = accounting.identity.session_id.trim();
+
+    if !session_id.is_empty() {
+        let mut session = SESSION_BUDGETS.entry(session_id.to_string()).or_default();
+        session.total_spend += trusted_cost;
+        session.total_tokens = session.total_tokens.saturating_add(accounting.total_tokens);
+        session.request_count = session.request_count.saturating_add(1);
+    }
 
     match RUNTIME_STATE.lock() {
         Ok(mut runtime) => {
@@ -2698,6 +2852,7 @@ struct PersistedWatchSession {
     model: Option<String>,
     display_name: Option<String>,
     initial_prompt: Option<String>,
+    ended_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2731,7 +2886,7 @@ fn load_persisted_watch_sessions(
                        AND t.provider = 'codex_responses' \
                        AND COALESCE(NULLIF(trim(t.requested_model), ''), NULLIF(trim(t.actual_model), '')) IS NOT NULL \
                      ORDER BY t.turn_number DESC LIMIT 1), \
-                    s.display_name, s.initial_prompt \
+                    s.display_name, s.initial_prompt, s.ended_at \
              FROM sessions s \
              WHERE s.session_id = ?1 \
                AND EXISTS (
@@ -2748,6 +2903,7 @@ fn load_persisted_watch_sessions(
                     model: row.get::<_, Option<String>>(1)?,
                     display_name: row.get::<_, Option<String>>(2)?,
                     initial_prompt: row.get::<_, Option<String>>(3)?,
+                    ended_at: row.get::<_, Option<String>>(4)?,
                 })
             })?
             .collect();
@@ -2761,7 +2917,7 @@ fn load_persisted_watch_sessions(
                    AND t.provider = 'codex_responses' \
                    AND COALESCE(NULLIF(trim(t.requested_model), ''), NULLIF(trim(t.actual_model), '')) IS NOT NULL \
                  ORDER BY t.turn_number DESC LIMIT 1), \
-                s.display_name, s.initial_prompt \
+                s.display_name, s.initial_prompt, s.ended_at \
          FROM sessions s \
          WHERE EXISTS (
             SELECT 1 FROM turn_snapshots t \
@@ -2777,6 +2933,7 @@ fn load_persisted_watch_sessions(
                 model: row.get::<_, Option<String>>(1)?,
                 display_name: row.get::<_, Option<String>>(2)?,
                 initial_prompt: row.get::<_, Option<String>>(3)?,
+                ended_at: row.get::<_, Option<String>>(4)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2835,6 +2992,8 @@ fn load_persisted_watch_replay_events(
 ) -> rusqlite::Result<Vec<watch::WatchEvent>> {
     let sessions = load_persisted_watch_sessions(conn, session_filter, limit)?;
     let mut events = Vec::new();
+    let postmortem_ready_cutoff =
+        epoch_to_iso8601(now_epoch_secs().saturating_sub(session_timeout_secs()));
 
     for session in sessions {
         let display_name = session.display_name.clone().unwrap_or_else(|| {
@@ -2855,7 +3014,11 @@ fn load_persisted_watch_replay_events(
             initial_prompt: session.initial_prompt.clone(),
         });
 
-        for turn in load_persisted_watch_turns(conn, &session.session_id)? {
+        let turns = load_persisted_watch_turns(conn, &session.session_id)?;
+        let total_turns = turns.len() as u32;
+        let total_tokens = turns.iter().map(|turn| turn.total_tokens).sum::<u64>();
+
+        for turn in turns {
             for tool_name in &turn.tool_calls {
                 events.push(watch::WatchEvent::ToolUse {
                     session_id: session.session_id.clone(),
@@ -2894,6 +3057,21 @@ fn load_persisted_watch_replay_events(
                 turns_to_compact: None,
             });
         }
+
+        if session
+            .ended_at
+            .as_deref()
+            .is_some_and(|ended_at| ended_at <= postmortem_ready_cutoff.as_str())
+            && total_turns > 0
+        {
+            events.push(watch::WatchEvent::PostmortemReady {
+                session_id: session.session_id.clone(),
+                total_turns,
+                total_tokens,
+                reason: "session idle enough to review".to_string(),
+                postmortem_command: postmortem_command_for_session(&session.session_id),
+            });
+        }
     }
 
     Ok(events)
@@ -2907,9 +3085,11 @@ fn watch_event_session_id(event: &watch::WatchEvent) -> Option<&str> {
         | watch::WatchEvent::FrustrationSignal { session_id, .. }
         | watch::WatchEvent::CompactionLoop { session_id, .. }
         | watch::WatchEvent::Diagnosis { session_id, .. }
+        | watch::WatchEvent::PostmortemReady { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
         | watch::WatchEvent::CodexTurnSummary { session_id, .. }
         | watch::WatchEvent::ContextStatus { session_id, .. } => Some(session_id.as_str()),
+        watch::WatchEvent::Cooldown { .. } => None,
     }
 }
 
@@ -3657,9 +3837,9 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                             .unwrap_or(STANDARD_CONTEXT_WINDOW_TOKENS);
 
                         // Phase 7: process-wide circuit breaker.
-                        if let Some((err_type, msg)) = check_circuit_breaker() {
-                            warn!(request_id = %request_id, error_type = err_type, "request blocked");
-                            let response = make_block_response(err_type, &msg);
+                        if let Some(block) = check_circuit_breaker() {
+                            warn!(request_id = %request_id, error_type = block.error_type, "request blocked");
+                            let response = make_block_response(&block);
                             if tx.send(Ok(response)).await.is_err() {
                                 break;
                             }
@@ -3716,14 +3896,14 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                         request_model_header = codex_observed_model_header.as_deref().unwrap_or(""),
                                         "ext_proc"
                                     );
-                                    if let Some((err_type, msg)) = check_session_budget(
+                                    if let Some(block) = check_session_budget(
                                         diagnosis::SESSIONS
                                             .get(&request_metadata.session_hash)
                                             .as_deref()
                                             .map(|state| state.session_id.as_str()),
                                     ) {
-                                        warn!(request_id = %request_id, error_type = err_type, "request blocked");
-                                        let response = make_block_response(err_type, &msg);
+                                        warn!(request_id = %request_id, error_type = block.error_type, "request blocked");
+                                        let response = make_block_response(&block);
                                         if tx.send(Ok(response)).await.is_err() {
                                             break;
                                         }
@@ -3796,6 +3976,7 @@ impl ExternalProcessor for CodexBlackboxProcessor {
 
                         // Phase 7: circuit breaker — only track errors from real API requests
                         // (ones where we parsed a model). Ignores envoy DPE/protocol errors.
+                        let mut cooldown_event = None;
                         match RUNTIME_STATE.lock() {
                             Ok(mut runtime) => {
                                 if status >= 400 && !model.is_empty() {
@@ -3805,8 +3986,16 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                     if runtime.consecutive_errors >= threshold
                                         && runtime.circuit_open_until.is_none()
                                     {
-                                        runtime.circuit_open_until =
-                                            Some(Instant::now() + Duration::from_secs(30));
+                                        let retry_after_seconds = 30;
+                                        runtime.circuit_open_until = Some(
+                                            Instant::now()
+                                                + Duration::from_secs(retry_after_seconds),
+                                        );
+                                        cooldown_event =
+                                            Some(cooldown_watch_event(&decision::CooldownFacts {
+                                                reason: "upstream errors".to_string(),
+                                                retry_after_seconds: Some(retry_after_seconds),
+                                            }));
                                         warn!(
                                             consecutive_errors = runtime.consecutive_errors,
                                             http_status = status,
@@ -3829,6 +4018,9 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                     "failed to update circuit breaker after response headers"
                                 );
                             }
+                        }
+                        if let Some(event) = cooldown_event {
+                            watch::BROADCASTER.broadcast(event);
                         }
                     }
                     Some(ExtProcRequest::ResponseBody(ref b)) => {
@@ -3932,6 +4124,18 @@ async fn handle_summary() -> impl IntoResponse {
         StatusCode::OK,
         [("content-type", "application/json")],
         serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    )
+}
+
+async fn handle_guard_state() -> impl IntoResponse {
+    let state = serde_json::json!({
+        "cooldown": current_cooldown_facts(),
+    });
+
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string_pretty(&state).unwrap_or_default(),
     )
 }
 
@@ -4050,9 +4254,11 @@ fn event_matches_session(ev: &watch::WatchEvent, filter: Option<&str>) -> bool {
         | watch::WatchEvent::FrustrationSignal { session_id, .. }
         | watch::WatchEvent::CompactionLoop { session_id, .. }
         | watch::WatchEvent::Diagnosis { session_id, .. }
+        | watch::WatchEvent::PostmortemReady { session_id, .. }
         | watch::WatchEvent::ModelFallback { session_id, .. }
         | watch::WatchEvent::CodexTurnSummary { session_id, .. }
         | watch::WatchEvent::ContextStatus { session_id, .. } => session_id == want,
+        watch::WatchEvent::Cooldown { .. } => true,
     }
 }
 
@@ -5080,6 +5286,7 @@ async fn http_server() {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/api/summary", get(handle_summary))
+        .route("/api/guard-state", get(handle_guard_state))
         .route("/api/recall", get(handle_recall))
         .route(
             "/api/billing-reconciliations",
@@ -5104,7 +5311,7 @@ async fn http_server() {
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| addr.clone());
-    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/summary, /api/recall, /api/billing-reconciliations, /api/sessions, /api/degradation, /api/postmortem/last, /api/postmortem/:session_id, /watch)");
+    info!("HTTP server listening on {bound_addr} (/health, /metrics, /api/summary, /api/guard-state, /api/recall, /api/billing-reconciliations, /api/sessions, /api/degradation, /api/postmortem/last, /api/postmortem/:session_id, /watch)");
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
@@ -5275,6 +5482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::{decision, ExtProcResponse};
+
     use std::fs;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
@@ -5295,22 +5504,84 @@ mod tests {
         extract_headers, filter_codex_envoy_diagnosis_payload, infer_context_window_tokens,
         load_degradation_view_from_db, load_persisted_watch_replay_events,
         load_recent_codex_session_rows, load_turn_snapshots_from_db,
-        looks_like_machine_recall_line, metrics, normalize_search_text, now_epoch_secs,
-        parse_request_body_metadata, persist_billing_reconciliation,
-        persist_session_diagnosis_report, persisted_session_display_name, postmortem, pricing,
+        looks_like_machine_recall_line, make_block_response, maybe_broadcast_postmortem_ready,
+        metrics, normalize_search_text, now_epoch_secs, parse_request_body_metadata,
+        persist_billing_reconciliation, persist_session_diagnosis_report,
+        persisted_session_display_name, policy_block_message, postmortem, pricing,
         query_historical_metrics, query_summary, record_codex_turn_command,
         repair_persisted_session_artifacts, repair_session_diagnosis_envoy_causes,
         repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
         score_recall_doc, seed_live_metric_labels_from_db, session_has_codex_evidence,
         session_timeout_secs, should_skip_chatgpt_auxiliary_request_body, table_columns,
         tokenize_search_text, BillingReconciliationInput, BillingReconciliationWriteError,
-        CodexCachedInputSummary, CostAccumulator, DbCommand, HttpHeaders, ProtoHeaderValue,
-        RequestMetadataSource, SelectedFinalizationOutcome, SelectedResponseAccumulator,
-        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        CodexCachedInputSummary, CostAccumulator, DbCommand, GuardBlockResponse, HttpHeaders,
+        ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
+        SelectedResponseAccumulator, SummaryWindowData, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
+    #[test]
+    fn guard_block_response_includes_structured_facts_and_next_request_scope() {
+        let block = decision::PolicyBlockFacts {
+            rule: "session_token_budget".to_string(),
+            reason: "token budget exceeded".to_string(),
+            current: Some("125000 tokens".to_string()),
+            limit: Some("120000 tokens".to_string()),
+            session_id: Some("session_guard".to_string()),
+            recovery_action: "restart narrower".to_string(),
+        };
+        let message = policy_block_message(&block);
+        assert!(message.contains("This applies only before the next request is sent"));
+        assert!(message.contains("cannot interrupt an already-streaming model response"));
+        assert!(!message.to_ascii_lowercase().contains("cache rebuild"));
+        assert!(!message.to_ascii_lowercase().contains("cache waste"));
+
+        let response = make_block_response(&GuardBlockResponse {
+            error_type: "policy_block",
+            message,
+            policy_block: Some(block),
+            cooldown: None,
+        });
+        let body = match response.response.expect("response") {
+            ExtProcResponse::ImmediateResponse(immediate) => immediate.body,
+            other => panic!("expected immediate response, got {other:?}"),
+        };
+        let json: Value = serde_json::from_str(&body).expect("block response json");
+
+        assert_eq!(
+            json.pointer("/error/policy_block/rule")
+                .and_then(|value| value.as_str()),
+            Some("session_token_budget")
+        );
+        assert_eq!(
+            json.pointer("/error/policy_block/current")
+                .and_then(|value| value.as_str()),
+            Some("125000 tokens")
+        );
+        assert_eq!(
+            json.pointer("/error/policy_block/limit")
+                .and_then(|value| value.as_str()),
+            Some("120000 tokens")
+        );
+        assert_eq!(
+            json.pointer("/error/policy_block/session_id")
+                .and_then(|value| value.as_str()),
+            Some("session_guard")
+        );
+        assert_eq!(
+            json.pointer("/error/scope")
+                .and_then(|value| value.as_str()),
+            Some("next_request_only")
+        );
+        assert_eq!(
+            json.pointer("/error/stream_interruption")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
     static METRICS_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    static ENV_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn create_history_test_db() -> Connection {
         let conn = Connection::open_in_memory().expect("open sqlite");
@@ -5784,12 +6055,84 @@ mod tests {
             outcome.accounting.status,
             super::codex_accounting::CodexTurnStatus::Completed
         );
-        assert!(super::SESSION_BUDGETS.get("phase-4b-session-005").is_none());
+        {
+            let budget_state = super::SESSION_BUDGETS
+                .get("phase-4b-session-005")
+                .expect("session budget state");
+            assert_eq!(budget_state.total_tokens, outcome.accounting.total_tokens);
+            assert_eq!(budget_state.request_count, 1);
+        }
 
+        let _ = super::SESSION_BUDGETS.remove("phase-4b-session-005");
         let _ = diagnosis::SESSIONS.remove(&super::codex_request::fallback_session_hash(
             "",
             "phase-4b-session-005",
         ));
+    }
+
+    #[test]
+    fn session_budget_guard_blocks_next_request_from_runtime_state() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let session_id = "phase-4b-session-budget";
+        std::env::set_var("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS", "1000");
+        std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        std::env::remove_var("CODEX_BLACKBOX_GUARD_POLICY_FILE");
+        let _ = super::SESSION_BUDGETS.remove(session_id);
+
+        let request = parse_codex_fixture_request(session_id);
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4b-budget",
+            &request,
+            &response,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        super::record_codex_runtime_counters(&outcome.accounting);
+        let block = super::check_session_budget(Some(session_id)).expect("budget block");
+
+        assert_eq!(block.error_type, "policy_block");
+        let policy_block = block.policy_block.expect("policy facts");
+        assert_eq!(policy_block.rule, "session_token_budget");
+        assert_eq!(
+            policy_block.session_id.as_deref(),
+            Some("phase-4b-session-budget")
+        );
+        assert_eq!(policy_block.current.as_deref(), Some("1376 tokens"));
+        assert_eq!(policy_block.limit.as_deref(), Some("1000 tokens"));
+        assert!(block.cooldown.is_none());
+
+        let _ = super::SESSION_BUDGETS.remove(session_id);
+        std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS");
+    }
+
+    #[test]
+    fn current_guard_state_reports_active_cooldown_without_session_surface() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        {
+            let mut runtime = super::RUNTIME_STATE.lock().unwrap();
+            runtime.circuit_open_until = Some(Instant::now() + Duration::from_secs(30));
+        }
+
+        let cooldown = super::current_cooldown_facts().expect("cooldown");
+        assert_eq!(cooldown.reason, "upstream errors");
+        assert!(cooldown.retry_after_seconds.unwrap_or_default() <= 30);
+        let event = super::cooldown_watch_event(&cooldown);
+        let json = serde_json::to_value(event).expect("cooldown event");
+        assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("cooldown")
+        );
+        assert!(json.get("session_id").is_none());
+
+        {
+            let mut runtime = super::RUNTIME_STATE.lock().unwrap();
+            runtime.circuit_open_until = None;
+        }
     }
 
     #[test]
@@ -7001,6 +7344,52 @@ mod tests {
                 ..
             } if session_id == "codex-watch-db" && (fill_percent - 10.0).abs() < f64::EPSILON
         )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            super::watch::WatchEvent::PostmortemReady {
+                session_id,
+                total_turns: 1,
+                total_tokens: 1100,
+                postmortem_command,
+                ..
+            } if session_id == "codex-watch-db"
+                && postmortem_command == "codex-blackbox postmortem codex-watch-db"
+        )));
+    }
+
+    #[test]
+    fn postmortem_ready_broadcasts_once_per_eligible_codex_session() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        conn.execute_batch(SCHEMA).expect("create schema");
+        ensure_codex_persistence_columns(&conn).expect("ensure codex columns");
+        let session_id = format!("codex-postmortem-ready-{}", now_epoch_secs());
+        insert_session(
+            &conn,
+            &session_id,
+            "2026-04-30T12:00:00Z",
+            Some("2026-04-30T12:00:10Z"),
+            "gpt-codex-fixture",
+            Some("fixture prompt"),
+        );
+        insert_codex_turn_snapshot(&conn, &session_id, "completed", 1);
+
+        let (_history, mut rx) = super::watch::BROADCASTER.subscribe_with_history();
+        maybe_broadcast_postmortem_ready(&conn, &session_id);
+        maybe_broadcast_postmortem_ready(&conn, &session_id);
+
+        let mut matching = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(
+                event,
+                super::watch::WatchEvent::PostmortemReady {
+                    session_id: ref event_session,
+                    ..
+                } if event_session == &session_id
+            ) {
+                matching += 1;
+            }
+        }
+        assert_eq!(matching, 1);
     }
 
     #[test]
