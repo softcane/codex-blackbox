@@ -3548,6 +3548,20 @@ fn load_cli_guard_policy(
     }
 }
 
+fn print_stdout_line(line: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(line.as_bytes())?;
+    stdout.write_all(b"\n")
+}
+
+fn print_decision_line(line: &str) -> Result<(), Box<dyn std::error::Error>> {
+    match print_stdout_line(line) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(Box::new(err)),
+    }
+}
+
 async fn fetch_status(
     base_url: &str,
     target: &str,
@@ -3579,18 +3593,15 @@ async fn fetch_status(
     };
 
     if json_output {
-        println!("{}", render_decision_footer_json(&decision)?);
+        print_decision_line(&render_decision_footer_json(&decision)?)?;
     } else {
-        println!(
-            "{}",
-            render_decision_footer(
-                &decision,
-                width.unwrap_or_else(terminal_width),
-                color_mode,
-                stdout_is_terminal(),
-                std::env::var_os("NO_COLOR").is_some(),
-            )
-        );
+        print_decision_line(&render_decision_footer(
+            &decision,
+            width.unwrap_or_else(terminal_width),
+            color_mode,
+            stdout_is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        ))?;
     }
     Ok(())
 }
@@ -3627,18 +3638,15 @@ async fn fetch_guard(
     };
 
     if json_output {
-        println!("{}", render_decision_footer_json(&decision)?);
+        print_decision_line(&render_decision_footer_json(&decision)?)?;
     } else {
-        println!(
-            "{}",
-            render_decision_footer(
-                &decision,
-                width.unwrap_or_else(terminal_width),
-                color_mode,
-                stdout_is_terminal(),
-                std::env::var_os("NO_COLOR").is_some(),
-            )
-        );
+        print_decision_line(&render_decision_footer(
+            &decision,
+            width.unwrap_or_else(terminal_width),
+            color_mode,
+            stdout_is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        ))?;
     }
     Ok(())
 }

@@ -3111,6 +3111,18 @@ fn should_load_persisted_watch_replay(
     })
 }
 
+fn history_contains_session_start(history: &[watch::WatchEvent], session_id: &str) -> bool {
+    history.iter().any(|event| {
+        matches!(
+            event,
+            watch::WatchEvent::SessionStart {
+                session_id: event_session_id,
+                ..
+            } if event_session_id == session_id
+        )
+    })
+}
+
 fn latest_response_summary_from_db(
     conn: &Connection,
     session_id: &str,
@@ -4172,6 +4184,9 @@ async fn handle_watch(
 
     // Look up stored session info synchronously before the stream starts.
     let synthetic_start = session_filter.as_ref().and_then(|sid| {
+        if history_contains_session_start(&history, sid) {
+            return None;
+        }
         diagnosis::SESSIONS.iter().find_map(|entry| {
             let s = entry.value();
             if s.session_id == *sid {
@@ -5501,14 +5516,14 @@ mod tests {
         context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
         drop_legacy_lifecycle_tables, ensure_codex_persistence_columns, ensure_session_columns,
         ensure_session_diagnosis_columns, epoch_to_iso8601, event_matches_session, extract_header,
-        extract_headers, filter_codex_envoy_diagnosis_payload, infer_context_window_tokens,
-        load_degradation_view_from_db, load_persisted_watch_replay_events,
-        load_recent_codex_session_rows, load_turn_snapshots_from_db,
-        looks_like_machine_recall_line, make_block_response, maybe_broadcast_postmortem_ready,
-        metrics, normalize_search_text, now_epoch_secs, parse_request_body_metadata,
-        persist_billing_reconciliation, persist_session_diagnosis_report,
-        persisted_session_display_name, policy_block_message, postmortem, pricing,
-        query_historical_metrics, query_summary, record_codex_turn_command,
+        extract_headers, filter_codex_envoy_diagnosis_payload, history_contains_session_start,
+        infer_context_window_tokens, load_degradation_view_from_db,
+        load_persisted_watch_replay_events, load_recent_codex_session_rows,
+        load_turn_snapshots_from_db, looks_like_machine_recall_line, make_block_response,
+        maybe_broadcast_postmortem_ready, metrics, normalize_search_text, now_epoch_secs,
+        parse_request_body_metadata, persist_billing_reconciliation,
+        persist_session_diagnosis_report, persisted_session_display_name, policy_block_message,
+        postmortem, pricing, query_historical_metrics, query_summary, record_codex_turn_command,
         repair_persisted_session_artifacts, repair_session_diagnosis_envoy_causes,
         repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
         score_recall_doc, seed_live_metric_labels_from_db, session_has_codex_evidence,
@@ -7355,6 +7370,33 @@ mod tests {
             } if session_id == "codex-watch-db"
                 && postmortem_command == "codex-blackbox postmortem codex-watch-db"
         )));
+    }
+
+    #[test]
+    fn session_filtered_watch_detects_existing_session_start_in_recent_history() {
+        let history = vec![
+            super::watch::WatchEvent::CodexTurnSummary {
+                session_id: "codex-watch-db".to_string(),
+                status: "completed".to_string(),
+                requested_model: "gpt-5.5".to_string(),
+                served_model: Some("gpt-5.5".to_string()),
+                input_tokens: 10,
+                cached_input_tokens: 4,
+                uncached_input_tokens: 6,
+                output_tokens: 2,
+                reasoning_output_tokens: 1,
+                total_tokens: 12,
+            },
+            super::watch::WatchEvent::SessionStart {
+                session_id: "codex-watch-db".to_string(),
+                display_name: "codex-blackbox".to_string(),
+                model: "gpt-5.5".to_string(),
+                initial_prompt: Some("fixture prompt".to_string()),
+            },
+        ];
+
+        assert!(history_contains_session_start(&history, "codex-watch-db"));
+        assert!(!history_contains_session_start(&history, "other-session"));
     }
 
     #[test]

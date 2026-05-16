@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -356,6 +356,55 @@ fn status_command_renders_uncolored_decision_json_from_postmortem_api() {
             .pointer("/correlation/session_id")
             .and_then(|v| v.as_str()),
         Some("session_status")
+    );
+}
+
+#[test]
+fn status_json_handles_closed_stdout_pipe_without_panic() {
+    let (url, request_rx) = serve_json_once(
+        r#"{
+          "schema_version": 1,
+          "report_type": "codex_responses_postmortem",
+          "session_id": "session_status",
+          "redacted": true,
+          "partial": false,
+          "summary": {"outcome": "Likely Completed", "turn_count": 2},
+          "diagnosis": {"primary_cause": "none", "primary_cause_type": "none"},
+          "impact": {
+            "local_total_tokens": 1234,
+            "local_estimate_trusted_for_budget_enforcement": true
+          },
+          "signals": {
+            "response_statuses": {"completed": 2, "failed": 0, "incomplete": 0, "unknown": 0},
+            "context_fill": {"max_percent": 31.0},
+            "model_mismatches": [],
+            "accounting_anomaly_count": 0
+          }
+        }"#,
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-blackbox"))
+        .args(["status", "--url", &url, "--json"])
+        .env("NO_COLOR", "1")
+        .env_remove("ANTHROPIC_BASE_URL")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn codex-blackbox");
+
+    let stdout = child.stdout.take().expect("stdout pipe");
+    drop(stdout);
+
+    let output = child.wait_with_output().expect("wait for codex-blackbox");
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /api/postmortem/last?redact=true "),
+        "unexpected request:\n{request}"
+    );
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("panicked at"),
+        "stderr:\n{}",
+        stderr(&output)
     );
 }
 
