@@ -2679,6 +2679,48 @@ fn compact_decision_reason(reason: &str, width: usize) -> String {
         } else {
             "budget"
         }
+    } else if lower == "cost budget exceeded" {
+        if width >= 13 {
+            "cost budget"
+        } else {
+            "cost"
+        }
+    } else if lower == "context threshold exceeded" {
+        if width >= 13 {
+            "context limit"
+        } else {
+            "context"
+        }
+    } else if lower == "failed response threshold exceeded" {
+        if width >= 12 {
+            "failed limit"
+        } else {
+            "failed"
+        }
+    } else if lower == "incomplete response threshold exceeded" {
+        if width >= 16 {
+            "incomplete limit"
+        } else {
+            "incomplete"
+        }
+    } else if lower == "unknown response threshold exceeded" {
+        if width >= 13 {
+            "unknown limit"
+        } else {
+            "unknown"
+        }
+    } else if lower == "accounting anomaly threshold exceeded" {
+        if width >= 16 {
+            "accounting limit"
+        } else {
+            "accounting"
+        }
+    } else if lower == "model mismatch observed" {
+        if width >= 14 {
+            "model mismatch"
+        } else {
+            "model"
+        }
     } else if lower == "upstream errors" {
         if width >= 15 {
             "upstream errors"
@@ -5976,6 +6018,18 @@ mod tests {
                 ["budget exceeded", "budget"],
             ),
             (
+                "Blocked",
+                decide(&ObservedSessionFacts {
+                    policy_block: Some(PolicyBlockFacts {
+                        reason: "context threshold exceeded".to_string(),
+                        recovery_action: "narrow next prompt".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ["context threshold exceeded", "context limit"],
+            ),
+            (
                 "Cooldown",
                 decide(&ObservedSessionFacts {
                     cooldown: Some(CooldownFacts {
@@ -7086,8 +7140,7 @@ mod tests {
         )
         .to_string()];
         let (watch_url, _watch_request_rx) = serve_sse_chunks_once(chunks);
-        let (api_url, api_request_rx) = serve_json_once(
-            r#"{
+        let report = r#"{
               "schema_version": 1,
               "session_id": "session_ready",
               "redacted": true,
@@ -7104,12 +7157,34 @@ mod tests {
                 "local_estimated_cost_dollars": 0.0
               },
               "signals": {"response_statuses": {"completed": 1}},
+              "flight_recorder": [
+                {
+                  "turn": 1,
+                  "timestamp": "2026-04-30T12:00:01Z",
+                  "status": "completed",
+                  "requested_model": "gpt-codex-fixture",
+                  "served_model": "gpt-codex-fixture",
+                  "model_mismatch": false,
+                  "input_tokens": 1000,
+                  "cached_input_tokens": 500,
+                  "uncached_input_tokens": 500,
+                  "output_tokens": 100,
+                  "reasoning_output_tokens": 20,
+                  "local_total_tokens": 1100,
+                  "context_fill_percent": 12.5,
+                  "context_window_tokens": 8000,
+                  "duration_ms": 42
+                }
+              ],
               "evidence": [],
               "timeline": [],
               "recommendations": [],
               "caveats": ["Evidence is limited to local Envoy-observed Codex Responses traffic."]
-            }"#,
-        );
+            }"#;
+        let report_json: serde_json::Value =
+            serde_json::from_str(report).expect("watch postmortem fixture");
+        assert!(!super::postmortem_flight_recorder_terminal_lines(&report_json).is_empty());
+        let (api_url, api_request_rx) = serve_json_once(report);
         let options = WatchRenderOptions {
             base_url: api_url,
             no_signals: false,
