@@ -224,10 +224,7 @@ fn codex_diagnostic_causes(turns: &[TurnSnapshot]) -> Vec<DegradationCause> {
                 DegradationCause {
                     turn_first_noticed: turn.turn_number,
                     cause_type: "codex_response_failed".to_string(),
-                    detail: format!(
-                        "Codex Responses turn {} ended with failed status.",
-                        turn.turn_number
-                    ),
+                    detail: format!("Model turn {} ended with failed status.", turn.turn_number),
                     estimated_cost: 0.0,
                     is_heuristic: false,
                     requested_model: turn.requested_model.clone(),
@@ -240,7 +237,7 @@ fn codex_diagnostic_causes(turns: &[TurnSnapshot]) -> Vec<DegradationCause> {
                     turn_first_noticed: turn.turn_number,
                     cause_type: "codex_response_incomplete".to_string(),
                     detail: format!(
-                        "Codex Responses turn {} ended incomplete before a normal completion.",
+                        "Model turn {} stopped incomplete before a normal completion.",
                         turn.turn_number
                     ),
                     estimated_cost: 0.0,
@@ -303,7 +300,7 @@ fn codex_diagnostic_causes(turns: &[TurnSnapshot]) -> Vec<DegradationCause> {
                         turn_first_noticed: turn.turn_number,
                         cause_type: "codex_high_reasoning_share".to_string(),
                         detail: format!(
-                            "Reasoning output was ~{:.0}% of output tokens on Codex turn {}.",
+                            "Internal reasoning was ~{:.0}% of output tokens on model turn {}.",
                             reasoning_share * 100.0,
                             turn.turn_number
                         ),
@@ -357,7 +354,7 @@ fn codex_diagnostic_causes(turns: &[TurnSnapshot]) -> Vec<DegradationCause> {
                         turn_first_noticed: first_turn,
                         cause_type: "codex_low_cached_input_reuse".to_string(),
                         detail: format!(
-                            "Cached input reuse was ~{:.0}% across {} Codex turns.",
+                            "Prompt cache reuse was ~{:.0}% across {} model turns.",
                             reuse_ratio * 100.0,
                             codex_turns.len()
                         ),
@@ -854,10 +851,10 @@ fn determine_outcome(turns: &[TurnSnapshot]) -> TaskOutcome {
 fn advice_for_cause(cause: &DegradationCause) -> String {
     match cause.cause_type.as_str() {
         "codex_response_failed" => {
-            "Codex Responses returned failed. Inspect the upstream error and retry only after the cause is clear.".to_string()
+            "The model response failed. Read the error detail above and retry only after the cause is clear.".to_string()
         }
         "codex_response_incomplete" => {
-            "Codex Responses ended incomplete. Narrow the next prompt or raise the relevant output limit if configured.".to_string()
+            "The model response stopped incomplete. Use a smaller next prompt or raise the output limit if that was intentional.".to_string()
         }
         "codex_model_mismatch" => {
             let actual = cause
@@ -876,10 +873,10 @@ fn advice_for_cause(cause: &DegradationCause) -> String {
             "Codex context fill is high. Start a fresh session or target fewer files before compaction pressure rises.".to_string()
         }
         "codex_high_reasoning_share" => {
-            "Reasoning tokens dominated the Codex output. Use a narrower prompt or lower reasoning effort when appropriate.".to_string()
+            "Internal reasoning tokens dominated the output. Use a narrower prompt or lower reasoning effort when appropriate.".to_string()
         }
         "codex_low_cached_input_reuse" => {
-            "Codex cached-input reuse is low across repeated turns. Keep cache-affinity metadata stable once real traffic confirms it.".to_string()
+            "Prompt cache reuse is low across repeated turns. Keep cache-affinity metadata stable once real traffic confirms it.".to_string()
         }
         "cache_miss_ttl" => "Cache expired from idle gap > 5 min. Send a message before the TTL to keep it warm.".to_string(),
         "cache_miss_thrash" => "Cache rebuilds were observed within 5 min. Check whether session inputs changed mid-session.".to_string(),

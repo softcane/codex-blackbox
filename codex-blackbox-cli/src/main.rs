@@ -18,7 +18,7 @@ use codex_blackbox_core::guard_policy::{
     evaluate_guard_policy, load_guard_policy_from_env, load_guard_policy_from_path,
     GuardCooldownEvidence, GuardEvidence, GuardPolicy, GuardPolicyIssue,
 };
-use colored::Colorize;
+use colored::{control as color_control, Colorize};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(3);
@@ -212,7 +212,7 @@ enum Commands {
         query: Vec<String>,
     },
 
-    /// Render a deterministic Codex Responses postmortem report
+    /// Render a deterministic Codex session report
     Postmortem {
         /// Base URL of codex-blackbox-core
         #[arg(long, default_value = "http://localhost:9091")]
@@ -225,6 +225,10 @@ enum Commands {
         /// Write markdown to a file instead of stdout
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Terminal color mode
+        #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+        color: ColorMode,
 
         /// "last" or a specific session ID
         target: String,
@@ -3315,10 +3319,11 @@ async fn main() {
             url,
             no_redact,
             output,
+            color,
             target,
         } => {
             let redact = !no_redact;
-            match fetch_postmortem(&url, &target, redact, output.as_deref()).await {
+            match fetch_postmortem(&url, &target, redact, output.as_deref(), color).await {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("{}", format!("Error: {}", e).red());
@@ -3501,6 +3506,7 @@ async fn fetch_postmortem(
     target: &str,
     redact: bool,
     output: Option<&Path>,
+    color_mode: ColorMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let report = fetch_postmortem_report_json(base_url, target, redact).await?;
     if let Some(path) = output {
@@ -3508,7 +3514,7 @@ async fn fetch_postmortem(
         fs::write(path, markdown)
             .map_err(|err| format!("failed to write {}: {}", path.display(), err))?;
     } else {
-        print_postmortem_terminal_report(&report);
+        print_postmortem_terminal_report(&report, color_mode);
     }
     Ok(())
 }
@@ -3818,17 +3824,122 @@ fn parse_percent_prefix(value: &str) -> Option<f64> {
     })
 }
 
+fn humanize_postmortem_source(source: &str) -> String {
+    if let Some(model) = source.strip_prefix("codex_unpriced:unknown_model:") {
+        format!("no trusted price for {model}")
+    } else {
+        match source {
+            "builtin_model_family_pricing" => "built-in model-family pricing".to_string(),
+            "codex_unpriced" => "no trusted price for this model".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+fn humanize_postmortem_cause(value: &str) -> String {
+    match value {
+        "none" => "No problem detected".to_string(),
+        "Codex Responses failed" => "Model response failed".to_string(),
+        "Codex Responses incomplete" => "Model response stopped incomplete".to_string(),
+        "High reasoning-output share" => "High internal reasoning token share".to_string(),
+        "Low cached-input reuse" => "Low prompt cache reuse".to_string(),
+        "Observed Codex Responses signal" => "Observed model-response signal".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn humanize_postmortem_signal(signal: &str) -> String {
+    match signal {
+        "codex_response_failed" => "response failed".to_string(),
+        "codex_response_incomplete" => "response stopped incomplete".to_string(),
+        "codex_response_unknown" => "response status unknown".to_string(),
+        "codex_model_mismatch" => "model changed".to_string(),
+        "codex_accounting_anomaly" => "token accounting anomaly".to_string(),
+        "codex_high_context_fill" => "high context use".to_string(),
+        "codex_high_reasoning_share" => "high internal reasoning".to_string(),
+        "codex_low_cached_input_reuse" => "low prompt cache reuse".to_string(),
+        "codex_tool_call_intent" => "tool request".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn humanize_postmortem_event(event: &str) -> String {
+    match event {
+        "session_start" => "session started".to_string(),
+        "codex_turn" => "model turn".to_string(),
+        "tool_call_intent" => "tool request".to_string(),
+        "session_degraded" => "issue detected".to_string(),
+        "latest_observation" => "latest check".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn humanize_postmortem_detail(value: &str) -> String {
+    match value {
+        "Responses stream ended without a recognized terminal status." => {
+            "Stream ended before a final status was recognized.".to_string()
+        }
+        "First persisted Codex Responses evidence for the session." => {
+            "First model response observed for the session.".to_string()
+        }
+        "Direct degraded Codex Responses evidence was observed." => {
+            "A failed or incomplete response was observed.".to_string()
+        }
+        "Latest persisted Codex Responses observation." => {
+            "Latest model response observed.".to_string()
+        }
+        "max_output_tokens" => "hit max_output_tokens".to_string(),
+        other => other
+            .replace("Codex Responses", "model response")
+            .replace("Responses status", "response status")
+            .replace(
+                "model-side tool-call intent observed",
+                "tool request observed",
+            )
+            .replace("Provider-side detail", "Observed detail"),
+    }
+}
+
+fn humanize_postmortem_note(key: &str, value: &str) -> String {
+    match value {
+        "Evidence is limited to local Envoy-observed Codex Responses traffic." => {
+            "Only local proxy traffic was used; confirm separately before making live-support claims."
+                .to_string()
+        }
+        "Tool-call rows are model-side intent only; local execution outcome is not observed." => {
+            "Tool rows mean the model asked for a tool; they do not prove the tool ran or succeeded."
+                .to_string()
+        }
+        "Cached input is token accounting only; lifecycle timing is not inferred." => {
+            "Cached input is token accounting only; cache timing is not inferred.".to_string()
+        }
+        "Provider account-limit state and permission decisions are not observed." => {
+            "Account limits and permission decisions are not visible here.".to_string()
+        }
+        "Inspect the persisted provider-side failure detail before retrying." => {
+            "Read the failure detail above before retrying.".to_string()
+        }
+        "Continue with a narrower prompt or adjust the relevant output limit." => {
+            "Continue with a smaller prompt, or raise the output limit if that was intentional."
+                .to_string()
+        }
+        other if key == "recommendations" => humanize_postmortem_detail(other),
+        other if key == "caveats" => humanize_postmortem_detail(other),
+        other => other.to_string(),
+    }
+}
+
 fn colorize_postmortem_value(label: &str, value: &str) -> String {
     let lower = value.to_ascii_lowercase();
     match label {
         "State" => {
-            if lower.contains("final") {
+            if lower.contains("complete") {
                 value.green().bold().to_string()
             } else {
                 value.yellow().bold().to_string()
             }
         }
-        "Outcome" => {
+        "Outcome" | "Result" => {
             if lower.contains("failed") || lower.contains("error") {
                 value.red().bold().to_string()
             } else if lower.contains("completed") || lower.contains("complete") {
@@ -3839,11 +3950,20 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
                 value.to_string()
             }
         }
-        "Session" | "Prompt" | "Final Summary" => value.bright_white().to_string(),
+        "Session" | "Prompt" | "Final Answer" | "Final Summary" => value.bright_white().to_string(),
         "Requested Model" | "Served Model" | "Model" => value.cyan().to_string(),
         "Turns" => value.bright_white().to_string(),
-        "Tokens" | "Impact" => value.yellow().to_string(),
-        "Local Estimate" | "Billed" | "Cost" => value.magenta().to_string(),
+        "Tokens" | "Impact" | "Usage" => value.yellow().to_string(),
+        "Local Estimate" | "Estimated Cost" | "Billed" | "Billed Cost" | "Cost" => {
+            value.magenta().to_string()
+        }
+        "Pricing" => {
+            if lower.contains("no trusted") {
+                value.yellow().bold().to_string()
+            } else {
+                value.magenta().to_string()
+            }
+        }
         "Redaction" => {
             if lower.contains("unredacted") {
                 value.yellow().bold().to_string()
@@ -3851,21 +3971,21 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
                 value.green().to_string()
             }
         }
-        "Local Estimate Trust" => {
-            if lower.contains("untrusted") {
+        "Local Estimate Trust" | "Cost Confidence" => {
+            if lower.contains("untrusted") || lower.contains("advisory") {
                 value.red().bold().to_string()
             } else {
                 value.green().to_string()
             }
         }
-        "Primary Cause" => {
-            if lower == "none" || lower.contains("no primary") {
+        "Primary Cause" | "Likely Cause" => {
+            if lower == "none" || lower.contains("no problem") || lower.contains("no primary") {
                 value.green().bold().to_string()
             } else {
                 value.yellow().bold().to_string()
             }
         }
-        "Responses statuses" => {
+        "Responses statuses" | "Response results" => {
             if lower.contains("failed") || lower.contains("incomplete") {
                 value.red().bold().to_string()
             } else if lower.contains("completed") {
@@ -3874,35 +3994,44 @@ fn colorize_postmortem_value(label: &str, value: &str) -> String {
                 value.to_string()
             }
         }
-        "Estimated context fill max" => match parse_percent_prefix(value) {
+        "Estimated context fill max" | "Context used" => match parse_percent_prefix(value) {
             Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
             Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
             Some(_) => value.green().to_string(),
             None => value.to_string(),
         },
-        "Cached input reuse" => match parse_percent_prefix(value) {
+        "Cached input reuse" | "Cache reuse" => match parse_percent_prefix(value) {
             Some(percent) if percent >= 60.0 => value.green().to_string(),
             Some(percent) if percent >= 30.0 => value.yellow().to_string(),
             Some(_) => value.red().bold().to_string(),
             None => value.to_string(),
         },
-        "Max reasoning-output share" => match parse_percent_prefix(value) {
+        "Max reasoning-output share" | "Reasoning share" => match parse_percent_prefix(value) {
             Some(percent) if percent >= 80.0 => value.red().bold().to_string(),
             Some(percent) if percent >= 60.0 => value.yellow().bold().to_string(),
             Some(_) => value.green().to_string(),
             None => value.to_string(),
         },
-        "Tool-call intent" => value.cyan().to_string(),
+        "Tool-call intent" | "Tool requests" | "Scope" => value.cyan().to_string(),
         _ => value.to_string(),
     }
 }
 
 fn colorize_evidence_kind(kind: &str) -> String {
     match kind {
-        "direct" => kind.green().bold().to_string(),
-        "heuristic" => kind.yellow().bold().to_string(),
-        "derived" => kind.cyan().bold().to_string(),
+        "observed" | "direct" => kind.green().bold().to_string(),
+        "pattern" | "heuristic" => kind.yellow().bold().to_string(),
+        "calculated" | "derived" => kind.cyan().bold().to_string(),
         _ => kind.bright_white().to_string(),
+    }
+}
+
+fn humanize_evidence_kind(kind: &str) -> &'static str {
+    match kind {
+        "direct" => "observed",
+        "heuristic" => "pattern",
+        "derived" => "calculated",
+        _ => "signal",
     }
 }
 
@@ -4060,6 +4189,19 @@ fn print_postmortem_box(
     println!("{}", postmortem_bottom_border(width, tone));
 }
 
+fn print_postmortem_section(
+    title: &str,
+    lines: &[PostmortemTerminalLine],
+    tone: PostmortemTone,
+    width: usize,
+) {
+    if lines.is_empty() {
+        return;
+    }
+    println!();
+    print_postmortem_box(title, lines, tone, width);
+}
+
 fn postmortem_key_value_lines(
     rows: Vec<(&str, String)>,
     content_width: usize,
@@ -4104,15 +4246,15 @@ fn postmortem_state(report: &serde_json::Value) -> &'static str {
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
     {
-        "partial snapshot"
+        "partial - session may still be running"
     } else {
-        "final or persisted snapshot"
+        "complete saved report"
     }
 }
 
 fn postmortem_token_line(impact: &serde_json::Value) -> String {
     format!(
-        "input {}, cached {}, uncached {}, output {}, reasoning {}, local total {}",
+        "input {} ({} cached, {} new), output {}, internal reasoning {}, total {}",
         number_field(impact, "input_tokens"),
         number_field(impact, "cached_input_tokens"),
         number_field(impact, "uncached_input_tokens"),
@@ -4128,9 +4270,11 @@ fn postmortem_model_line(summary: &serde_json::Value) -> Option<String> {
         json_str(summary, "served_model"),
     ) {
         (Some(requested), Some(served)) if requested == served => Some(requested.to_string()),
-        (Some(requested), Some(served)) => Some(format!("{requested} -> {served}")),
+        (Some(requested), Some(served)) => {
+            Some(format!("requested {requested}, answered {served}"))
+        }
         (Some(requested), None) => Some(requested.to_string()),
-        (None, Some(served)) => Some(format!("served {served}")),
+        (None, Some(served)) => Some(format!("answered {served}")),
         (None, None) => None,
     }
 }
@@ -4140,19 +4284,19 @@ fn postmortem_local_estimate_line(impact: &serde_json::Value) -> String {
         .get("local_estimated_cost_dollars")
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0);
-    let mut parts = vec![format!("local ${cost:.2}")];
+    let mut parts = vec![format!("estimated ${cost:.2}")];
     if let Some(trusted) = impact
         .get("local_estimate_trusted_for_budget_enforcement")
         .and_then(|value| value.as_bool())
     {
         parts.push(if trusted {
-            "trusted for budget enforcement".to_string()
+            "budget stops enabled".to_string()
         } else {
-            "untrusted for budget enforcement".to_string()
+            "budget stops advisory".to_string()
         });
     }
     if let Some(source) = json_str(impact, "local_estimate_source") {
-        parts.push(source.to_string());
+        parts.push(humanize_postmortem_source(source));
     }
     parts.join(", ")
 }
@@ -4234,7 +4378,7 @@ fn postmortem_terminal_header_lines(
             ),
         ),
         (
-            "Outcome",
+            "Result",
             format!(
                 "{}; {} turns",
                 json_str(summary, "outcome").unwrap_or("?"),
@@ -4249,7 +4393,7 @@ fn postmortem_terminal_header_lines(
         rows.push(("Model", model));
     }
     rows.push((
-        "Impact",
+        "Usage",
         format!(
             "{} local tokens; {}",
             number_field(impact, "local_total_tokens"),
@@ -4257,8 +4401,8 @@ fn postmortem_terminal_header_lines(
         ),
     ));
     rows.push((
-        "Boundary",
-        "Envoy-observed Codex Responses; tool calls are intent only".to_string(),
+        "Scope",
+        "Local proxy traffic only; tool rows show requests, not success.".to_string(),
     ));
     postmortem_key_value_lines(rows, content_width)
 }
@@ -4277,27 +4421,25 @@ fn postmortem_snapshot_terminal_lines(
     let mut rows = vec![
         ("State", postmortem_state(report).to_string()),
         ("Tokens", postmortem_token_line(impact)),
-        ("Local Estimate", format!("${cost:.2}")),
+        ("Estimated Cost", format!("${cost:.2}")),
         (
-            "Primary Cause",
-            json_str(diagnosis, "primary_cause")
-                .unwrap_or("none")
-                .to_string(),
+            "Likely Cause",
+            humanize_postmortem_cause(json_str(diagnosis, "primary_cause").unwrap_or("none")),
         ),
     ];
     if let Some(source) = json_str(impact, "local_estimate_source") {
-        rows.push(("Local Estimate Source", source.to_string()));
+        rows.push(("Pricing", humanize_postmortem_source(source)));
     }
     if let Some(trusted) = impact
         .get("local_estimate_trusted_for_budget_enforcement")
         .and_then(|value| value.as_bool())
     {
         rows.push((
-            "Local Estimate Trust",
+            "Cost Confidence",
             if trusted {
-                "trusted for budget enforcement".to_string()
+                "trusted for budget stops".to_string()
             } else {
-                "untrusted for budget enforcement".to_string()
+                "untrusted - dollar budgets stay advisory".to_string()
             },
         ));
     }
@@ -4307,13 +4449,13 @@ fn postmortem_snapshot_terminal_lines(
         .and_then(|map| map.get("billed_cost_dollars"))
         .and_then(|value| value.as_f64())
     {
-        rows.push(("Billed", format!("${billed:.2}")));
+        rows.push(("Billed Cost", format!("${billed:.2}")));
     }
     if let Some(prompt) = json_str(summary, "initial_prompt_excerpt") {
         rows.push(("Prompt", prompt.to_string()));
     }
     if let Some(summary_text) = json_str(summary, "final_response_summary") {
-        rows.push(("Final Summary", summary_text.to_string()));
+        rows.push(("Final Answer", summary_text.to_string()));
     }
     postmortem_key_value_lines(rows, content_width)
 }
@@ -4327,25 +4469,25 @@ fn postmortem_signals_terminal_lines(
     };
     let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(rendered) = postmortem_response_statuses_line(signals) {
-        rows.push(("Responses statuses", rendered));
+        rows.push(("Response results", rendered));
     }
     if let Some(context) = signals.get("context_fill") {
         let percent = context
             .get("max_percent")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0);
-        rows.push(("Estimated context fill max", format!("{percent:.1}%")));
+        rows.push(("Context used", format!("{percent:.1}% max")));
     }
     if let Some(cache) = signals.get("cached_input_reuse") {
         if let Some(ratio) = cache.get("ratio").and_then(|value| value.as_f64()) {
-            rows.push(("Cached input reuse", format!("{:.0}%", ratio * 100.0)));
+            rows.push(("Cache reuse", format!("{:.0}% reused", ratio * 100.0)));
         }
     }
     if let Some(reasoning) = signals.get("reasoning_output_share") {
         if let Some(ratio) = reasoning.get("max_ratio").and_then(|value| value.as_f64()) {
             rows.push((
-                "Max reasoning-output share",
-                format!("{:.0}%", ratio * 100.0),
+                "Reasoning share",
+                format!("{:.0}% of output tokens", ratio * 100.0),
             ));
         }
     }
@@ -4361,7 +4503,7 @@ fn postmortem_signals_terminal_lines(
             .collect::<Vec<_>>()
             .join(", ");
         if !rendered.is_empty() {
-            rows.push(("Tool-call intent", rendered));
+            rows.push(("Tool requests", rendered));
         }
     }
     postmortem_key_value_lines(rows, content_width)
@@ -4376,13 +4518,15 @@ fn postmortem_evidence_terminal_lines(report: &serde_json::Value) -> Vec<Postmor
         .take(12)
         .enumerate()
         .map(|(idx, row)| {
-            let kind = json_str(row, "type").unwrap_or("signal");
-            let signal = json_str(row, "signal").unwrap_or("unknown");
+            let kind = humanize_evidence_kind(json_str(row, "type").unwrap_or("signal"));
+            let signal = humanize_postmortem_signal(json_str(row, "signal").unwrap_or("unknown"));
             let turn = row
                 .get("turn")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(0);
-            let detail = postmortem_table_cell(json_str(row, "detail").unwrap_or(""));
+            let detail = postmortem_table_cell(&humanize_postmortem_detail(
+                json_str(row, "detail").unwrap_or(""),
+            ));
             let index = idx + 1;
             let plain = format!("{index}. [{kind}] {signal} turn {turn}: {detail}");
             let styled = format!(
@@ -4407,8 +4551,10 @@ fn postmortem_timeline_terminal_lines(report: &serde_json::Value) -> Vec<Postmor
         .take(14)
         .map(|row| {
             let timestamp = json_str(row, "timestamp").unwrap_or("");
-            let event = json_str(row, "event").unwrap_or("event");
-            let detail = postmortem_table_cell(json_str(row, "detail").unwrap_or(""));
+            let event = humanize_postmortem_event(json_str(row, "event").unwrap_or("event"));
+            let detail = postmortem_table_cell(&humanize_postmortem_detail(
+                json_str(row, "detail").unwrap_or(""),
+            ));
             let plain = format!("{timestamp}  {event}  {detail}");
             let styled = format!(
                 "{}  {}  {}",
@@ -4437,7 +4583,7 @@ fn postmortem_string_list_terminal_lines(
         .enumerate()
     {
         let index = idx + 1;
-        let item = postmortem_table_cell(item);
+        let item = postmortem_table_cell(&humanize_postmortem_note(key, item));
         let prefix = format!("{index}. ");
         let value_width = content_width
             .saturating_sub(postmortem_visible_len(&prefix))
@@ -4488,7 +4634,13 @@ fn postmortem_restart_prompt_terminal_lines(
         .unwrap_or_default()
 }
 
-fn print_postmortem_terminal_report(report: &serde_json::Value) {
+fn print_postmortem_terminal_report(report: &serde_json::Value, color_mode: ColorMode) {
+    color_control::set_override(color_enabled(
+        color_mode,
+        stdout_is_terminal(),
+        std::env::var_os("NO_COLOR").is_some(),
+    ));
+
     let width = postmortem_terminal_width();
     let content_width = width.saturating_sub(4);
     let report_tone = postmortem_report_tone(report);
@@ -4497,44 +4649,38 @@ fn print_postmortem_terminal_report(report: &serde_json::Value) {
         other => other,
     };
 
-    println!();
-    print_postmortem_box(
-        "Codex Responses Postmortem",
+    print_postmortem_section(
+        "Codex Session Report",
         &postmortem_terminal_header_lines(report, content_width),
         PostmortemTone::Header,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Snapshot",
+    print_postmortem_section(
+        "At a Glance",
         &postmortem_snapshot_terminal_lines(report, content_width),
         report_tone,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Signals",
+    print_postmortem_section(
+        "Checks",
         &postmortem_signals_terminal_lines(report, content_width),
         signal_tone,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Evidence",
+    print_postmortem_section(
+        "What Triggered This",
         &postmortem_evidence_terminal_lines(report),
         signal_tone,
         width,
     );
-    println!();
-    print_postmortem_box(
+    print_postmortem_section(
         "Timeline",
         &postmortem_timeline_terminal_lines(report),
         PostmortemTone::Info,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Recommendations",
+    print_postmortem_section(
+        "Next Steps",
         &postmortem_string_list_terminal_lines(
             report,
             "recommendations",
@@ -4544,9 +4690,8 @@ fn print_postmortem_terminal_report(report: &serde_json::Value) {
         PostmortemTone::Warn,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Caveats",
+    print_postmortem_section(
+        "Limits",
         &postmortem_string_list_terminal_lines(
             report,
             "caveats",
@@ -4556,13 +4701,13 @@ fn print_postmortem_terminal_report(report: &serde_json::Value) {
         PostmortemTone::Muted,
         width,
     );
-    println!();
-    print_postmortem_box(
-        "Restart Prompt",
+    print_postmortem_section(
+        "Continue Prompt",
         &postmortem_restart_prompt_terminal_lines(report, content_width),
         PostmortemTone::Info,
         width,
     );
+    color_control::unset_override();
 }
 
 #[cfg(unix)]
@@ -4651,7 +4796,9 @@ fn postmortem_table_cell(value: &str) -> String {
 fn postmortem_column_widths(headers: &[&str]) -> Vec<usize> {
     match headers {
         ["Type", "Signal", "Turn", "Detail"] => vec![10, 28, 5, 0],
+        ["Kind", "Check", "Turn", "Detail"] => vec![10, 28, 5, 0],
         ["Time", "Event", "Detail"] => vec![20, 18, 0],
+        ["Time", "Step", "Detail"] => vec![20, 18, 0],
         _ => headers
             .iter()
             .enumerate()
@@ -4731,7 +4878,7 @@ fn push_key_value_table(out: &mut String, rows: Vec<(&str, String)>) {
 
 fn render_postmortem_markdown(report: &serde_json::Value) -> String {
     let mut out = String::new();
-    out.push_str("# Codex Responses Postmortem\n\n");
+    out.push_str("# Codex Session Report\n\n");
     render_postmortem_snapshot(report, &mut out);
     render_postmortem_signals(report, &mut out);
     render_postmortem_evidence(report, &mut out);
@@ -4743,7 +4890,7 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
     {
-        out.push_str("\n## Restart Prompt\n");
+        out.push_str("\n## Continue Prompt\n");
         out.push_str("```text\n");
         out.push_str(prompt);
         out.push_str("\n```\n");
@@ -4755,54 +4902,30 @@ fn render_postmortem_snapshot(report: &serde_json::Value, out: &mut String) {
     let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
     let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
     let diagnosis = report.get("diagnosis").unwrap_or(&serde_json::Value::Null);
-    out.push_str("## Snapshot\n");
+    out.push_str("## At a Glance\n");
     push_md_line(
         out,
         "Session",
         json_str(report, "session_id").unwrap_or("?"),
     );
-    push_md_line(
-        out,
-        "State",
-        if report
-            .get("partial")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
-        {
-            "partial snapshot"
-        } else {
-            "final or persisted snapshot"
-        },
-    );
-    push_md_line(out, "Outcome", json_str(summary, "outcome").unwrap_or("?"));
-    if let Some(model) = json_str(summary, "requested_model") {
-        push_md_line(out, "Requested Model", model);
-    }
-    if let Some(model) = json_str(summary, "served_model") {
-        push_md_line(out, "Served Model", model);
+    push_md_line(out, "State", postmortem_state(report));
+    push_md_line(out, "Result", json_str(summary, "outcome").unwrap_or("?"));
+    if let Some(model) = postmortem_model_line(summary) {
+        push_md_line(out, "Model", &model);
     }
     let turn_count = summary
         .get("turn_count")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
     push_md_line(out, "Turns", &turn_count.to_string());
-    let token_line = format!(
-        "input {}, cached {}, uncached {}, output {}, reasoning {}, local total {}",
-        number_field(impact, "input_tokens"),
-        number_field(impact, "cached_input_tokens"),
-        number_field(impact, "uncached_input_tokens"),
-        number_field(impact, "output_tokens"),
-        number_field(impact, "reasoning_output_tokens"),
-        number_field(impact, "local_total_tokens"),
-    );
-    push_md_line(out, "Tokens", &token_line);
+    push_md_line(out, "Tokens", &postmortem_token_line(impact));
     let cost = impact
         .get("local_estimated_cost_dollars")
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0);
-    push_md_line(out, "Local Estimate", &format!("${cost:.2}"));
+    push_md_line(out, "Estimated Cost", &format!("${cost:.2}"));
     if let Some(source) = json_str(impact, "local_estimate_source") {
-        push_md_line(out, "Local Estimate Source", source);
+        push_md_line(out, "Pricing", &humanize_postmortem_source(source));
     }
     if let Some(trusted) = impact
         .get("local_estimate_trusted_for_budget_enforcement")
@@ -4810,11 +4933,11 @@ fn render_postmortem_snapshot(report: &serde_json::Value, out: &mut String) {
     {
         push_md_line(
             out,
-            "Local Estimate Trust",
+            "Cost Confidence",
             if trusted {
-                "trusted for budget enforcement"
+                "trusted for budget stops"
             } else {
-                "untrusted for budget enforcement"
+                "untrusted - dollar budgets stay advisory"
             },
         );
     }
@@ -4824,18 +4947,18 @@ fn render_postmortem_snapshot(report: &serde_json::Value, out: &mut String) {
         .and_then(|map| map.get("billed_cost_dollars"))
         .and_then(|value| value.as_f64())
     {
-        push_md_line(out, "Billed", &format!("${billed:.2}"));
+        push_md_line(out, "Billed Cost", &format!("${billed:.2}"));
     }
     push_md_line(
         out,
-        "Primary Cause",
-        json_str(diagnosis, "primary_cause").unwrap_or("none"),
+        "Likely Cause",
+        &humanize_postmortem_cause(json_str(diagnosis, "primary_cause").unwrap_or("none")),
     );
     if let Some(prompt) = json_str(summary, "initial_prompt_excerpt") {
         push_md_line(out, "Prompt", prompt);
     }
     if let Some(summary_text) = json_str(summary, "final_response_summary") {
-        push_md_line(out, "Final Summary", summary_text);
+        push_md_line(out, "Final Answer", summary_text);
     }
 }
 
@@ -4843,7 +4966,7 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
     let Some(signals) = report.get("signals") else {
         return;
     };
-    out.push_str("\n## Signals\n");
+    out.push_str("\n## Checks\n");
     let mut rows: Vec<(&str, String)> = Vec::new();
     if let Some(statuses) = signals
         .get("response_statuses")
@@ -4857,7 +4980,7 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .collect::<Vec<_>>()
             .join(", ");
         if !rendered.is_empty() {
-            rows.push(("Responses statuses", rendered));
+            rows.push(("Response results", rendered));
         }
     }
     if let Some(context) = signals.get("context_fill") {
@@ -4865,18 +4988,18 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .get("max_percent")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0);
-        rows.push(("Estimated context fill max", format!("{percent:.1}%")));
+        rows.push(("Context used", format!("{percent:.1}% max")));
     }
     if let Some(cache) = signals.get("cached_input_reuse") {
         if let Some(ratio) = cache.get("ratio").and_then(|value| value.as_f64()) {
-            rows.push(("Cached input reuse", format!("{:.0}%", ratio * 100.0)));
+            rows.push(("Cache reuse", format!("{:.0}% reused", ratio * 100.0)));
         }
     }
     if let Some(reasoning) = signals.get("reasoning_output_share") {
         if let Some(ratio) = reasoning.get("max_ratio").and_then(|value| value.as_f64()) {
             rows.push((
-                "Max reasoning-output share",
-                format!("{:.0}%", ratio * 100.0),
+                "Reasoning share",
+                format!("{:.0}% of output tokens", ratio * 100.0),
             ));
         }
     }
@@ -4892,7 +5015,7 @@ fn render_postmortem_signals(report: &serde_json::Value, out: &mut String) {
             .collect::<Vec<_>>()
             .join(", ");
         if !rendered.is_empty() {
-            rows.push(("Tool-call intent", rendered));
+            rows.push(("Tool requests", rendered));
         }
     }
     push_key_value_table(out, rows);
@@ -4907,26 +5030,21 @@ fn render_postmortem_evidence(report: &serde_json::Value, out: &mut String) {
     if rows.is_empty() {
         return;
     }
-    out.push_str("\n## Evidence\n");
-    let headers = ["Type", "Signal", "Turn", "Detail"];
+    out.push_str("\n## What Triggered This\n");
+    let headers = ["Kind", "Check", "Turn", "Detail"];
     push_postmortem_table_header(out, &headers);
     for row in rows.iter().take(12) {
-        let kind = json_str(row, "type").unwrap_or("signal");
-        let signal = json_str(row, "signal").unwrap_or("unknown");
+        let kind = humanize_evidence_kind(json_str(row, "type").unwrap_or("signal"));
+        let signal = humanize_postmortem_signal(json_str(row, "signal").unwrap_or("unknown"));
         let turn = row
             .get("turn")
             .and_then(|value| value.as_u64())
             .unwrap_or(0);
-        let detail = json_str(row, "detail").unwrap_or("");
+        let detail = humanize_postmortem_detail(json_str(row, "detail").unwrap_or(""));
         push_postmortem_table_row(
             out,
             &headers,
-            &[
-                kind.to_string(),
-                signal.to_string(),
-                turn.to_string(),
-                detail.to_string(),
-            ],
+            &[kind.to_string(), signal, turn.to_string(), detail],
         );
     }
 }
@@ -4941,17 +5059,13 @@ fn render_postmortem_timeline(report: &serde_json::Value, out: &mut String) {
         return;
     }
     out.push_str("\n## Timeline\n");
-    let headers = ["Time", "Event", "Detail"];
+    let headers = ["Time", "Step", "Detail"];
     push_postmortem_table_header(out, &headers);
     for row in rows.iter().take(14) {
         let timestamp = json_str(row, "timestamp").unwrap_or("");
-        let event = json_str(row, "event").unwrap_or("event");
-        let detail = json_str(row, "detail").unwrap_or("");
-        push_postmortem_table_row(
-            out,
-            &headers,
-            &[timestamp.to_string(), event.to_string(), detail.to_string()],
-        );
+        let event = humanize_postmortem_event(json_str(row, "event").unwrap_or("event"));
+        let detail = humanize_postmortem_detail(json_str(row, "detail").unwrap_or(""));
+        push_postmortem_table_row(out, &headers, &[timestamp.to_string(), event, detail]);
     }
 }
 
@@ -4964,10 +5078,10 @@ fn render_postmortem_recommendations(report: &serde_json::Value, out: &mut Strin
     if rows.is_empty() {
         return;
     }
-    out.push_str("\n## Recommendations\n");
+    out.push_str("\n## Next Steps\n");
     for row in rows {
         if let Some(item) = row.as_str() {
-            push_md_bullet(out, item);
+            push_md_bullet(out, &humanize_postmortem_note("recommendations", item));
         }
     }
 }
@@ -4981,10 +5095,10 @@ fn render_postmortem_caveats(report: &serde_json::Value, out: &mut String) {
     if rows.is_empty() {
         return;
     }
-    out.push_str("\n## Caveats\n");
+    out.push_str("\n## Limits\n");
     for row in rows {
         if let Some(item) = row.as_str() {
-            push_md_bullet(out, item);
+            push_md_bullet(out, &humanize_postmortem_note("caveats", item));
         }
     }
 }
@@ -5148,6 +5262,7 @@ async fn maybe_render_watch_postmortem(
         session_id,
         options.redact_postmortem,
         None,
+        options.color_mode,
     )
     .await
     {

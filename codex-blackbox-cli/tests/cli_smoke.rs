@@ -316,6 +316,17 @@ fn guard_help_documents_policy_json_color_and_width_options() {
 }
 
 #[test]
+fn postmortem_help_documents_color_option() {
+    let output = codex_blackbox(&["postmortem", "--help"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("--color"));
+    assert!(out.contains("--no-redact"));
+    assert!(out.contains("--output"));
+}
+
+#[test]
 fn status_command_renders_uncolored_decision_json_from_postmortem_api() {
     let (url, request_rx) = serve_json_once(
         r#"{
@@ -630,7 +641,7 @@ fn recall_command_reports_no_matches() {
 }
 
 #[test]
-fn postmortem_command_renders_redacted_markdown_from_api() {
+fn postmortem_command_renders_colored_human_terminal_report_from_api() {
     let (url, request_rx) = serve_json_once(
         r#"{
           "schema_version": 1,
@@ -682,7 +693,7 @@ fn postmortem_command_renders_redacted_markdown_from_api() {
         }"#,
     );
 
-    let output = codex_blackbox(&["postmortem", "--url", &url, "last"]);
+    let output = codex_blackbox(&["postmortem", "--url", &url, "--color", "always", "last"]);
 
     assert!(output.status.success(), "stderr:\n{}", stderr(&output));
     let request = captured_request(request_rx);
@@ -691,22 +702,28 @@ fn postmortem_command_renders_redacted_markdown_from_api() {
         "unexpected request:\n{request}"
     );
     let out = stdout(&output);
-    assert!(out.contains("\u{250c}\u{2500}[ Codex Responses Postmortem ]"));
-    assert!(out.contains("[ Snapshot ]"));
-    assert!(out.contains("[ Signals ]"));
-    assert!(out.contains("[ Evidence ]"));
+    assert!(out.contains("\x1b["));
+    assert!(out.contains("\u{250c}\u{2500}[ Codex Session Report ]"));
+    assert!(out.contains("[ At a Glance ]"));
+    assert!(out.contains("[ Checks ]"));
+    assert!(out.contains("[ What Triggered This ]"));
     assert!(out.contains("[ Timeline ]"));
-    assert!(out.contains("[ Recommendations ]"));
-    assert!(out.contains("[ Caveats ]"));
-    assert!(out.contains("[ Restart Prompt ]"));
-    assert!(!out.contains("# Codex Responses Postmortem"));
+    assert!(out.contains("[ Next Steps ]"));
+    assert!(out.contains("[ Limits ]"));
+    assert!(out.contains("[ Continue Prompt ]"));
+    assert!(!out.contains("# Codex Session Report"));
     assert!(out.contains("[redacted prompt excerpt]"));
-    assert!(out.contains("Local Estimate Source"));
-    assert!(out.contains("codex_unpriced:unknown_model:gpt-5.5"));
-    assert!(out.contains("Local Estimate Trust"));
-    assert!(out.contains("untrusted for budget enforcement"));
-    assert!(out.contains("Tool-call intent"));
+    assert!(out.contains("Pricing"));
+    assert!(out.contains("no trusted price for gpt-5.5"));
+    assert!(out.contains("Cost Confidence"));
+    assert!(out.contains("untrusted - dollar budgets stay advisory"));
+    assert!(out.contains("Tool requests"));
     assert!(out.contains("read_file: 1"));
+    assert!(out.contains("response stopped incomplete"));
+    assert!(out.contains("hit max_output_tokens"));
+    assert!(!out.contains("Tool-call intent"));
+    assert!(!out.contains("Responses statuses"));
+    assert!(!out.contains("Max reasoning-output share"));
     assert!(!out.to_ascii_lowercase().contains("tool result"));
     assert!(!out.to_ascii_lowercase().contains("mcp lifecycle"));
 }
@@ -764,7 +781,10 @@ fn postmortem_command_supports_no_redact_and_output_file() {
     );
     let markdown = fs::read_to_string(&output_path).expect("read postmortem output");
     assert!(markdown.contains("Inspect /Users/alice/private/repo"));
-    assert!(markdown.contains("partial snapshot"));
+    assert!(markdown.contains("# Codex Session Report"));
+    assert!(markdown.contains("partial - session may still be running"));
+    assert!(markdown.contains("## At a Glance"));
+    assert!(markdown.contains("## Next Steps"));
 
     let _ = fs::remove_dir_all(dir);
 }

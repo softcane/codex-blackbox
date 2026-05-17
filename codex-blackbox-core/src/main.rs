@@ -6860,6 +6860,64 @@ mod tests {
     }
 
     #[test]
+    fn postmortem_report_is_not_partial_when_session_has_ended_at() {
+        let path = unique_test_db_path("codex-postmortem-ended-at");
+        let session_id = "codex-postmortem-ended-at-session";
+        let request = parse_codex_fixture_request(session_id);
+        let completed = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            None,
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-postmortem-ended-at",
+            &request,
+            &completed,
+            Duration::from_millis(10),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+
+        run_db_writer_commands(
+            &path,
+            vec![record_codex_turn_command(
+                &outcome,
+                "2026-04-30T12:00:04Z".to_string(),
+            )],
+        );
+
+        let active_key = 0xfeed_u64;
+        diagnosis::SESSIONS.insert(
+            active_key,
+            diagnosis::SessionState {
+                session_id: session_id.to_string(),
+                display_name: "codex-blackbox".to_string(),
+                model: "gpt-codex-fixture".to_string(),
+                initial_prompt: Some("fixture prompt".to_string()),
+                created_at: std::time::Instant::now(),
+                last_activity: std::time::Instant::now(),
+                session_inserted: true,
+            },
+        );
+
+        let conn = Connection::open(&path).expect("open persisted db");
+        let report = postmortem::build_postmortem_report(
+            &conn,
+            postmortem::PostmortemTarget::Session(session_id.to_string()),
+            true,
+        )
+        .expect("postmortem report");
+
+        assert_eq!(
+            report.pointer("/summary/ended_at").and_then(Value::as_str),
+            Some("2026-04-30T12:00:04Z")
+        );
+        assert_eq!(report.get("partial").and_then(Value::as_bool), Some(false));
+
+        let _ = diagnosis::SESSIONS.remove(&active_key);
+        drop(conn);
+        cleanup_test_db(&path);
+    }
+
+    #[test]
     fn postmortem_last_is_provider_scoped_to_codex_responses() {
         let conn = create_full_test_db();
         insert_session(
@@ -6963,7 +7021,7 @@ mod tests {
                 "postmortem report must not expose unsupported surface {forbidden}"
             );
         }
-        assert!(body.contains("tool-call intent"));
+        assert!(body.contains("tool request observed") || body.contains("codex_tool_call_intent"));
 
         drop(conn);
         cleanup_test_db(&path);

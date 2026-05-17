@@ -132,7 +132,7 @@ pub(crate) fn build_postmortem_report(
         "evidence_origin": evidence_origin,
         "session_id": session_id,
         "redacted": redact,
-        "partial": session_is_active(&session.session_id),
+        "partial": session_is_partial(&session),
         "summary": summary,
         "diagnosis": {
             "degraded": diagnosis.degraded,
@@ -141,8 +141,8 @@ pub(crate) fn build_postmortem_report(
             "primary_cause_type": primary.as_ref().map(|cause| cause.cause_type.clone()).unwrap_or_else(|| "none".to_string()),
             "cause_classification": primary.as_ref().map(|cause| cause.classification.clone()).unwrap_or_else(|| "none".to_string()),
             "confidence": primary.as_ref().map(|cause| cause.confidence.clone()).unwrap_or_else(|| "low".to_string()),
-            "detail": primary.as_ref().map(|cause| redactor.redact(&cause.detail)).unwrap_or_else(|| "No direct degraded Codex Responses cause was observed.".to_string()),
-            "next_action": recommendations.first().cloned().unwrap_or_else(|| "No immediate action is required from the observed Codex Responses evidence.".to_string()),
+            "detail": primary.as_ref().map(|cause| redactor.redact(&cause.detail)).unwrap_or_else(|| "No failed or incomplete model response was observed.".to_string()),
+            "next_action": recommendations.first().cloned().unwrap_or_else(|| "No immediate action is required from the observed model traffic.".to_string()),
             "causes": redactor.redact_value(diagnosis.causes.clone()),
             "advice": redactor.redact_value(diagnosis.advice.clone()),
         },
@@ -595,7 +595,7 @@ fn build_evidence(turns: &[TurnEvidence], redactor: &Redactor) -> Vec<Value> {
                 "direct",
                 "codex_response_unknown",
                 turn,
-                "Responses stream ended without a recognized terminal status.".to_string(),
+                "Stream ended before Codex Blackbox could identify a final status.".to_string(),
             )),
             _ => {}
         }
@@ -663,7 +663,7 @@ fn build_evidence(turns: &[TurnEvidence], redactor: &Redactor) -> Vec<Value> {
                 "direct",
                 "codex_tool_call_intent",
                 turn,
-                format!("model-side tool-call intent observed: {names}"),
+                format!("tool request observed: {names}"),
             ));
         }
     }
@@ -716,7 +716,7 @@ fn build_timeline(
         timeline.push(json!({
             "timestamp": started_at,
             "event": "session_start",
-            "detail": "First persisted Codex Responses evidence for the session.",
+            "detail": "First model response observed for the session.",
         }));
     }
     for turn in turns {
@@ -744,9 +744,9 @@ fn build_timeline(
             "timestamp": session.ended_at.as_ref().unwrap_or(&last.timestamp),
             "event": if degraded { "session_degraded" } else { "latest_observation" },
             "detail": if degraded {
-                "Direct degraded Codex Responses evidence was observed."
+                "A degraded-session signal was observed."
             } else {
-                "Latest persisted Codex Responses observation."
+                "Latest model response observed."
             },
         }));
     }
@@ -769,12 +769,11 @@ fn build_recommendations(
 
     if recommendations.is_empty() {
         if turns.iter().any(|turn| turn.status == "failed") {
-            recommendations.push(
-                "Inspect the persisted provider-side failure detail before retrying.".to_string(),
-            );
+            recommendations.push("Read the failure detail above before retrying.".to_string());
         } else if turns.iter().any(|turn| turn.status == "incomplete") {
             recommendations.push(
-                "Continue with a narrower prompt or adjust the relevant output limit.".to_string(),
+                "Continue with a smaller prompt, or raise the output limit if that was intentional."
+                    .to_string(),
             );
         } else if turns.iter().any(|turn| {
             turn.requested_model.is_some()
@@ -782,7 +781,8 @@ fn build_recommendations(
                 && turn.requested_model != turn.served_model
         }) {
             recommendations.push(
-                "Treat model-specific conclusions carefully because requested and served models differed.".to_string(),
+                "Confirm which model answered before relying on model-specific conclusions."
+                    .to_string(),
             );
         } else {
             recommendations.push(
@@ -837,14 +837,14 @@ fn primary_cause(causes: &Value) -> Option<PrimaryCause> {
 
 fn cause_label(cause_type: &str) -> &'static str {
     match cause_type {
-        "codex_response_failed" => "Codex Responses failed",
-        "codex_response_incomplete" => "Codex Responses incomplete",
+        "codex_response_failed" => "Model response failed",
+        "codex_response_incomplete" => "Model response stopped incomplete",
         "codex_model_mismatch" => "Requested and served models differed",
         "codex_accounting_anomaly" => "Token accounting anomaly",
         "codex_high_context_fill" => "High estimated context fill",
-        "codex_high_reasoning_share" => "High reasoning-output share",
-        "codex_low_cached_input_reuse" => "Low cached-input reuse",
-        _ => "Observed Codex Responses signal",
+        "codex_high_reasoning_share" => "High internal reasoning token share",
+        "codex_low_cached_input_reuse" => "Low prompt cache reuse",
+        _ => "Observed model-response signal",
     }
 }
 
@@ -869,25 +869,26 @@ fn restart_prompt(
         _ => "",
     };
     let mut prompt = format!(
-        "Continue from Codex Blackbox session {session_id}. Outcome: {}. Last observed Responses status: {}.",
+        "Continue from Codex Blackbox session {session_id}. Outcome: {}. Last observed model status: {}.",
         diagnosis.outcome, last.status
     );
     if let Some(summary) = summary {
         prompt.push_str(&format!(" Final response summary: {summary}."));
     }
     if !issue.is_empty() {
-        prompt.push_str(&format!(" Provider-side detail: {issue}."));
+        prompt.push_str(&format!(" Observed stop detail: {issue}."));
     }
     Some(redactor.redact(&prompt))
 }
 
 fn caveats(evidence_origin: &'static str) -> Vec<String> {
     vec![
-        "Evidence is limited to local Envoy-observed Codex Responses traffic.".to_string(),
-        "Tool-call rows are model-side intent only; local execution outcome is not observed."
+        "Only local proxy traffic was used; confirm separately before making live-support claims."
             .to_string(),
-        "Cached input is token accounting only; lifecycle timing is not inferred.".to_string(),
-        "Provider account-limit state and permission decisions are not observed.".to_string(),
+        "Tool rows mean the model asked for a tool; they do not prove the tool ran or succeeded."
+            .to_string(),
+        "Cached input is token accounting only; cache timing is not inferred.".to_string(),
+        "Account limits and permission decisions are not visible here.".to_string(),
         if evidence_origin == "local_fake_fixture_contract" {
             "Fake fixtures validate local contracts only and are not live support evidence."
                 .to_string()
@@ -918,6 +919,10 @@ fn evidence_origin(session_id: &str, turns: &[TurnEvidence]) -> &'static str {
     } else {
         "unknown_local_envoy"
     }
+}
+
+fn session_is_partial(session: &SessionFacts) -> bool {
+    session.ended_at.is_none() && session_is_active(&session.session_id)
 }
 
 fn session_is_active(session_id: &str) -> bool {
