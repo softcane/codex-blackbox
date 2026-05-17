@@ -84,6 +84,39 @@ fill, pricing trust, response status, and a per-turn Flight Recorder.
 Cached input is part of input tokens. Reasoning tokens are output detail. Local
 total tokens are input plus output.
 
+## Guard
+
+Guard answers whether the next Codex request should continue, warn, or block
+from trusted local evidence:
+
+```bash
+codex-blackbox guard --json
+```
+
+Runtime guard enforcement is next-request-only. It cannot interrupt a response
+that is already streaming. Token budgets block only with trusted session
+evidence, and dollar budgets block only when pricing is trusted. Unknown or
+untrusted pricing stays advisory.
+
+Supported policy fields:
+
+```toml
+session_token_budget = 200000
+session_cost_budget_dollars = 10.00
+context_warn_percent = 70
+context_block_percent = 85
+failed_response_warn_count = 1
+failed_response_block_count = 1
+incomplete_response_warn_count = 1
+incomplete_response_block_count = 1
+unknown_response_warn_count = 1
+unknown_response_block_count = 1
+accounting_anomaly_warn_count = 1
+accounting_anomaly_block_count = 1
+model_mismatch_warn = true
+model_mismatch_block = false
+```
+
 ## What Gets Recorded
 
 Codex Blackbox records model-turn evidence observed from Codex Responses
