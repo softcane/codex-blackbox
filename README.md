@@ -1,20 +1,25 @@
 # Codex Blackbox
 
-Codex runs can be hard to judge after the fact.
+Codex Blackbox records what happened during a Codex CLI run.
 
-It may finish, but you still do not know what happened: which model answered,
-whether the response actually completed, how many tokens were used, whether
-cached input helped, or whether the run is worth continuing.
+It runs a local Envoy proxy, `codex-blackbox-core`, SQLite, Prometheus, and
+Grafana. When Codex sends a model request through the proxy, the core service
+stores the request and response evidence.
 
-Codex Blackbox gives you a local postmortem for a Codex CLI session. It turns
-the run into a short report with the outcome, model, token use, cost estimate,
-important signals, and a practical next step.
+Use it when a run finishes and you want clear answers:
 
-It is built for local debugging. The database, metrics, dashboard, and CLI run
-on your machine.
+- did the model response complete, fail, or end incomplete?
+- which model answered?
+- how many tokens were used?
+- how much input came from cache?
+- is the context window getting tight?
+- what is the next practical step?
 
-The demo image below is fixture-backed example output, not live support
-evidence.
+The wrapper uses Codex's experimental subscription proxy path. Live support
+claims should be tied to real Codex traffic observed with
+`provider="codex_responses"`.
+
+The animation below is a fixture-backed sample.
 
 ![demo](docs/demo.gif)
 
@@ -26,127 +31,139 @@ Install:
 curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh
 ```
 
-Start the local stack:
+Check the local environment and start the stack:
 
 ```bash
 codex-blackbox doctor
 codex-blackbox up
 ```
 
-Run Codex normally through the wrapper:
+Run Codex through the wrapper:
 
 ```bash
 codex-blackbox run --watch -- codex
 ```
 
-Read the latest report:
+Read the latest postmortem:
 
 ```bash
 codex-blackbox postmortem last
-```
-
-Render the latest advisory decision as a one-line footer or JSON:
-
-```bash
-codex-blackbox status
-codex-blackbox status --json
-codex-blackbox guard --json
-```
-
-Or opt in to automatic postmortem rendering when watch sees a completed idle
-session:
-
-```bash
-codex-blackbox watch --postmortem
-```
-
-For a quick one-shot check instead of an interactive Codex session:
-
-```bash
-codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize this repo. Do not edit files."
 ```
 
 Open Grafana:
 
 [http://127.0.0.1:3000/d/codex-blackbox-main](http://127.0.0.1:3000/d/codex-blackbox-main)
 
-## What You Get
+For a quick read-only check:
 
-The postmortem is redacted by default. It shows:
+```bash
+codex-blackbox run --watch -- codex exec --sandbox read-only "Read README.md and summarize this repo. Do not edit files."
+```
 
-- the session id
-- whether the run completed, failed, or ended incomplete
-- the requested model and served model
+## What Gets Recorded
+
+Codex Blackbox records model-turn evidence observed through the local proxy:
+
+- session id and turn number
+- response status: completed, failed, incomplete, or unknown
+- requested model and served model
 - input, cached input, uncached input, output, and reasoning tokens
-- local token and cost estimates
-- important signals, like high context use or model mismatch
-- tool-call intent the model emitted, not proof that a tool succeeded
+- local cost estimate when pricing is known
+- context usage and accounting anomalies
+- model-side tool requests
+- a redacted prompt excerpt and response summary when available
 
-Example terminal display (fixture-style redacted sample, not live evidence):
+Cached input is counted as part of input tokens. Reasoning tokens are output
+detail. Unknown model pricing stays unpriced.
+
+Tool requests are model intent observed in the response stream. For tool
+execution results, inspect the tool output or runtime logs.
+
+## Postmortems
+
+Postmortems are redacted by default and are built from persisted evidence.
+
+Example terminal output:
 
 ```text
-┌─[ Codex Responses Postmortem ]────────────────────────────────────────────┐
+┌─[ Codex Session Report ]─────────────────────────────────────────────────┐
 │ Session   019e0743-63c2-7c61-b326-8088e4ae0c7b (redacted)                │
-│ Outcome   Likely Completed; 3 turns                                      │
+│ Result    Likely Completed; 3 turns                                      │
 │ Model     gpt-5.5                                                        │
-│ Impact    54841 local tokens; local $0.10                                │
+│ Usage     54841 local tokens; estimated $0.10                            │
 └──────────────────────────────────────────────────────────────────────────┘
 
-┌─[ Recommendations ]───────────────────────────────────────────────────────┐
+┌─[ Next Steps ]────────────────────────────────────────────────────────────┐
 │ 1. Continue from the latest response summary.                             │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-For a specific session:
+Read a specific session:
 
 ```bash
 codex-blackbox postmortem <session_id>
 ```
 
-For local debugging without redaction:
+Show local debugging details:
 
 ```bash
 codex-blackbox postmortem last --no-redact
 ```
 
-To write the report to a file:
+Write Markdown to a file:
 
 ```bash
 codex-blackbox postmortem last --output report.md
 ```
 
-The terminal view is styled for scanning; `--output` writes plain Markdown.
+Control terminal color:
 
-## What It Can Tell You
+```bash
+codex-blackbox postmortem last --color always
+codex-blackbox postmortem last --color never
+```
 
-Codex Blackbox can report what it observed during the model run:
+## Watch, Status, And Guard
 
-- did the model response complete, fail, or stop incomplete?
-- which model was requested, and which model answered?
-- how many input, cached input, uncached input, output, and reasoning tokens
-  were used?
-- what was the local cost estimate?
-- did the run show context pressure, model mismatch, or accounting oddities?
-- which tools did the model try to call?
+`watch` streams local events while a Codex run is active:
+
+```bash
+codex-blackbox watch --url http://127.0.0.1:9091
+codex-blackbox watch --postmortem
+```
+
+`status` renders the current decision footer:
+
+```bash
+codex-blackbox status
+codex-blackbox status --json
+```
+
+`guard` renders the advisory decision for the next request:
+
+```bash
+codex-blackbox guard --json
+```
+
+Guard policies are checked before the next request is sent. A response already
+in progress continues streaming.
+
+If a guard policy file fails to load, Codex Blackbox reports the policy problem
+and stays fail-open.
 
 ## Common Commands
 
 ```bash
 codex-blackbox doctor
 codex-blackbox up
-codex-blackbox watch --url http://127.0.0.1:9091
-codex-blackbox watch --postmortem
+codex-blackbox run --watch -- codex
+codex-blackbox sessions --limit 20 --days 7
+codex-blackbox recall "pricing"
+codex-blackbox postmortem last
 codex-blackbox status --json
 codex-blackbox guard --json
-codex-blackbox sessions --limit 20 --days 7
-codex-blackbox postmortem last
-codex-blackbox postmortem last --no-redact
+codex-blackbox config codex
 ```
-
-Guard checks are local and advisory by default. A configured token budget or
-trusted cost budget can block only the next request before it is sent; it cannot
-interrupt an already-streaming model response. If a guard policy file cannot be
-loaded, Codex Blackbox fails open and reports the policy issue.
 
 API shortcuts:
 
@@ -157,30 +174,47 @@ curl -s 'http://127.0.0.1:9091/api/guard-state'
 curl -s http://127.0.0.1:9091/metrics
 ```
 
-## Testing
+## Local Data
 
-Evidence categories:
+The stack stores data locally:
 
-- Fake fixtures validate local parser, persistence, watch, status, guard, and
-  postmortem contracts. They do not contact OpenAI and do not prove live Codex
-  support.
-- Preflight checks validate local configuration and login state without
-  launching a Codex model turn.
-- Dogfood evidence means a real local Codex run was intentionally routed
-  through `codex-blackbox run -- codex ...` and observed by
-  `codex-blackbox-core`.
-- Live support claims require real observed Codex Responses traffic persisted
-  with `provider="codex_responses"`.
+- SQLite keeps sessions, requests, turn summaries, diagnoses, and reports.
+- Prometheus stores bounded metrics for requests, tokens, status, duration, and
+  context usage.
+- Grafana reads Prometheus and shows the local dashboard.
 
-Local fake and static checks:
+Prometheus labels are kept bounded. Session ids, prompts, request ids, response
+ids, cwd values, and raw tool inputs are kept out of metric labels.
+
+## Evidence And Testing
+
+The project keeps evidence categories separate:
+
+- Fixture tests cover local parser, persistence, API, watch, status, guard,
+  metrics, dashboard, and postmortem contracts.
+- Preflight checks validate local configuration and login state.
+- Dogfood evidence comes from a real local Codex run through
+  `codex-blackbox run -- codex ...`.
+- Live support evidence requires a real `provider="codex_responses"` request
+  observed and persisted by `codex-blackbox-core`.
+
+Run the main local checks:
 
 ```bash
+cargo fmt --check
+cargo test --workspace
 ./test/validate-openai-config.sh
 ./test/e2e-openai-responses-full.sh
 ```
 
+Run a real dogfood check only when you intend to spend a live Codex turn:
+
+```bash
+./test/dogfood-codex-sessions.sh
+```
+
 ## Development
 
-Developer notes:
+Developer notes live in [docs/reference/developing.md](docs/reference/developing.md).
 
-[docs/reference/developing.md](docs/reference/developing.md)
+The system map lives in [ARCHITECTURE.md](ARCHITECTURE.md).
