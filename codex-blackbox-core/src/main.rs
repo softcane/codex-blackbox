@@ -216,16 +216,41 @@ impl RuntimeState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct SessionBudgetState {
+#[derive(Clone, Debug)]
+struct SessionGuardState {
     total_spend: f64,
     total_tokens: u64,
     request_count: u64,
+    local_estimate_trusted_for_budget_enforcement: bool,
+    max_context_fill_percent: Option<f64>,
+    failed_responses: u32,
+    incomplete_responses: u32,
+    unknown_responses: u32,
+    accounting_anomalies: u32,
+    model_mismatch: bool,
+}
+
+impl Default for SessionGuardState {
+    fn default() -> Self {
+        Self {
+            total_spend: 0.0,
+            total_tokens: 0,
+            request_count: 0,
+            local_estimate_trusted_for_budget_enforcement: true,
+            max_context_fill_percent: None,
+            failed_responses: 0,
+            incomplete_responses: 0,
+            unknown_responses: 0,
+            accounting_anomalies: 0,
+            model_mismatch: false,
+        }
+    }
 }
 
 static RUNTIME_STATE: LazyLock<Mutex<RuntimeState>> =
     LazyLock::new(|| Mutex::new(RuntimeState::new()));
-static SESSION_BUDGETS: LazyLock<DashMap<String, SessionBudgetState>> = LazyLock::new(DashMap::new);
+static SESSION_GUARD_STATES: LazyLock<DashMap<String, SessionGuardState>> =
+    LazyLock::new(DashMap::new);
 static POSTMORTEM_READY_SESSIONS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -311,9 +336,9 @@ fn warn_guard_policy_issues(issues: &[guard_policy::GuardPolicyIssue]) {
 
 /// Check if the current session has exceeded an explicit local policy before
 /// allowing the next request.
-fn check_session_budget(session_id: Option<&str>) -> Option<GuardBlockResponse> {
+fn check_session_guard(session_id: Option<&str>) -> Option<GuardBlockResponse> {
     let session_id = session_id?;
-    let state = SESSION_BUDGETS.get(session_id)?;
+    let state = SESSION_GUARD_STATES.get(session_id)?;
     let loaded = load_process_guard_policy();
     let mut evaluation = guard_policy::evaluate_guard_policy(
         &loaded.policy,
@@ -323,8 +348,14 @@ fn check_session_budget(session_id: Option<&str>) -> Option<GuardBlockResponse> 
             applies_to_next_request: true,
             session_total_tokens: Some(state.total_tokens),
             session_estimated_cost_dollars: Some(state.total_spend),
-            local_estimate_trusted_for_budget_enforcement: pricing::trusted_for_budget_enforcement(
-            ),
+            local_estimate_trusted_for_budget_enforcement: state
+                .local_estimate_trusted_for_budget_enforcement,
+            max_context_fill_percent: state.max_context_fill_percent,
+            failed_responses: state.failed_responses,
+            incomplete_responses: state.incomplete_responses,
+            unknown_responses: state.unknown_responses,
+            accounting_anomalies: state.accounting_anomalies,
+            model_mismatch: state.model_mismatch,
             cooldown: None,
         },
     );
@@ -2361,7 +2392,7 @@ fn finalize_codex_response(
 
 fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration: Duration) {
     let newly_started = upsert_codex_session(&outcome.accounting);
-    record_codex_runtime_counters(&outcome.accounting);
+    record_codex_runtime_counters(outcome);
     persist_codex_finalization_outcome(outcome);
     remember_codex_turn_and_emit_diagnosis(outcome);
 
@@ -2420,7 +2451,8 @@ fn apply_codex_finalization_outcome(outcome: &CodexFinalizationOutcome, duration
     }
 }
 
-fn record_codex_runtime_counters(accounting: &codex_accounting::CodexTurnAccounting) {
+fn record_codex_runtime_counters(outcome: &CodexFinalizationOutcome) {
+    let accounting = &outcome.accounting;
     let trusted_cost = accounting
         .pricing
         .trusted_for_budget_enforcement
@@ -2430,10 +2462,40 @@ fn record_codex_runtime_counters(accounting: &codex_accounting::CodexTurnAccount
     let session_id = accounting.identity.session_id.trim();
 
     if !session_id.is_empty() {
-        let mut session = SESSION_BUDGETS.entry(session_id.to_string()).or_default();
+        let mut session = SESSION_GUARD_STATES
+            .entry(session_id.to_string())
+            .or_default();
         session.total_spend += trusted_cost;
         session.total_tokens = session.total_tokens.saturating_add(accounting.total_tokens);
         session.request_count = session.request_count.saturating_add(1);
+        session.local_estimate_trusted_for_budget_enforcement &=
+            accounting.pricing.trusted_for_budget_enforcement;
+        session.max_context_fill_percent = Some(
+            session
+                .max_context_fill_percent
+                .unwrap_or(0.0)
+                .max(outcome.context_fill_percent),
+        );
+        match &accounting.status {
+            codex_accounting::CodexTurnStatus::Failed => {
+                session.failed_responses = session.failed_responses.saturating_add(1);
+            }
+            codex_accounting::CodexTurnStatus::Incomplete => {
+                session.incomplete_responses = session.incomplete_responses.saturating_add(1);
+            }
+            codex_accounting::CodexTurnStatus::Unknown => {
+                session.unknown_responses = session.unknown_responses.saturating_add(1);
+            }
+            codex_accounting::CodexTurnStatus::Completed => {}
+        }
+        session.accounting_anomalies = session
+            .accounting_anomalies
+            .saturating_add(accounting.anomalies.len().min(u32::MAX as usize) as u32);
+        if let Some(served) = accounting.served_model.as_ref() {
+            if served != &accounting.requested_model {
+                session.model_mismatch = true;
+            }
+        }
     }
 
     match RUNTIME_STATE.lock() {
@@ -3404,7 +3466,7 @@ fn repair_persisted_session_artifacts(conn: &Connection) -> rusqlite::Result<()>
 
 /// End a session: run diagnosis, broadcast SessionEnd, persist to DB, clean up.
 fn end_session(session_id: &str, _session_model: Option<String>, initial_prompt: Option<String>) {
-    SESSION_BUDGETS.remove(session_id);
+    SESSION_GUARD_STATES.remove(session_id);
     if let Some((_, turns)) = diagnosis::SESSION_TURNS.remove(session_id) {
         if turns.is_empty() {
             // No turns collected — still broadcast session end.
@@ -3974,7 +4036,7 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                         request_model_header = codex_observed_model_header.as_deref().unwrap_or(""),
                                         "ext_proc"
                                     );
-                                    if let Some(block) = check_session_budget(
+                                    if let Some(block) = check_session_guard(
                                         diagnosis::SESSIONS
                                             .get(&request_metadata.session_hash)
                                             .as_deref()
@@ -6193,14 +6255,14 @@ mod tests {
             super::codex_accounting::CodexTurnStatus::Completed
         );
         {
-            let budget_state = super::SESSION_BUDGETS
+            let budget_state = super::SESSION_GUARD_STATES
                 .get("phase-4b-session-005")
-                .expect("session budget state");
+                .expect("session guard state");
             assert_eq!(budget_state.total_tokens, outcome.accounting.total_tokens);
             assert_eq!(budget_state.request_count, 1);
         }
 
-        let _ = super::SESSION_BUDGETS.remove("phase-4b-session-005");
+        let _ = super::SESSION_GUARD_STATES.remove("phase-4b-session-005");
         let _ = diagnosis::SESSIONS.remove(&super::codex_request::fallback_session_hash(
             "",
             "phase-4b-session-005",
@@ -6214,7 +6276,7 @@ mod tests {
         std::env::set_var("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS", "1000");
         std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS");
         std::env::remove_var("CODEX_BLACKBOX_GUARD_POLICY_FILE");
-        let _ = super::SESSION_BUDGETS.remove(session_id);
+        let _ = super::SESSION_GUARD_STATES.remove(session_id);
 
         let request = parse_codex_fixture_request(session_id);
         let response = accumulate_codex_fixture_response(
@@ -6229,8 +6291,8 @@ mod tests {
             STANDARD_CONTEXT_WINDOW_TOKENS,
         );
 
-        super::record_codex_runtime_counters(&outcome.accounting);
-        let block = super::check_session_budget(Some(session_id)).expect("budget block");
+        super::record_codex_runtime_counters(&outcome);
+        let block = super::check_session_guard(Some(session_id)).expect("budget block");
 
         assert_eq!(block.error_type, "policy_block");
         let policy_block = block.policy_block.expect("policy facts");
@@ -6243,8 +6305,50 @@ mod tests {
         assert_eq!(policy_block.limit.as_deref(), Some("1000 tokens"));
         assert!(block.cooldown.is_none());
 
-        let _ = super::SESSION_BUDGETS.remove(session_id);
+        let _ = super::SESSION_GUARD_STATES.remove(session_id);
         std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS");
+    }
+
+    #[test]
+    fn runtime_session_guard_blocks_next_request_from_context_state() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let session_id = "phase-4b-session-context";
+        std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_TOKENS");
+        std::env::remove_var("CODEX_BLACKBOX_SESSION_BUDGET_DOLLARS");
+        std::env::remove_var("CODEX_BLACKBOX_GUARD_POLICY_FILE");
+        std::env::set_var("CODEX_BLACKBOX_CONTEXT_BLOCK_PERCENT", "80");
+        let _ = super::SESSION_GUARD_STATES.remove(session_id);
+
+        let request = parse_codex_fixture_request(session_id);
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-phase-4b-context",
+            &request,
+            &response,
+            Duration::from_millis(10),
+            1000,
+        );
+
+        super::record_codex_runtime_counters(&outcome);
+        let block = super::check_session_guard(Some(session_id)).expect("context block");
+
+        assert_eq!(block.error_type, "policy_block");
+        let policy_block = block.policy_block.expect("policy facts");
+        assert_eq!(policy_block.rule, "context_block_percent");
+        assert_eq!(policy_block.reason, "context threshold exceeded");
+        assert_eq!(policy_block.limit.as_deref(), Some("80.0%"));
+        assert_eq!(
+            policy_block.session_id.as_deref(),
+            Some("phase-4b-session-context")
+        );
+        assert!(block.message.contains("next request is sent"));
+        assert!(block.cooldown.is_none());
+
+        let _ = super::SESSION_GUARD_STATES.remove(session_id);
+        std::env::remove_var("CODEX_BLACKBOX_CONTEXT_BLOCK_PERCENT");
     }
 
     #[test]
@@ -7137,6 +7241,166 @@ mod tests {
             .pointer("/signals/provider_reported_total_tokens")
             .is_none());
         assert!(!body.contains("legacy session prompt should not appear"));
+    }
+
+    #[test]
+    fn postmortem_report_exposes_turn_flight_recorder_without_sensitive_fields() {
+        let conn = create_full_test_db();
+        insert_session(
+            &conn,
+            "postmortem-flight-recorder",
+            "2026-04-30T12:00:00Z",
+            Some("2026-04-30T12:00:05Z"),
+            "gpt-5.5",
+            Some("legacy prompt should not be in flight recorder"),
+        );
+
+        for (turn, status, requested, served, input, cached, output, reasoning, context, window) in [
+            (
+                1_i64,
+                "completed",
+                "gpt-5.5",
+                "gpt-5.5",
+                100_i64,
+                40_i64,
+                20_i64,
+                5_i64,
+                Some(0.10_f64),
+                Some(1000_i64),
+            ),
+            (
+                2,
+                "failed",
+                "gpt-5.5",
+                "gpt-5.4",
+                200,
+                50,
+                30,
+                6,
+                Some(0.20),
+                Some(1000),
+            ),
+            (
+                3,
+                "incomplete",
+                "gpt-5.5",
+                "gpt-5.5",
+                300,
+                100,
+                40,
+                7,
+                Some(0.30),
+                Some(1000),
+            ),
+            (
+                4, "unknown", "gpt-5.5", "gpt-5.5", 400, 150, 50, 8, None, None,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO turn_snapshots (
+                    session_id, turn_number, timestamp, input_tokens, cache_read_tokens,
+                    cache_creation_tokens, output_tokens, ttft_ms, tool_calls, tool_failures,
+                    gap_from_prev_secs, context_utilization, context_window_tokens,
+                    frustration_signals, requested_model, actual_model, response_summary,
+                    provider, codex_status, codex_input_tokens, codex_cached_input_tokens,
+                    codex_uncached_input_tokens, codex_output_tokens,
+                    codex_reasoning_output_tokens, codex_total_tokens, codex_prompt_excerpt,
+                    codex_tool_calls, codex_accounting_anomalies
+                ) VALUES (
+                    'postmortem-flight-recorder', ?1, ?2, ?3, 0, 0, ?4, 120,
+                    '[]', 0, 0.0, ?5, ?6, 0, ?7, ?8, NULL,
+                    'codex_responses', ?9, ?3, ?10, ?11, ?4, ?12, 999999,
+                    'secret prompt /Users/alice/private/repo', ?13, '[]'
+                )",
+                rusqlite::params![
+                    turn,
+                    format!("2026-04-30T12:00:0{turn}Z"),
+                    input,
+                    output,
+                    context,
+                    window,
+                    requested,
+                    served,
+                    status,
+                    cached,
+                    input - cached,
+                    reasoning,
+                    serde_json::json!([{
+                        "name": "shell",
+                        "input": "{\"command\":\"cat /Users/alice/private/repo/secret.txt\"}"
+                    }])
+                    .to_string(),
+                ],
+            )
+            .expect("insert flight recorder turn");
+        }
+
+        let report = postmortem::build_postmortem_report(
+            &conn,
+            postmortem::PostmortemTarget::Session("postmortem-flight-recorder".to_string()),
+            true,
+        )
+        .expect("postmortem report");
+        let rows = report
+            .get("flight_recorder")
+            .and_then(Value::as_array)
+            .expect("flight recorder rows");
+
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0].get("status").and_then(Value::as_str),
+            Some("completed")
+        );
+        assert_eq!(
+            rows[1].get("status").and_then(Value::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            rows[2].get("status").and_then(Value::as_str),
+            Some("incomplete")
+        );
+        assert_eq!(
+            rows[3].get("status").and_then(Value::as_str),
+            Some("unknown")
+        );
+        assert_eq!(
+            rows[1].get("model_mismatch").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            rows[1].get("served_model").and_then(Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            rows[0].get("uncached_input_tokens").and_then(Value::as_u64),
+            Some(60)
+        );
+        assert_eq!(
+            rows[0].get("local_total_tokens").and_then(Value::as_u64),
+            Some(120)
+        );
+        assert_eq!(
+            rows[0]
+                .get("reasoning_output_tokens")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        assert_eq!(
+            rows[0].get("context_fill_percent").and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert_eq!(
+            rows[0].get("context_window_tokens").and_then(Value::as_u64),
+            Some(1000)
+        );
+        assert!(rows[3].get("context_fill_percent").is_some());
+        assert!(rows[3].get("context_window_tokens").is_some());
+
+        let flight_body = serde_json::to_string(rows).expect("flight recorder json");
+        assert!(!flight_body.contains("secret prompt"));
+        assert!(!flight_body.contains("/Users/alice"));
+        assert!(!flight_body.contains("codex_tool_calls"));
+        assert!(!flight_body.contains("command"));
     }
 
     #[test]

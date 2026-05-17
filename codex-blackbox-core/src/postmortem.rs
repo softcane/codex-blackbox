@@ -117,6 +117,7 @@ pub(crate) fn build_postmortem_report(
     let redactor = Redactor::new(redact);
     let impact = impact_totals(&turns);
     let signals = build_signals(&turns);
+    let flight_recorder = build_flight_recorder(&turns);
     let evidence = build_evidence(&turns, &redactor);
     let timeline = build_timeline(&session, &turns, diagnosis.degraded, &redactor);
     let recommendations = build_recommendations(&diagnosis, &turns, &redactor);
@@ -163,6 +164,7 @@ pub(crate) fn build_postmortem_report(
             })),
         },
         "signals": signals,
+        "flight_recorder": flight_recorder,
         "evidence": evidence,
         "timeline": timeline,
         "recommendations": recommendations,
@@ -442,6 +444,44 @@ fn impact_totals(turns: &[TurnEvidence]) -> ImpactTotals {
             .saturating_add(turn.input_tokens.saturating_add(turn.output_tokens));
     }
     totals
+}
+
+fn build_flight_recorder(turns: &[TurnEvidence]) -> Vec<Value> {
+    turns
+        .iter()
+        .map(|turn| {
+            let model_mismatch = match (
+                turn.requested_model.as_deref(),
+                turn.served_model.as_deref(),
+            ) {
+                (Some(requested), Some(served)) => requested != served,
+                _ => false,
+            };
+            let context_fill_percent =
+                if turn.context_window_tokens.is_some() || turn.context_utilization > 0.0 {
+                    Some(round_percent(turn.context_utilization * 100.0))
+                } else {
+                    None
+                };
+            json!({
+                "turn": turn.turn_number,
+                "timestamp": turn.timestamp,
+                "status": turn.status,
+                "requested_model": turn.requested_model,
+                "served_model": turn.served_model,
+                "model_mismatch": model_mismatch,
+                "input_tokens": turn.input_tokens,
+                "cached_input_tokens": turn.cached_input_tokens,
+                "uncached_input_tokens": turn.uncached_input_tokens,
+                "output_tokens": turn.output_tokens,
+                "reasoning_output_tokens": turn.reasoning_output_tokens,
+                "local_total_tokens": turn.input_tokens.saturating_add(turn.output_tokens),
+                "context_fill_percent": context_fill_percent,
+                "context_window_tokens": turn.context_window_tokens,
+                "duration_ms": turn.duration_ms,
+            })
+        })
+        .collect()
 }
 
 fn build_summary(

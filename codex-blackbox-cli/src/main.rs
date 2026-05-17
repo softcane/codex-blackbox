@@ -2351,7 +2351,7 @@ impl DecisionSessionTracker {
             let facts = self
                 .facts
                 .entry("__codex_blackbox_cooldown__".to_string())
-                .or_insert_with(ObservedSessionFacts::default);
+                .or_default();
             facts.cooldown = Some(codex_blackbox_core::decision::CooldownFacts {
                 reason: reason.clone(),
                 retry_after_seconds: *retry_after_seconds,
@@ -3656,6 +3656,7 @@ fn guard_report_to_evidence(
 ) -> GuardEvidence {
     let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
     let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
+    let signals = report.get("signals").unwrap_or(&serde_json::Value::Null);
     let total_turns = summary
         .get("turn_count")
         .and_then(|value| value.as_u64())
@@ -3676,6 +3677,22 @@ fn guard_report_to_evidence(
             .get("local_estimate_trusted_for_budget_enforcement")
             .and_then(|value| value.as_bool())
             .unwrap_or(false),
+        max_context_fill_percent: signals
+            .get("context_fill")
+            .and_then(|context| context.get("max_percent"))
+            .and_then(|value| value.as_f64()),
+        failed_responses: status_count(report, "failed"),
+        incomplete_responses: status_count(report, "incomplete"),
+        unknown_responses: status_count(report, "unknown"),
+        accounting_anomalies: signals
+            .get("accounting_anomaly_count")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32,
+        model_mismatch: signals
+            .get("model_mismatches")
+            .and_then(|value| value.as_array())
+            .is_some_and(|items| !items.is_empty()),
         cooldown: guard_cooldown_evidence(guard_state),
     }
 }
@@ -4567,6 +4584,120 @@ fn postmortem_timeline_terminal_lines(report: &serde_json::Value) -> Vec<Postmor
         .collect()
 }
 
+fn postmortem_flight_model(row: &serde_json::Value) -> String {
+    match (
+        json_str(row, "requested_model"),
+        json_str(row, "served_model"),
+        row.get("model_mismatch")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+    ) {
+        (Some(requested), Some(served), true) => format!("{requested}->{served}"),
+        (Some(requested), _, _) => requested.to_string(),
+        (None, Some(served), _) => served.to_string(),
+        (None, None, _) => "unknown".to_string(),
+    }
+}
+
+fn postmortem_flight_tokens(row: &serde_json::Value) -> String {
+    let input = row
+        .get("input_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let cached = row
+        .get("cached_input_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let uncached = row
+        .get("uncached_input_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let output = row
+        .get("output_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let reasoning = row
+        .get("reasoning_output_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let total = row
+        .get("local_total_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(input.saturating_add(output));
+    format!(
+        "in {}, cached {}, uncached {}, out {}, reasoning {}, total {}",
+        format_tokens(input),
+        format_tokens(cached),
+        format_tokens(uncached),
+        format_tokens(output),
+        format_tokens(reasoning),
+        format_tokens(total)
+    )
+}
+
+fn postmortem_flight_context(row: &serde_json::Value) -> String {
+    let Some(percent) = row
+        .get("context_fill_percent")
+        .and_then(|value| value.as_f64())
+    else {
+        return "context unknown".to_string();
+    };
+    match row
+        .get("context_window_tokens")
+        .and_then(|value| value.as_u64())
+    {
+        Some(window) => format!("{percent:.1}% of {} window", format_tokens(window)),
+        None => format!("{percent:.1}%"),
+    }
+}
+
+fn postmortem_flight_duration(row: &serde_json::Value) -> String {
+    row.get("duration_ms")
+        .and_then(|value| value.as_u64())
+        .map(|duration| format!("{duration}ms"))
+        .unwrap_or_else(|| "duration unknown".to_string())
+}
+
+fn postmortem_flight_recorder_terminal_lines(
+    report: &serde_json::Value,
+) -> Vec<PostmortemTerminalLine> {
+    report
+        .get("flight_recorder")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .take(20)
+        .map(|row| {
+            let turn = row
+                .get("turn")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let status = json_str(row, "status").unwrap_or("unknown");
+            let model = postmortem_flight_model(row);
+            let tokens = postmortem_flight_tokens(row);
+            let context = postmortem_flight_context(row);
+            let duration = postmortem_flight_duration(row);
+            let plain =
+                format!("Turn {turn} | {status} | {model} | {tokens} | {context} | {duration}");
+            let styled = format!(
+                "{} {} {} {} {} {} {} {} {} {} {}",
+                format!("Turn {turn}").bright_white().bold(),
+                "|".bright_black(),
+                status.cyan(),
+                "|".bright_black(),
+                model.bright_white(),
+                "|".bright_black(),
+                tokens.bright_white(),
+                "|".bright_black(),
+                context.bright_cyan(),
+                "|".bright_black(),
+                duration.bright_black()
+            );
+            PostmortemTerminalLine::styled(plain, styled)
+        })
+        .collect()
+}
+
 fn postmortem_string_list_terminal_lines(
     report: &serde_json::Value,
     key: &str,
@@ -4665,6 +4796,12 @@ fn print_postmortem_terminal_report(report: &serde_json::Value, color_mode: Colo
         "Checks",
         &postmortem_signals_terminal_lines(report, content_width),
         signal_tone,
+        width,
+    );
+    print_postmortem_section(
+        "Flight Recorder",
+        &postmortem_flight_recorder_terminal_lines(report),
+        PostmortemTone::Info,
         width,
     );
     print_postmortem_section(
@@ -4799,6 +4936,9 @@ fn postmortem_column_widths(headers: &[&str]) -> Vec<usize> {
         ["Kind", "Check", "Turn", "Detail"] => vec![10, 28, 5, 0],
         ["Time", "Event", "Detail"] => vec![20, 18, 0],
         ["Time", "Step", "Detail"] => vec![20, 18, 0],
+        ["Turn", "Time", "Status", "Model", "Tokens", "Context", "Duration"] => {
+            vec![6, 20, 10, 18, 34, 18, 0]
+        }
         _ => headers
             .iter()
             .enumerate()
@@ -4881,6 +5021,7 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
     out.push_str("# Codex Session Report\n\n");
     render_postmortem_snapshot(report, &mut out);
     render_postmortem_signals(report, &mut out);
+    render_postmortem_flight_recorder(report, &mut out);
     render_postmortem_evidence(report, &mut out);
     render_postmortem_timeline(report, &mut out);
     render_postmortem_recommendations(report, &mut out);
@@ -4896,6 +5037,43 @@ fn render_postmortem_markdown(report: &serde_json::Value) -> String {
         out.push_str("\n```\n");
     }
     out
+}
+
+fn render_postmortem_flight_recorder(report: &serde_json::Value, out: &mut String) {
+    let rows = report
+        .get("flight_recorder")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str("\n## Flight Recorder\n");
+    let headers = [
+        "Turn", "Time", "Status", "Model", "Tokens", "Context", "Duration",
+    ];
+    push_postmortem_table_header(out, &headers);
+    for row in rows.iter().take(20) {
+        let turn = row
+            .get("turn")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let timestamp = json_str(row, "timestamp").unwrap_or("");
+        let status = json_str(row, "status").unwrap_or("unknown");
+        push_postmortem_table_row(
+            out,
+            &headers,
+            &[
+                turn.to_string(),
+                timestamp.to_string(),
+                status.to_string(),
+                postmortem_flight_model(row),
+                postmortem_flight_tokens(row),
+                postmortem_flight_context(row),
+                postmortem_flight_duration(row),
+            ],
+        );
+    }
 }
 
 fn render_postmortem_snapshot(report: &serde_json::Value, out: &mut String) {
@@ -6007,6 +6185,7 @@ mod tests {
             &codex_blackbox_core::guard_policy::GuardPolicy {
                 session_token_budget: Some(120_000),
                 session_cost_budget_dollars: None,
+                ..Default::default()
             },
             Vec::new(),
             None,
@@ -6031,6 +6210,63 @@ mod tests {
                 .pointer("/policy_block/session_id")
                 .and_then(|v| v.as_str()),
             Some("session_guard")
+        );
+    }
+
+    #[test]
+    fn guard_postmortem_report_maps_codex_native_policy_block_to_decision_json() {
+        let report = serde_json::json!({
+            "session_id": "session_guard",
+            "partial": false,
+            "summary": {"turn_count": 3},
+            "impact": {
+                "local_total_tokens": 125000,
+                "local_estimated_cost_dollars": 2.50,
+                "local_estimate_trusted_for_budget_enforcement": false
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 3,
+                    "failed": 0,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 90.0},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": null}
+        });
+        let decision = guard_report_to_decision(
+            &report,
+            &codex_blackbox_core::guard_policy::GuardPolicy {
+                session_cost_budget_dollars: Some(1.00),
+                context_block_percent: Some(85.0),
+                ..Default::default()
+            },
+            Vec::new(),
+            None,
+        );
+        let rendered = render_decision_footer_json(&decision).expect("guard json");
+
+        assert_no_ansi(&rendered);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("guard decision");
+        assert_eq!(value.get("state").and_then(|v| v.as_str()), Some("blocked"));
+        assert_eq!(
+            value.pointer("/policy_block/rule").and_then(|v| v.as_str()),
+            Some("context_block_percent")
+        );
+        assert_eq!(
+            value
+                .pointer("/policy_block/current")
+                .and_then(|v| v.as_str()),
+            Some("90.0%")
+        );
+        assert_eq!(
+            value
+                .pointer("/policy_block/limit")
+                .and_then(|v| v.as_str()),
+            Some("85.0%")
         );
     }
 

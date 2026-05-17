@@ -678,6 +678,25 @@ fn postmortem_command_renders_colored_human_terminal_report_from_api() {
             "reasoning_output_share": {"max_ratio": 0.25},
             "tool_call_intent_counts": {"read_file": 1}
           },
+          "flight_recorder": [
+            {
+              "turn": 2,
+              "timestamp": "2026-04-30T12:00:05Z",
+              "status": "incomplete",
+              "requested_model": "gpt-5.5",
+              "served_model": "gpt-5.5",
+              "model_mismatch": false,
+              "input_tokens": 900,
+              "cached_input_tokens": 300,
+              "uncached_input_tokens": 600,
+              "output_tokens": 64,
+              "reasoning_output_tokens": 16,
+              "local_total_tokens": 964,
+              "context_fill_percent": 12.5,
+              "context_window_tokens": 7200,
+              "duration_ms": 42
+            }
+          ],
           "evidence": [
             {"type": "direct", "signal": "codex_response_incomplete", "turn": 2, "timestamp": "2026-04-30T12:00:05Z", "detail": "max_output_tokens"}
           ],
@@ -706,6 +725,7 @@ fn postmortem_command_renders_colored_human_terminal_report_from_api() {
     assert!(out.contains("\u{250c}\u{2500}[ Codex Session Report ]"));
     assert!(out.contains("[ At a Glance ]"));
     assert!(out.contains("[ Checks ]"));
+    assert!(out.contains("[ Flight Recorder ]"));
     assert!(out.contains("[ What Triggered This ]"));
     assert!(out.contains("[ Timeline ]"));
     assert!(out.contains("[ Next Steps ]"));
@@ -719,6 +739,9 @@ fn postmortem_command_renders_colored_human_terminal_report_from_api() {
     assert!(out.contains("untrusted - dollar budgets stay advisory"));
     assert!(out.contains("Tool requests"));
     assert!(out.contains("read_file: 1"));
+    assert!(out.contains("Turn 2"));
+    assert!(out.contains("incomplete"));
+    assert!(out.contains("12.5%"));
     assert!(out.contains("response stopped incomplete"));
     assert!(out.contains("hit max_output_tokens"));
     assert!(!out.contains("Tool-call intent"));
@@ -753,6 +776,25 @@ fn postmortem_command_supports_no_redact_and_output_file() {
             "local_estimated_cost_dollars": 0.01
           },
           "signals": {"response_statuses": {"completed": 1}},
+          "flight_recorder": [
+            {
+              "turn": 1,
+              "timestamp": "2026-04-30T12:00:01Z",
+              "status": "completed",
+              "requested_model": "gpt-5.5",
+              "served_model": "gpt-5.4",
+              "model_mismatch": true,
+              "input_tokens": 10,
+              "cached_input_tokens": 4,
+              "uncached_input_tokens": 6,
+              "output_tokens": 2,
+              "reasoning_output_tokens": 0,
+              "local_total_tokens": 12,
+              "context_fill_percent": null,
+              "context_window_tokens": null,
+              "duration_ms": 5
+            }
+          ],
           "evidence": [],
           "timeline": [],
           "recommendations": ["Continue."],
@@ -784,6 +826,8 @@ fn postmortem_command_supports_no_redact_and_output_file() {
     assert!(markdown.contains("# Codex Session Report"));
     assert!(markdown.contains("partial - session may still be running"));
     assert!(markdown.contains("## At a Glance"));
+    assert!(markdown.contains("## Flight Recorder"));
+    assert!(markdown.contains("gpt-5.5->gpt-5.4"));
     assert!(markdown.contains("## Next Steps"));
 
     let _ = fs::remove_dir_all(dir);

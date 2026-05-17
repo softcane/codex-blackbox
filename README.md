@@ -72,6 +72,7 @@ Codex Blackbox records model-turn evidence observed through the local proxy:
 - context usage and accounting anomalies
 - model-side tool requests
 - a redacted prompt excerpt and response summary when available
+- a per-turn Flight Recorder row for compact postmortem review
 
 Cached input is counted as part of input tokens. Reasoning tokens are output
 detail. Unknown model pricing stays unpriced.
@@ -91,6 +92,11 @@ Example terminal output:
 │ Result    Likely Completed; 3 turns                                      │
 │ Model     gpt-5.5                                                        │
 │ Usage     54841 local tokens; estimated $0.10                            │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─[ Flight Recorder ]──────────────────────────────────────────────────────┐
+│ Turn 1 | completed | gpt-5.5 | in 12K, cached 0, uncached 12K, out 1K... │
+│ Turn 2 | incomplete | gpt-5.5 | in 80K, cached 52K, uncached 28K...      │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌─[ Next Steps ]────────────────────────────────────────────────────────────┐
@@ -147,6 +153,32 @@ codex-blackbox guard --json
 
 Guard policies are checked before the next request is sent. A response already
 in progress continues streaming.
+
+Supported policy fields:
+
+```toml
+session_token_budget = 200000
+session_cost_budget_dollars = 10.00
+
+context_warn_percent = 70
+context_block_percent = 85
+
+failed_response_warn_count = 1
+failed_response_block_count = 1
+incomplete_response_warn_count = 1
+incomplete_response_block_count = 1
+unknown_response_warn_count = 1
+unknown_response_block_count = 1
+accounting_anomaly_warn_count = 1
+accounting_anomaly_block_count = 1
+
+model_mismatch_warn = true
+model_mismatch_block = false
+```
+
+Dollar budgets block only when local pricing is trusted for budget enforcement.
+When pricing is unknown or untrusted, dollar policy is advisory and other
+trusted non-dollar rules can still block the next request.
 
 If a guard policy file fails to load, Codex Blackbox reports the policy problem
 and stays fail-open.

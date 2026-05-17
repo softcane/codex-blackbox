@@ -546,6 +546,7 @@ assert_postmortem_api() {
         assert_file_contains "$output_path" "\"report_type\": \"codex_responses_postmortem\"" "postmortem API returns Codex report for $case_name"
         assert_file_contains "$output_path" "\"$status\": 1" "postmortem API reports $status status for $case_name"
         assert_file_contains "$output_path" "\"redacted\": true" "postmortem API defaults to redacted report for $case_name"
+        assert_file_contains "$output_path" "\"flight_recorder\"" "postmortem API includes flight recorder for $case_name"
         assert_file_contains "$output_path" "\"input_tokens\"" "postmortem API includes token impact for $case_name"
         assert_file_contains "$output_path" "\"cached_input_tokens\"" "postmortem API includes cached input impact for $case_name"
         case "$fixture" in
