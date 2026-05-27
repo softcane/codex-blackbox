@@ -30,6 +30,7 @@ docker-compose.override.yml
 
 # Internal planning docs and external agent/runtime state
 internal_docs/
+docs_internal/
 doc_internal/
 docs/internal/
 docs/
@@ -37,6 +38,7 @@ wiki/*
 CLAUDE.md
 .claude/
 .omx/
+reference/
 
 # Temporary OpenAI harness work
 test/harness-*.sh

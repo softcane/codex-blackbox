@@ -27,6 +27,7 @@ async-stream = "0.3"
 futures-core = "0.3"
 prometheus = "0.13"
 toml = "0.8"
+zstd = "0.13"
 
 [build-dependencies]
 tonic-build = "0.11"

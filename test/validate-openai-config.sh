@@ -19,6 +19,12 @@ docker compose -f docker-compose.yml config >/tmp/codex-blackbox-codex-compose-c
 rg -n 'failure_mode_allow:\s*true' envoy/envoy.yaml >/dev/null
 rg -n 'request_body_mode:\s*BUFFERED' envoy/envoy.yaml >/dev/null
 rg -n 'response_body_mode:\s*STREAMED' envoy/envoy.yaml >/dev/null
+rg -n 'status:\s*426' envoy/envoy.yaml >/dev/null
+rg -n 'upgrade' envoy/envoy.yaml >/dev/null
+rg -n 'upgrade:\s*"%REQ\(UPGRADE\)%"' envoy/envoy.yaml test/envoy.openai-responses.e2e.yaml >/dev/null
+rg -n 'prefix:\s*"/backend-api/codex/responses/compact"' envoy/envoy.yaml >/dev/null
+rg -n 'type\.googleapis\.com/envoy\.extensions\.filters\.http\.ext_proc\.v3\.ExtProcPerRoute' envoy/envoy.yaml >/dev/null
+rg -n 'disabled:\s*true' envoy/envoy.yaml >/dev/null
 rg -n 'prefix:\s*"/backend-api"' envoy/envoy.yaml >/dev/null
 rg -n 'host_rewrite_literal:\s*chatgpt\.com' envoy/envoy.yaml >/dev/null
 rg -n 'address:\s*chatgpt\.com' envoy/envoy.yaml >/dev/null

@@ -76,6 +76,45 @@ fn serve_response_once(status: u16, body: &str) -> (String, mpsc::Receiver<Strin
     (url, rx)
 }
 
+fn serve_response_sequence(responses: Vec<(u16, String)>) -> (String, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let n = stream.read(&mut buffer).expect("read request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..n]);
+                if request_is_complete(&request) {
+                    break;
+                }
+            }
+
+            tx.send(String::from_utf8_lossy(&request).into_owned())
+                .expect("send captured request");
+
+            write!(
+                stream,
+                "HTTP/1.1 {} {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                status,
+                if status < 400 { "OK" } else { "ERROR" },
+                body.len(),
+                body
+            )
+            .expect("write response");
+        }
+    });
+
+    (url, rx)
+}
+
 fn request_is_complete(request: &[u8]) -> bool {
     let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
         return false;
@@ -97,6 +136,15 @@ fn request_is_complete(request: &[u8]) -> bool {
 fn captured_request(rx: mpsc::Receiver<String>) -> String {
     rx.recv_timeout(Duration::from_secs(2))
         .expect("captured HTTP request")
+}
+
+fn captured_requests(rx: mpsc::Receiver<String>, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("captured HTTP request")
+        })
+        .collect()
 }
 
 fn unique_test_dir(label: &str) -> PathBuf {
@@ -130,7 +178,10 @@ fn top_level_help_exposes_user_workflows() {
     assert!(out.contains("recall"));
     assert!(out.contains("postmortem"));
     assert!(out.contains("reconcile"));
+    assert!(out.contains("coach"));
+    assert!(out.contains("baseline"));
     assert!(out.contains("config"));
+    assert!(out.contains("ui"));
 }
 
 #[test]
@@ -171,6 +222,539 @@ fn config_codex_prints_read_only_future_override() {
     assert!(out.contains("CODEX_THREAD_ID"));
     assert!(out.contains("Codex CLI mode requires an existing Codex ChatGPT login"));
     assert!(!out.contains("model_providers.codex-blackbox-openai"));
+}
+
+#[test]
+fn ui_enable_dry_run_prints_exact_config_without_mutating_files() {
+    let dir = unique_test_dir("ui-enable-dry-run");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    fs::write(&config_path, "model = \"gpt-5\"\n").expect("write config");
+
+    let output = codex_blackbox_with_env(
+        &["ui", "enable", "--dry-run"],
+        &[
+            (
+                "CODEX_BLACKBOX_CODEX_CONFIG",
+                config_path.to_str().expect("utf8 config"),
+            ),
+            (
+                "CODEX_BLACKBOX_UI_STATE_DIR",
+                state_dir.to_str().expect("utf8 state"),
+            ),
+        ],
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Codex Blackbox UI enable preview"));
+    assert!(out.contains("Dry run: no files modified"));
+    assert!(out.contains(config_path.to_str().expect("utf8 config")));
+    assert!(out.contains(r#"openai_base_url = "http://127.0.0.1:10000/backend-api/codex""#));
+    assert!(out.contains("[features]"));
+    assert!(out.contains("enable_request_compression = false"));
+    assert!(!out.contains(r#"chatgpt_base_url = "http://127.0.0.1:10000/backend-api""#));
+    assert!(!out.contains(r#"model_provider = "codex-blackbox-chatgpt""#));
+    assert!(!out.contains("[model_providers.codex-blackbox-chatgpt]"));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read config"),
+        "model = \"gpt-5\"\n"
+    );
+    assert!(!state_dir.exists());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_enable_and_disable_round_trip_through_temp_config() {
+    let dir = unique_test_dir("ui-enable-disable");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let original = "model = \"gpt-5\"\nmodel_provider = \"openai\"\n";
+    fs::write(&config_path, original).expect("write config");
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+    ];
+
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    assert!(stdout(&enable).contains("Codex Blackbox UI mode enabled"));
+    let enabled = fs::read_to_string(&config_path).expect("read enabled");
+    assert!(enabled.contains(r#"model_provider = "openai""#));
+    assert!(enabled.contains(r#"openai_base_url = "http://127.0.0.1:10000/backend-api/codex""#));
+    assert!(enabled.contains("enable_request_compression = false"));
+    assert!(!enabled.contains("codex-blackbox-chatgpt"));
+    assert!(state_dir.join("codex-ui-state.json").is_file());
+
+    let disable = codex_blackbox_with_env(&["ui", "disable"], &envs);
+    assert!(disable.status.success(), "stderr:\n{}", stderr(&disable));
+    assert!(stdout(&disable).contains("Codex Blackbox UI mode disabled"));
+    let disabled = fs::read_to_string(&config_path).expect("read disabled");
+    assert!(disabled.contains("model = \"gpt-5\""));
+    assert!(disabled.contains("model_provider = \"openai\""));
+    assert!(!disabled.contains("codex-blackbox-chatgpt"));
+    assert!(!state_dir.join("codex-ui-state.json").exists());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_status_json_reports_not_configured_without_touching_real_config() {
+    let dir = unique_test_dir("ui-status-missing");
+    let config_path = dir.join("missing-config.toml");
+    let state_dir = dir.join("state");
+
+    let output = codex_blackbox_with_env(
+        &["ui", "status", "--json"],
+        &[
+            (
+                "CODEX_BLACKBOX_CODEX_CONFIG",
+                config_path.to_str().expect("utf8 config"),
+            ),
+            (
+                "CODEX_BLACKBOX_UI_STATE_DIR",
+                state_dir.to_str().expect("utf8 state"),
+            ),
+            ("CODEX_BLACKBOX_UI_SKIP_PROCESS_DETECTION", "1"),
+        ],
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("not_configured")
+    );
+    assert_eq!(
+        value
+            .pointer("/config/config_exists")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert!(!config_path.exists());
+    assert!(!state_dir.exists());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_doctor_json_reports_missing_config_stack_readiness_and_restart_warning() {
+    let dir = unique_test_dir("ui-doctor");
+    let config_path = dir.join("missing-config.toml");
+    let state_dir = dir.join("state");
+    let (url, request_rx) = serve_response_once(200, "ok");
+
+    let output = codex_blackbox_with_env(
+        &["ui", "doctor", "--json", "--url", &url],
+        &[
+            (
+                "CODEX_BLACKBOX_CODEX_CONFIG",
+                config_path.to_str().expect("utf8 config"),
+            ),
+            (
+                "CODEX_BLACKBOX_UI_STATE_DIR",
+                state_dir.to_str().expect("utf8 state"),
+            ),
+            (
+                "CODEX_BLACKBOX_UI_PROCESS_FIXTURE",
+                "102 /usr/local/bin/codex app-server --port 1234",
+            ),
+        ],
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("GET /health "),
+        "unexpected request:\n{request}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("doctor json");
+    assert_eq!(
+        value.pointer("/config/status").and_then(|v| v.as_str()),
+        Some("not_configured")
+    );
+    assert_eq!(
+        value.get("core_ready").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value.get("restart_required").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value
+            .pointer("/active_app_server_processes/0/pid")
+            .and_then(|v| v.as_u64()),
+        Some(102)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_doctor_json_reports_configured_state() {
+    let dir = unique_test_dir("ui-doctor-configured");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        ("CODEX_BLACKBOX_UI_SKIP_PROCESS_DETECTION", "1"),
+        ("CODEX_BLACKBOX_UI_SKIP_ENVOY_LOG_DETECTION", "1"),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, _request_rx) = serve_response_once(200, "ok");
+
+    let output = codex_blackbox_with_env(&["ui", "doctor", "--json", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("doctor json");
+    assert_eq!(
+        value.pointer("/config/status").and_then(|v| v.as_str()),
+        Some("configured")
+    );
+    assert_eq!(
+        value
+            .pointer("/config/state_exists")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value.get("restart_required").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_smoke_is_guided_and_does_not_start_live_model_traffic() {
+    let output = codex_blackbox(&["ui", "smoke"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("guided"));
+    assert!(out.contains("No live model traffic"));
+    assert!(out.contains("provider=\"codex_responses\""));
+}
+
+#[test]
+fn ui_status_json_reports_configured_unobserved_from_core_observation_api() {
+    let dir = unique_test_dir("ui-status-unobserved");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        ("CODEX_BLACKBOX_UI_SKIP_PROCESS_DETECTION", "1"),
+        ("CODEX_BLACKBOX_UI_SKIP_ENVOY_LOG_DETECTION", "1"),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_json_once(
+        r#"{"provider":"codex_responses","request_count":0,"latest_request_rowid":0,"matched":false}"#,
+    );
+
+    let output = codex_blackbox_with_env(&["ui", "status", "--json", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("POST /api/observations/codex "),
+        "unexpected request:\n{request}"
+    );
+    assert!(request.contains(r#""after_request_rowid":0"#));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("configured_unobserved")
+    );
+    assert_eq!(
+        value.get("core_ready").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value
+            .get("observed_codex_responses")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_status_json_reports_websocket_only_when_ui_reaches_proxy_without_http_fallback() {
+    let dir = unique_test_dir("ui-status-websocket-only");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envoy_logs = r#"{"status":426,"method":"GET","path":"/backend-api/codex/responses","upgrade":"websocket"}"#;
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_PROCESS_FIXTURE",
+            "102 /usr/local/bin/codex app-server --port 1234",
+        ),
+        ("CODEX_BLACKBOX_UI_ENVOY_LOG_FIXTURE", envoy_logs),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_json_once(
+        r#"{"provider":"codex_responses","request_count":0,"latest_request_rowid":0,"matched":false}"#,
+    );
+
+    let output = codex_blackbox_with_env(&["ui", "status", "--json", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("POST /api/observations/codex "),
+        "unexpected request:\n{request}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("websocket_only_unobservable")
+    );
+    assert_eq!(
+        value
+            .get("recent_http_responses_post")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        value
+            .get("recent_websocket_upgrade_required")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value
+            .get("observed_codex_responses")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_status_json_reports_http_unparsed_when_proxy_sees_post_without_core_evidence() {
+    let dir = unique_test_dir("ui-status-http-unparsed");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envoy_logs =
+        r#"{"status":200,"method":"POST","path":"/backend-api/codex/responses","upgrade":""}"#;
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_PROCESS_FIXTURE",
+            "102 /usr/local/bin/codex app-server --port 1234",
+        ),
+        ("CODEX_BLACKBOX_UI_ENVOY_LOG_FIXTURE", envoy_logs),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_json_once(
+        r#"{"provider":"codex_responses","request_count":0,"latest_request_rowid":0,"matched":false}"#,
+    );
+
+    let output = codex_blackbox_with_env(&["ui", "status", "--json", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("POST /api/observations/codex "),
+        "unexpected request:\n{request}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("http_responses_unparsed")
+    );
+    assert_eq!(
+        value
+            .get("recent_http_responses_post")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        value
+            .get("recent_websocket_upgrade_required")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        value
+            .get("observed_codex_responses")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_status_json_does_not_treat_fake_fixture_sessions_as_live_ui_evidence() {
+    let dir = unique_test_dir("ui-status-fake-fixture");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        ("CODEX_BLACKBOX_UI_SKIP_PROCESS_DETECTION", "1"),
+        ("CODEX_BLACKBOX_UI_SKIP_ENVOY_LOG_DETECTION", "1"),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_response_sequence(vec![
+        (
+            200,
+            r#"{"provider":"codex_responses","request_count":1,"latest_request_rowid":9,"matched":true}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"sessions":[{"session_id":"fake-full-e2e-session","started_at":"2099-01-01T00:00:00Z","model":"gpt-codex-fixture"}]}"#
+                .to_string(),
+        ),
+    ]);
+
+    let output = codex_blackbox_with_env(&["ui", "status", "--json", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let requests = captured_requests(request_rx, 2);
+    assert!(requests[0].starts_with("POST /api/observations/codex "));
+    assert!(requests[1].starts_with("GET /api/sessions?limit=20&days=30 "));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("configured_unobserved")
+    );
+    assert_eq!(
+        value
+            .get("observed_codex_responses")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_status_json_reports_recent_observed_traffic_from_core_fixtures() {
+    let dir = unique_test_dir("ui-status-recent");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        ("CODEX_BLACKBOX_UI_SKIP_PROCESS_DETECTION", "1"),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_response_sequence(vec![
+        (
+            200,
+            r#"{"provider":"codex_responses","request_count":1,"latest_request_rowid":9,"matched":true}"#
+                .to_string(),
+        ),
+        (
+            200,
+            r#"{"sessions":[{"session_id":"session_ui","started_at":"2099-01-01T00:00:00Z"}]}"#
+                .to_string(),
+        ),
+    ]);
+
+    let output = codex_blackbox_with_env(
+        &[
+            "ui",
+            "status",
+            "--json",
+            "--url",
+            &url,
+            "--recent-seconds",
+            "9999999999",
+        ],
+        &envs,
+    );
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let requests = captured_requests(request_rx, 2);
+    assert!(requests[0].starts_with("POST /api/observations/codex "));
+    assert!(requests[1].starts_with("GET /api/sessions?limit=20&days=30 "));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).expect("status json");
+    assert_eq!(
+        value.get("state").and_then(|v| v.as_str()),
+        Some("observing_recent_ui_traffic")
+    );
+    assert_eq!(
+        value
+            .get("observed_codex_responses")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ui_launch_dry_run_renders_safe_platform_action() {
+    let output = codex_blackbox(&["ui", "launch", "--dry-run"]);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("Codex Blackbox UI launch preview"));
+    assert!(
+        out.contains("No processes will be killed or restarted") || out.contains("unsupported")
+    );
+    assert!(!out.to_ascii_lowercase().contains("kill -"));
 }
 
 #[test]
@@ -324,6 +908,135 @@ fn postmortem_help_documents_color_option() {
     assert!(out.contains("--color"));
     assert!(out.contains("--no-redact"));
     assert!(out.contains("--output"));
+}
+
+#[test]
+fn coach_install_status_and_uninstall_round_trip_through_temp_hooks_file() {
+    let dir = unique_test_dir("coach-hooks");
+    let hooks_file = dir.join(".codex").join("hooks.json");
+
+    let preview = codex_blackbox(&[
+        "coach",
+        "preview",
+        "--hooks-file",
+        hooks_file.to_str().expect("utf8 hooks"),
+    ]);
+    assert!(preview.status.success(), "stderr:\n{}", stderr(&preview));
+    assert!(!hooks_file.exists());
+    assert!(stdout(&preview).contains("PreToolUse"));
+
+    let install = codex_blackbox(&[
+        "coach",
+        "install",
+        "--hooks-file",
+        hooks_file.to_str().expect("utf8 hooks"),
+    ]);
+    assert!(install.status.success(), "stderr:\n{}", stderr(&install));
+    let installed = fs::read_to_string(&hooks_file).expect("read hooks");
+    assert!(installed.contains("codex-blackbox coach handle"));
+    assert!(installed.contains("UserPromptSubmit"));
+
+    let status = codex_blackbox(&[
+        "coach",
+        "status",
+        "--json",
+        "--hooks-file",
+        hooks_file.to_str().expect("utf8 hooks"),
+    ]);
+    assert!(status.status.success(), "stderr:\n{}", stderr(&status));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&status)).expect("status json");
+    assert_eq!(
+        value.get("installed_handlers").and_then(|v| v.as_u64()),
+        Some(4)
+    );
+
+    let uninstall = codex_blackbox(&[
+        "coach",
+        "uninstall",
+        "--hooks-file",
+        hooks_file.to_str().expect("utf8 hooks"),
+    ]);
+    assert!(
+        uninstall.status.success(),
+        "stderr:\n{}",
+        stderr(&uninstall)
+    );
+    assert!(!fs::read_to_string(&hooks_file)
+        .expect("read hooks")
+        .contains("codex-blackbox coach handle"));
+}
+
+#[test]
+fn coach_handle_posts_hook_payload_and_fails_open_with_json() {
+    let (url, request_rx) = serve_json_once(
+        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"blocked"}}"#,
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codex-blackbox"))
+        .args(["coach", "handle", "--url", &url])
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn coach handle");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(br#"{"hook_event_name":"PreToolUse","tool_name":"Bash"}"#)
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("coach output");
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(request.starts_with("POST /api/coach/hook "));
+    assert!(stdout(&output).contains("permissionDecision"));
+}
+
+#[test]
+fn baseline_disable_show_and_reset_are_derived_only() {
+    let dir = unique_test_dir("baseline");
+    let state = dir.join("baseline.json");
+
+    let disable = codex_blackbox(&[
+        "baseline",
+        "disable",
+        "--state",
+        state.to_str().expect("utf8 baseline"),
+    ]);
+    assert!(disable.status.success(), "stderr:\n{}", stderr(&disable));
+    let raw = fs::read_to_string(&state).expect("read baseline");
+    assert!(raw.contains("derived_only"));
+    for forbidden in [
+        "raw_prompt",
+        "raw_output",
+        "raw_command",
+        "raw_path",
+        "secret_value",
+    ] {
+        assert!(
+            !raw.contains(&format!("\"{forbidden}\"")),
+            "baseline must not store field {forbidden}"
+        );
+    }
+
+    let show = codex_blackbox(&[
+        "baseline",
+        "show",
+        "--json",
+        "--state",
+        state.to_str().expect("utf8 baseline"),
+    ]);
+    assert!(show.status.success(), "stderr:\n{}", stderr(&show));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&show)).expect("baseline json");
+    assert_eq!(value.get("enabled").and_then(|v| v.as_bool()), Some(false));
+
+    let reset = codex_blackbox(&[
+        "baseline",
+        "reset",
+        "--state",
+        state.to_str().expect("utf8 baseline"),
+    ]);
+    assert!(reset.status.success(), "stderr:\n{}", stderr(&reset));
+    assert!(!state.exists());
 }
 
 #[test]

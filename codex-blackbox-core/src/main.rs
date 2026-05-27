@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{LazyLock, Mutex};
@@ -50,6 +51,7 @@ pub mod envoy {
     }
 }
 
+pub mod coach;
 pub mod codex_accounting;
 pub mod codex_request;
 pub mod codex_response;
@@ -565,11 +567,26 @@ CREATE TABLE IF NOT EXISTS billing_reconciliations (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
+CREATE TABLE IF NOT EXISTS coach_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT,
+    turn_id             TEXT,
+    timestamp           TEXT NOT NULL,
+    evidence_source     TEXT NOT NULL,
+    category            TEXT NOT NULL,
+    reason_code         TEXT,
+    privacy             TEXT NOT NULL,
+    confidence          TEXT NOT NULL,
+    payload_summary     TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turn_snapshots(session_id, turn_number);
 CREATE INDEX IF NOT EXISTS idx_diagnoses_completed ON session_diagnoses(completed_at);
 CREATE INDEX IF NOT EXISTS idx_session_recall_session ON session_recall(session_id);
 CREATE INDEX IF NOT EXISTS idx_billing_reconciliations_session_imported
     ON billing_reconciliations(session_id, imported_at DESC);
+CREATE INDEX IF NOT EXISTS idx_coach_events_session_time
+    ON coach_events(session_id, timestamp);
 ";
 
 struct RecordCodexTurnCommand {
@@ -1006,6 +1023,116 @@ fn initialize_persistence_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+fn insert_coach_event(conn: &Connection, event: &coach::NormalizedEvent) -> rusqlite::Result<()> {
+    let payload_summary =
+        serde_json::to_string(&event.payload_summary).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "INSERT INTO coach_events (
+            session_id, turn_id, timestamp, evidence_source, category,
+            reason_code, privacy, confidence, payload_summary
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            &event.session_id,
+            &event.turn_id,
+            &event.timestamp,
+            event.evidence_source.as_str(),
+            event.category.as_str(),
+            &event.reason_code,
+            serde_json::to_value(event.privacy)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "derived_private".to_string()),
+            serde_json::to_value(event.confidence)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "high".to_string()),
+            payload_summary,
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_proxy_coach_events(
+    conn: &Connection,
+    timestamp: &str,
+    session_id: &str,
+    status: &str,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    context_utilization: f64,
+    tool_calls_json: &str,
+    trusted_for_budget_enforcement: bool,
+    turn_number: u32,
+) {
+    let context_fill_percent = Some((context_utilization * 100.0).clamp(0.0, 100.0));
+    let turn_id = format!("turn_{turn_number}");
+    let turn_event = coach::proxy_turn_event(
+        timestamp.to_string(),
+        session_id.to_string(),
+        turn_id.clone(),
+        status,
+        coach::TokenTotals {
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            local_total_tokens: total_tokens,
+        },
+        context_fill_percent,
+    );
+    let _ = insert_coach_event(conn, &turn_event);
+
+    if let Some(fill) = context_fill_percent.filter(|fill| *fill >= 70.0) {
+        let event = coach::NormalizedEvent::new(
+            timestamp.to_string(),
+            coach::EvidenceSource::Proxy,
+            coach::EventCategory::ContextPressureObserved,
+        )
+        .with_session(session_id.to_string())
+        .with_turn(turn_id.clone())
+        .with_reason(if fill >= 85.0 {
+            "high_context_stop"
+        } else {
+            "high_context_careful"
+        })
+        .with_payload_value("fill_percent", serde_json::json!(fill));
+        let _ = insert_coach_event(conn, &event);
+    }
+
+    for tool_name in parse_codex_tool_calls_json(tool_calls_json) {
+        let event = coach::NormalizedEvent::new(
+            timestamp.to_string(),
+            coach::EvidenceSource::Proxy,
+            coach::EventCategory::ToolIntentObserved,
+        )
+        .with_session(session_id.to_string())
+        .with_turn(turn_id.clone())
+        .with_reason("proxy_tool_intent")
+        .with_payload_value(
+            "tool_category",
+            serde_json::json!(coach::tool_category(&tool_name)),
+        );
+        let _ = insert_coach_event(conn, &event);
+    }
+
+    if !trusted_for_budget_enforcement {
+        let event = coach::NormalizedEvent::new(
+            timestamp.to_string(),
+            coach::EvidenceSource::Proxy,
+            coach::EventCategory::PricingTrustObserved,
+        )
+        .with_session(session_id.to_string())
+        .with_turn(turn_id)
+        .with_reason("untrusted_pricing")
+        .with_payload_value("trusted_for_budget_enforcement", serde_json::json!(false))
+        .with_payload_value("dollar_budget_configured", serde_json::json!(false));
+        let _ = insert_coach_event(conn, &event);
+    }
+}
+
 fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
     let conn = match Connection::open(path) {
         Ok(c) => c,
@@ -1197,6 +1324,22 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
                         &tool_calls_json,
                         &accounting_anomalies_json,
                     ],
+                );
+
+                record_proxy_coach_events(
+                    &conn,
+                    &timestamp,
+                    &session_id,
+                    &status,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    total_tokens,
+                    context_utilization,
+                    &tool_calls_json,
+                    trusted_for_budget_enforcement,
+                    turn_number,
                 );
 
                 let _ = conn.execute(
@@ -3685,22 +3828,65 @@ struct RequestBodyMetadata {
     user_prompt_excerpt: String,
 }
 
+#[cfg(test)]
 fn parse_request_body_metadata(
     body: &[u8],
     headers: &codex_request::CodexRequestHeaders,
 ) -> Option<RequestBodyMetadata> {
-    codex_request::parse_codex_responses_request(body, headers.clone())
-        .map(|parsed| request_metadata_from_codex(body.len(), parsed))
+    parse_request_body_metadata_result(body, headers, "").ok()
+}
+
+fn parse_request_body_metadata_result(
+    body: &[u8],
+    headers: &codex_request::CodexRequestHeaders,
+    content_encoding: &str,
+) -> Result<RequestBodyMetadata, codex_request::CodexRequestParseError> {
+    let decoded = request_body_for_json(body, content_encoding)?;
+    codex_request::parse_codex_responses_request(decoded.as_ref(), headers.clone())
+        .map(|parsed| request_metadata_from_codex(decoded.len(), parsed))
         .map_err(|err| {
             debug!(error = %err, "skipping non-Responses request body");
             err
         })
-        .ok()
+}
+
+fn request_body_for_json<'a>(
+    body: &'a [u8],
+    content_encoding: &str,
+) -> Result<Cow<'a, [u8]>, codex_request::CodexRequestParseError> {
+    let encoding = content_encoding.trim().to_ascii_lowercase();
+    if encoding.is_empty() || encoding == "identity" {
+        return Ok(Cow::Borrowed(body));
+    }
+
+    if encoding
+        .split(',')
+        .map(str::trim)
+        .any(|encoding| matches!(encoding, "zstd" | "zst"))
+    {
+        return zstd::stream::decode_all(std::io::Cursor::new(body))
+            .map(Cow::Owned)
+            .map_err(|_| codex_request::CodexRequestParseError::InvalidJson);
+    }
+
+    Ok(Cow::Borrowed(body))
+}
+
+fn request_body_profile_for_log(body: &[u8]) -> &'static str {
+    match body {
+        [] => "empty",
+        [0x1f, 0x8b, ..] => "gzip_magic",
+        [0x28, 0xb5, 0x2f, 0xfd, ..] => "zstd_magic",
+        [b'{', ..] => "json_object",
+        [b'[', ..] => "json_array",
+        _ if std::str::from_utf8(body).is_ok() => "utf8_non_json",
+        _ => "binary_non_utf8",
+    }
 }
 
 fn should_skip_chatgpt_auxiliary_request_body(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
-    path.starts_with("/backend-api/") && !path.starts_with("/backend-api/codex/responses")
+    path.starts_with("/backend-api/") && path != "/backend-api/codex/responses"
 }
 
 fn request_metadata_from_codex(
@@ -3921,6 +4107,8 @@ impl ExternalProcessor for CodexBlackboxProcessor {
             let mut codex_observed_model_header: Option<String> = None;
             let mut current_codex_request: Option<codex_request::ParsedCodexRequest> = None;
             let mut request_path = String::new();
+            let mut request_content_type = String::new();
+            let mut request_content_encoding = String::new();
             let mut context_window_tokens = STANDARD_CONTEXT_WINDOW_TOKENS;
             let mut finalized = false;
 
@@ -3968,6 +4156,10 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                             .unwrap_or_else(|| format!("req_{}", started_at.elapsed().as_nanos()));
                         codex_request_headers = codex_request_headers_from_ext_proc(h);
                         request_path = extract_header(h, ":path").unwrap_or_default();
+                        request_content_type =
+                            extract_header(h, "content-type").unwrap_or_default();
+                        request_content_encoding =
+                            extract_header(h, "content-encoding").unwrap_or_default();
                         codex_observed_model_header = extract_header(h, "openai-model")
                             .or_else(|| extract_header(h, "x-openai-model"));
                         if let Some(header_model) = codex_observed_model_header.as_deref() {
@@ -4015,8 +4207,12 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                 "skipping non-model ChatGPT backend request body parse"
                             );
                         } else {
-                            match parse_request_body_metadata(&b.body, &codex_request_headers) {
-                                Some(request_metadata) => {
+                            match parse_request_body_metadata_result(
+                                &b.body,
+                                &codex_request_headers,
+                                &request_content_encoding,
+                            ) {
+                                Ok(request_metadata) => {
                                     response_accumulator =
                                         SelectedResponseAccumulator::for_request_source(
                                             request_metadata.source,
@@ -4069,8 +4265,17 @@ impl ExternalProcessor for CodexBlackboxProcessor {
                                         model = request_metadata.model;
                                     }
                                 }
-                                None => {
-                                    warn!(request_id=%request_id, bytes=b.body.len(), path=%request_path, "failed to parse request JSON");
+                                Err(err) => {
+                                    warn!(
+                                        request_id = %request_id,
+                                        bytes = b.body.len(),
+                                        path = %request_path,
+                                        parse_error = %err,
+                                        body_profile = request_body_profile_for_log(&b.body),
+                                        content_type = %request_content_type,
+                                        content_encoding = %request_content_encoding,
+                                        "failed to parse request JSON"
+                                    );
                                 }
                             }
                         }
@@ -4278,6 +4483,801 @@ async fn handle_guard_state() -> impl IntoResponse {
         serde_json::to_string_pretty(&state).unwrap_or_default(),
     )
 }
+
+fn evidence_source_from_db(value: &str) -> coach::EvidenceSource {
+    match value {
+        "proxy" => coach::EvidenceSource::Proxy,
+        "hook" => coach::EvidenceSource::Hook,
+        "transcript" => coach::EvidenceSource::Transcript,
+        "app_server" => coach::EvidenceSource::AppServer,
+        "user_policy" => coach::EvidenceSource::UserPolicy,
+        _ => coach::EvidenceSource::Hook,
+    }
+}
+
+fn coach_category_from_db(value: &str) -> coach::EventCategory {
+    match value {
+        "model_turn_started" => coach::EventCategory::ModelTurnStarted,
+        "model_turn_completed" => coach::EventCategory::ModelTurnCompleted,
+        "model_turn_failed" => coach::EventCategory::ModelTurnFailed,
+        "model_turn_incomplete" => coach::EventCategory::ModelTurnIncomplete,
+        "model_turn_unknown" => coach::EventCategory::ModelTurnUnknown,
+        "tool_intent_observed" => coach::EventCategory::ToolIntentObserved,
+        "supported_tool_started" => coach::EventCategory::SupportedToolStarted,
+        "supported_tool_completed" => coach::EventCategory::SupportedToolCompleted,
+        "supported_tool_failed" => coach::EventCategory::SupportedToolFailed,
+        "validation_started" => coach::EventCategory::ValidationStarted,
+        "validation_succeeded" => coach::EventCategory::ValidationSucceeded,
+        "validation_failed" => coach::EventCategory::ValidationFailed,
+        "file_edit_observed" => coach::EventCategory::FileEditObserved,
+        "prompt_submitted" => coach::EventCategory::PromptSubmitted,
+        "stop_observed" => coach::EventCategory::StopObserved,
+        "compaction_observed" => coach::EventCategory::CompactionObserved,
+        "context_pressure_observed" => coach::EventCategory::ContextPressureObserved,
+        "rate_limit_pressure_observed" => coach::EventCategory::RateLimitPressureObserved,
+        "coach_warning_emitted" => coach::EventCategory::CoachWarningEmitted,
+        "coach_block_emitted" => coach::EventCategory::CoachBlockEmitted,
+        "pricing_trust_observed" => coach::EventCategory::PricingTrustObserved,
+        "durable_evidence_missing" => coach::EventCategory::DurableEvidenceMissing,
+        "baseline_learned" => coach::EventCategory::BaselineLearned,
+        _ => coach::EventCategory::ModelTurnUnknown,
+    }
+}
+
+fn privacy_from_db(value: &str) -> coach::PrivacyClassification {
+    match value {
+        "public_aggregate" => coach::PrivacyClassification::PublicAggregate,
+        "sensitive_redacted" => coach::PrivacyClassification::SensitiveRedacted,
+        _ => coach::PrivacyClassification::DerivedPrivate,
+    }
+}
+
+fn confidence_from_db(value: &str) -> coach::ConfidenceLevel {
+    match value {
+        "medium" => coach::ConfidenceLevel::Medium,
+        "low" => coach::ConfidenceLevel::Low,
+        _ => coach::ConfidenceLevel::High,
+    }
+}
+
+fn load_coach_events_from_db(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<coach::NormalizedEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT timestamp, evidence_source, category, reason_code, privacy, confidence, \
+                session_id, turn_id, payload_summary \
+         FROM coach_events \
+         WHERE session_id = ?1 \
+         ORDER BY timestamp ASC, id ASC \
+         LIMIT 500",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        let payload_raw = row.get::<_, String>(8)?;
+        let payload_summary =
+            serde_json::from_str::<BTreeMap<String, Value>>(&payload_raw).unwrap_or_default();
+        Ok(coach::NormalizedEvent {
+            timestamp: row.get::<_, String>(0)?,
+            evidence_source: evidence_source_from_db(&row.get::<_, String>(1)?),
+            category: coach_category_from_db(&row.get::<_, String>(2)?),
+            reason_code: row.get::<_, Option<String>>(3)?,
+            privacy: privacy_from_db(&row.get::<_, String>(4)?),
+            confidence: confidence_from_db(&row.get::<_, String>(5)?),
+            session_id: row.get::<_, Option<String>>(6)?,
+            turn_id: row.get::<_, Option<String>>(7)?,
+            payload_summary,
+        })
+    })?;
+    rows.collect()
+}
+
+fn synthesize_coach_events_from_turns(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<coach::NormalizedEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT turn_number, timestamp, COALESCE(NULLIF(trim(codex_status), ''), 'unknown'), \
+                codex_input_tokens, codex_cached_input_tokens, codex_output_tokens, \
+                codex_reasoning_output_tokens, codex_total_tokens, context_utilization, \
+                COALESCE(codex_tool_calls, '[]') \
+         FROM turn_snapshots \
+         WHERE session_id = ?1 AND provider = 'codex_responses' \
+         ORDER BY turn_number ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?.max(0) as u32,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?.max(0) as u64,
+            row.get::<_, i64>(4)?.max(0) as u64,
+            row.get::<_, i64>(5)?.max(0) as u64,
+            row.get::<_, i64>(6)?.max(0) as u64,
+            row.get::<_, i64>(7)?.max(0) as u64,
+            row.get::<_, f64>(8)?,
+            row.get::<_, String>(9)?,
+        ))
+    })?;
+
+    let mut events = Vec::new();
+    for row in rows {
+        let (
+            turn_number,
+            timestamp,
+            status,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            reasoning_output_tokens,
+            total_tokens,
+            context_utilization,
+            tool_calls_json,
+        ) = row?;
+        let turn_id = format!("turn_{turn_number}");
+        events.push(coach::proxy_turn_event(
+            timestamp.clone(),
+            session_id.to_string(),
+            turn_id.clone(),
+            &status,
+            coach::TokenTotals {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_output_tokens,
+                local_total_tokens: total_tokens,
+            },
+            Some((context_utilization * 100.0).clamp(0.0, 100.0)),
+        ));
+        for tool_name in parse_codex_tool_calls_json(&tool_calls_json) {
+            events.push(
+                coach::NormalizedEvent::new(
+                    timestamp.clone(),
+                    coach::EvidenceSource::Proxy,
+                    coach::EventCategory::ToolIntentObserved,
+                )
+                .with_session(session_id.to_string())
+                .with_turn(turn_id.clone())
+                .with_reason("proxy_tool_intent")
+                .with_payload_value(
+                    "tool_category",
+                    serde_json::json!(coach::tool_category(&tool_name)),
+                ),
+            );
+        }
+    }
+    Ok(events)
+}
+
+fn resolve_companion_session_id(
+    conn: &Connection,
+    target: &str,
+) -> rusqlite::Result<Option<String>> {
+    if target != "last" {
+        return Ok(Some(target.to_string()));
+    }
+    conn.query_row(
+        "SELECT session_id FROM ( \
+            SELECT session_id, timestamp AS observed_at FROM requests WHERE provider = 'codex_responses' \
+            UNION ALL \
+            SELECT session_id, timestamp AS observed_at FROM turn_snapshots WHERE provider = 'codex_responses' \
+            UNION ALL \
+            SELECT session_id, timestamp AS observed_at FROM coach_events WHERE session_id IS NOT NULL \
+         ) WHERE session_id IS NOT NULL AND trim(session_id) != '' \
+         ORDER BY observed_at DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+fn build_companion_snapshot_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<coach::CompanionSnapshot>> {
+    initialize_persistence_schema(conn)?;
+    let mut events = load_coach_events_from_db(conn, session_id)?;
+    if events.is_empty() {
+        events = synthesize_coach_events_from_turns(conn, session_id)?;
+    }
+    if events.is_empty() {
+        return Ok(None);
+    }
+    if let Some(ended_at) = conn
+        .query_row(
+            "SELECT ended_at FROM sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    {
+        events.push(
+            coach::NormalizedEvent::new(
+                ended_at,
+                coach::EvidenceSource::Proxy,
+                coach::EventCategory::StopObserved,
+            )
+            .with_session(session_id.to_string())
+            .with_reason("session_ended")
+            .with_privacy(coach::PrivacyClassification::PublicAggregate),
+        );
+    }
+    let mut state = coach::derive_session_state(&events);
+    state.session_id = Some(session_id.to_string());
+    state.postmortem_available = session_has_codex_evidence(conn, session_id).unwrap_or(false);
+    if state.postmortem_available {
+        state.postmortem_link = Some(format!("/api/postmortem/{session_id}?redact=true"));
+    }
+    let signals = coach::detect_signals(&state);
+    let decision = decision::decide(&coach::facts_from_state_and_signals(&state, &signals));
+    Ok(Some(coach::CompanionSnapshot {
+        state,
+        signals,
+        decision,
+        timeline: events,
+    }))
+}
+
+fn build_companion_sessions_response(
+    conn: &Connection,
+    limit: i64,
+    days: i64,
+) -> rusqlite::Result<Value> {
+    initialize_persistence_schema(conn)?;
+    let since_secs = now_epoch_secs().saturating_sub(days.max(0) as u64 * 86400);
+    let since = epoch_to_iso8601(since_secs);
+    let rows = load_recent_codex_session_rows(conn, &since, limit)?;
+    let mut sessions = Vec::new();
+    for row in rows {
+        if let Some(snapshot) = build_companion_snapshot_for_session(conn, &row.session_id)? {
+            sessions.push(serde_json::json!({
+                "session_id": row.session_id,
+                "started_at": row.started_at,
+                "state": snapshot.decision.state,
+                "primary_reason": snapshot.decision.primary_reason,
+                "next_action": snapshot.decision.next_action,
+                "turn_count": snapshot.state.turn_count,
+                "tokens": snapshot.state.token_totals.local_total_tokens,
+                "evidence_sources": snapshot.decision.evidence_sources,
+                "postmortem_link": snapshot.state.postmortem_link,
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "privacy": "redacted_by_default",
+        "sessions": sessions,
+    }))
+}
+
+async fn handle_companion_sessions(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(20);
+    let days: i64 = params
+        .get("days")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(7);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(db_path())?;
+        build_companion_sessions_response(&conn, limit, days)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(body)) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
+        )
+            .into_response(),
+        Ok(Err(err)) => {
+            warn!(error = %err, "companion sessions query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db unavailable").into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "companion sessions task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn handle_companion_session(
+    axum::extract::Path(target): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = Connection::open(db_path())?;
+        let Some(session_id) = resolve_companion_session_id(&conn, &target)? else {
+            return Ok(None);
+        };
+        build_companion_snapshot_for_session(&conn, &session_id)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(snapshot))) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+        )
+            .into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, "not found").into_response(),
+        Ok(Err(err)) => {
+            warn!(error = %err, "companion session query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "db unavailable").into_response()
+        }
+        Err(err) => {
+            warn!(error = %err, "companion session task failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
+    }
+}
+
+async fn handle_companion_ui() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("content-type", "text/html; charset=utf-8")],
+        COMPANION_HTML,
+    )
+}
+
+fn hook_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+fn hook_event_name(input: &Value) -> String {
+    hook_str(input, "hook_event_name")
+        .or_else(|| hook_str(input, "event"))
+        .or_else(|| hook_str(input, "event_name"))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn hook_session_id(input: &Value) -> Option<String> {
+    hook_str(input, "session_id")
+        .or_else(|| hook_str(input, "sessionId"))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn hook_turn_id(input: &Value) -> Option<String> {
+    hook_str(input, "turn_id")
+        .or_else(|| hook_str(input, "turnId"))
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn hook_tool_name(input: &Value) -> String {
+    hook_str(input, "tool_name")
+        .or_else(|| hook_str(input, "toolName"))
+        .or_else(|| input.get("tool").and_then(|tool| hook_str(tool, "name")))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn hook_tool_command(input: &Value) -> Option<&str> {
+    input
+        .get("tool_input")
+        .or_else(|| input.get("toolInput"))
+        .and_then(|tool_input| {
+            hook_str(tool_input, "command")
+                .or_else(|| hook_str(tool_input, "cmd"))
+                .or_else(|| hook_str(tool_input, "description"))
+        })
+}
+
+fn hook_tool_failed(input: &Value) -> bool {
+    input
+        .get("tool_response")
+        .or_else(|| input.get("toolResponse"))
+        .is_some_and(|response| {
+            response
+                .get("exit_code")
+                .or_else(|| response.get("exitCode"))
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0)
+                || response
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| {
+                        matches!(status, "failed" | "error" | "failure" | "timed_out")
+                    })
+                || response.get("error").is_some()
+        })
+}
+
+fn hook_event_base(
+    input: &Value,
+    category: coach::EventCategory,
+    reason_code: &str,
+) -> coach::NormalizedEvent {
+    let mut event =
+        coach::NormalizedEvent::new(now_iso8601(), coach::EvidenceSource::Hook, category)
+            .with_reason(reason_code)
+            .with_confidence(coach::ConfidenceLevel::Medium)
+            .with_privacy(coach::PrivacyClassification::DerivedPrivate);
+    if let Some(session_id) = hook_session_id(input) {
+        event = event.with_session(session_id);
+    }
+    if let Some(turn_id) = hook_turn_id(input) {
+        event = event.with_turn(turn_id);
+    }
+    event
+}
+
+fn hook_response_continue() -> Value {
+    serde_json::json!({"continue": true})
+}
+
+fn hook_response_warning(event_name: &str, message: &str) -> Value {
+    serde_json::json!({
+        "continue": true,
+        "systemMessage": message,
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": message
+        }
+    })
+}
+
+fn hook_response_pretool_deny(message: &str) -> Value {
+    serde_json::json!({
+        "systemMessage": message,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": message
+        }
+    })
+}
+
+fn hook_response_stop_continue(message: &str) -> Value {
+    serde_json::json!({
+        "decision": "block",
+        "reason": message
+    })
+}
+
+fn companion_stop_reason(snapshot: &coach::CompanionSnapshot) -> Option<String> {
+    snapshot.signals.iter().find_map(|signal| {
+        matches!(
+            signal.signal_name.as_str(),
+            "unvalidated_edit" | "repeated_validation_failure" | "blind_retry"
+        )
+        .then(|| format!("Careful: {}. {}", signal.reason, signal.next_action))
+    })
+}
+
+fn process_coach_hook(input: Value) -> Value {
+    let event_name = hook_event_name(&input);
+    let tool_name = hook_tool_name(&input);
+    let tool_category = coach::tool_category(&tool_name);
+    let command = hook_tool_command(&input).unwrap_or_default();
+    let validation_category = coach::validation_category_from_command(command);
+    let mut events = Vec::new();
+    let mut output = hook_response_continue();
+
+    match event_name.as_str() {
+        "PreToolUse" => {
+            let mut event = hook_event_base(
+                &input,
+                coach::EventCategory::SupportedToolStarted,
+                tool_category,
+            )
+            .with_payload_value("tool_category", serde_json::json!(tool_category));
+            if let Some(validation_category) = validation_category {
+                event = event.with_reason("validation_started").with_payload_value(
+                    "validation_category",
+                    serde_json::json!(validation_category),
+                );
+                events.push(
+                    hook_event_base(
+                        &input,
+                        coach::EventCategory::ValidationStarted,
+                        validation_category,
+                    )
+                    .with_payload_value(
+                        "validation_category",
+                        serde_json::json!(validation_category),
+                    ),
+                );
+            }
+            if tool_category == "apply_patch" {
+                events.push(hook_event_base(
+                    &input,
+                    coach::EventCategory::FileEditObserved,
+                    "file_edit_observed",
+                ));
+            }
+            if tool_category == "bash" && coach::command_is_risky(command) {
+                event = event.with_reason("risky_supported_tool_call");
+                events.push(event);
+                events.push(hook_event_base(
+                    &input,
+                    coach::EventCategory::CoachBlockEmitted,
+                    "risky_supported_tool_call",
+                ));
+                metrics::record_hook_event("PreToolUse", tool_category, "blocked");
+                metrics::record_coach_action("block", "risky_supported_tool_call");
+                output = hook_response_pretool_deny(
+                    "Blocked: risky supported tool call. Confirm scope or use a safer command.",
+                );
+            } else {
+                metrics::record_hook_event("PreToolUse", tool_category, "unknown");
+                events.push(event);
+            }
+        }
+        "PostToolUse" => {
+            let failed = hook_tool_failed(&input);
+            metrics::record_hook_event(
+                "PostToolUse",
+                tool_category,
+                if failed { "failure" } else { "success" },
+            );
+            let category = if failed {
+                coach::EventCategory::SupportedToolFailed
+            } else {
+                coach::EventCategory::SupportedToolCompleted
+            };
+            events.push(
+                hook_event_base(&input, category, tool_category)
+                    .with_payload_value("tool_category", serde_json::json!(tool_category))
+                    .with_payload_value(
+                        "result",
+                        serde_json::json!(if failed { "failure" } else { "success" }),
+                    ),
+            );
+            if let Some(validation_category) = validation_category {
+                let validation_event = if failed {
+                    coach::EventCategory::ValidationFailed
+                } else {
+                    coach::EventCategory::ValidationSucceeded
+                };
+                events.push(
+                    hook_event_base(&input, validation_event, validation_category)
+                        .with_payload_value(
+                            "validation_category",
+                            serde_json::json!(validation_category),
+                        ),
+                );
+                metrics::record_validation_run(
+                    validation_category,
+                    if failed { "failure" } else { "success" },
+                );
+                if failed {
+                    events.push(hook_event_base(
+                        &input,
+                        coach::EventCategory::CoachWarningEmitted,
+                        "validation_failed",
+                    ));
+                    metrics::record_coach_action("warn", "repeated_validation_failure");
+                    output = hook_response_warning(
+                        "PostToolUse",
+                        "Careful: validation failed. Inspect the first failure before editing again.",
+                    );
+                }
+            }
+        }
+        "UserPromptSubmit" => {
+            metrics::record_hook_event("UserPromptSubmit", "other", "success");
+            events.push(hook_event_base(
+                &input,
+                coach::EventCategory::PromptSubmitted,
+                "prompt_submitted",
+            ));
+            let prompt = hook_str(&input, "prompt")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if prompt.contains("skip validation")
+                || prompt.contains("do not run tests")
+                || prompt.contains("without tests")
+            {
+                events.push(hook_event_base(
+                    &input,
+                    coach::EventCategory::CoachWarningEmitted,
+                    "validation_risk_prompt",
+                ));
+                metrics::record_coach_action("warn", "unvalidated_edit");
+                output = hook_response_warning(
+                    "UserPromptSubmit",
+                    "Careful: this request may skip validation. Keep validation evidence explicit.",
+                );
+            }
+        }
+        "Stop" => {
+            metrics::record_hook_event("Stop", "other", "success");
+            events.push(hook_event_base(
+                &input,
+                coach::EventCategory::StopObserved,
+                "stop_observed",
+            ));
+        }
+        "PreCompact" | "PostCompact" => {
+            events.push(hook_event_base(
+                &input,
+                coach::EventCategory::CompactionObserved,
+                "compaction_observed",
+            ));
+        }
+        _ => {}
+    }
+
+    if let Ok(conn) = Connection::open(db_path()) {
+        if initialize_persistence_schema(&conn).is_ok() {
+            for event in &events {
+                let _ = insert_coach_event(&conn, event);
+            }
+            if event_name == "Stop" {
+                if let Some(session_id) = hook_session_id(&input) {
+                    if let Ok(Some(snapshot)) =
+                        build_companion_snapshot_for_session(&conn, &session_id)
+                    {
+                        for signal in &snapshot.signals {
+                            metrics::record_loop_signal(
+                                &signal.signal_name,
+                                signal.severity.as_str(),
+                                signal.evidence_source.as_str(),
+                            );
+                        }
+                        if let Some(reason) = companion_stop_reason(&snapshot) {
+                            events.push(hook_event_base(
+                                &input,
+                                coach::EventCategory::CoachWarningEmitted,
+                                "stop_requires_followup",
+                            ));
+                            if let Some(last) = events.last() {
+                                let _ = insert_coach_event(&conn, last);
+                            }
+                            metrics::record_coach_action("continue", "unvalidated_edit");
+                            output = hook_response_stop_continue(&reason);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    output
+}
+
+async fn handle_coach_hook(Json(input): Json<Value>) -> impl IntoResponse {
+    let output = tokio::task::spawn_blocking(move || process_coach_hook(input))
+        .await
+        .unwrap_or_else(|err| {
+            warn!(error = %err, "coach hook task failed open");
+            hook_response_continue()
+        });
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        serde_json::to_string(&output).unwrap_or_else(|_| "{\"continue\":true}".to_string()),
+    )
+}
+
+const COMPANION_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Blackbox Companion</title>
+  <style>
+    :root { color-scheme: light; --ink:#172026; --muted:#61717d; --line:#d8dee3; --bg:#f7f8f8; --panel:#ffffff; --good:#187044; --watch:#136b8f; --care:#9a6200; --stop:#b42318; --block:#7a1020; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); letter-spacing:0; }
+    header { height:56px; display:flex; align-items:center; gap:12px; padding:0 18px; border-bottom:1px solid var(--line); background:#fff; }
+    .mark { width:28px; height:28px; border:2px solid var(--ink); display:grid; place-items:center; font-size:14px; font-weight:700; }
+    .title { font-weight:700; }
+    .layout { display:grid; grid-template-columns:minmax(220px, 300px) 1fr; min-height:calc(100vh - 56px); }
+    aside { border-right:1px solid var(--line); background:#fff; padding:12px; overflow:auto; }
+    main { padding:16px; overflow:auto; }
+    button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); min-height:32px; border-radius:6px; padding:6px 10px; cursor:pointer; }
+    button:hover { border-color:#94a3ad; }
+    .session { width:100%; text-align:left; margin-bottom:8px; display:grid; gap:4px; }
+    .session strong { font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .session span { font-size:12px; color:var(--muted); }
+    .band { background:var(--panel); border-bottom:1px solid var(--line); padding:14px 16px; margin:-16px -16px 16px; display:grid; gap:8px; }
+    .state { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .pill { display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; font-weight:650; }
+    .healthy { color:var(--good); border-color:#a7d7bd; }
+    .watching { color:var(--watch); border-color:#9ed1e0; }
+    .careful { color:var(--care); border-color:#e3c383; }
+    .stop { color:var(--stop); border-color:#efb0a8; }
+    .blocked { color:var(--block); border-color:#dda1ad; }
+    .cooldown { color:var(--care); border-color:#e3c383; }
+    .ended { color:var(--muted); }
+    .grid { display:grid; grid-template-columns:repeat(12, 1fr); gap:12px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+    h2 { font-size:14px; margin:0 0 10px; }
+    .span4 { grid-column:span 4; } .span6 { grid-column:span 6; } .span8 { grid-column:span 8; } .span12 { grid-column:span 12; }
+    .metric { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid #edf0f2; }
+    .metric:last-child { border-bottom:0; }
+    .muted { color:var(--muted); }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; border-bottom:1px solid #edf0f2; padding:7px 6px; vertical-align:top; }
+    th { color:var(--muted); font-weight:650; }
+    .empty { color:var(--muted); font-size:13px; padding:10px 0; }
+    .bar { height:10px; background:#e8edf0; border-radius:999px; overflow:hidden; }
+    .bar > div { height:100%; background:#2f6f73; width:0%; }
+    a { color:#0f5f9a; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    @media (max-width: 820px) { .layout { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid var(--line); max-height:220px; } .span4,.span6,.span8 { grid-column:span 12; } }
+  </style>
+</head>
+<body>
+  <header><div class="mark">CB</div><div class="title">Codex Blackbox Companion</div><div class="muted" id="updated"></div></header>
+  <div class="layout">
+    <aside><div id="sessions"></div></aside>
+    <main>
+      <div class="band">
+        <div class="state"><span id="state" class="pill watching">Watching</span><strong id="reason">Loading</strong></div>
+        <div id="next" class="muted"></div>
+        <div id="evidence"></div>
+      </div>
+      <div class="grid">
+        <section class="span4"><h2>Tokens And Context</h2><div id="tokens"></div></section>
+        <section class="span4"><h2>Validation</h2><div id="validation"></div></section>
+        <section class="span4"><h2>Coach Actions</h2><div id="actions"></div></section>
+        <section class="span6"><h2>Signals</h2><div id="signals"></div></section>
+        <section class="span6"><h2>Postmortem</h2><div id="postmortem"></div></section>
+        <section class="span12"><h2>Timeline</h2><div id="timeline"></div></section>
+      </div>
+    </main>
+  </div>
+  <script>
+    let selected = null;
+    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const stateClass = (s) => String(s || "watching").toLowerCase();
+    async function json(url) { const r = await fetch(url); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
+    function renderSessions(items) {
+      const box = document.getElementById("sessions");
+      if (!items.length) { box.innerHTML = '<div class="empty">No sessions</div>'; return; }
+      if (!selected) selected = items[0].session_id;
+      box.innerHTML = items.map(s => `<button class="session" data-id="${esc(s.session_id)}"><strong>${esc(s.session_id)}</strong><span>${esc(s.state)} · ${esc(s.primary_reason)}</span></button>`).join("");
+      box.querySelectorAll("button").forEach(b => b.onclick = () => { selected = b.dataset.id; loadSession(); });
+    }
+    function rows(items, cols) {
+      if (!items.length) return '<div class="empty">None</div>';
+      return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${cols.map(c=>`<td>${esc(c[1](item))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    }
+    function renderSnapshot(s) {
+      const decision = s.decision || {};
+      const state = stateClass(decision.state);
+      const stateEl = document.getElementById("state");
+      stateEl.className = `pill ${state}`;
+      stateEl.textContent = decision.state || "watching";
+      document.getElementById("reason").textContent = decision.primary_reason || "";
+      document.getElementById("next").textContent = decision.next_action || "";
+      document.getElementById("evidence").innerHTML = (decision.evidence_sources || []).map(e => `<span class="pill">${esc(e.evidence_source)} ${esc(e.count)}</span>`).join(" ");
+      const fill = Math.max(0, Math.min(100, s.state.max_context_fill_percent || 0));
+      document.getElementById("tokens").innerHTML = [
+        ['Turns', s.state.turn_count],
+        ['Total tokens', s.state.token_totals.local_total_tokens],
+        ['Cached input', s.state.token_totals.cached_input_tokens],
+        ['Output', s.state.token_totals.output_tokens],
+        ['Reasoning output', s.state.token_totals.reasoning_output_tokens],
+      ].map(([k,v]) => `<div class="metric"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("") + `<div class="metric"><span>Context</span><strong>${fill.toFixed(0)}%</strong></div><div class="bar"><div style="width:${fill}%"></div></div>`;
+      document.getElementById("validation").innerHTML = rows(s.state.recent_validation_results || [], [['Category', x=>x.category], ['Result', x=>x.result], ['Evidence', x=>x.evidence_source]]);
+      document.getElementById("actions").innerHTML = rows(s.state.hook_actions || [], [['Action', x=>x.action], ['Reason', x=>x.reason_code], ['Evidence', x=>x.evidence_source]]);
+      document.getElementById("signals").innerHTML = rows(s.signals || [], [['Severity', x=>x.severity], ['Signal', x=>x.signal_name], ['Reason', x=>x.reason], ['Evidence', x=>x.evidence_source]]);
+      document.getElementById("postmortem").innerHTML = s.state.postmortem_link ? `<a href="${esc(s.state.postmortem_link)}">Open redacted postmortem</a>` : '<div class="empty">Not ready</div>';
+      document.getElementById("timeline").innerHTML = rows((s.timeline || []).slice(-80), [['Time', x=>x.timestamp], ['Evidence', x=>x.evidence_source], ['Category', x=>x.category], ['Reason', x=>x.reason_code || '']] );
+    }
+    async function loadSession() { if (!selected) return; try { renderSnapshot(await json(`/api/companion/session/${encodeURIComponent(selected)}`)); } catch (_) {} }
+    async function tick() {
+      try {
+        const data = await json('/api/companion/sessions?limit=20&days=7');
+        renderSessions(data.sessions || []);
+        await loadSession();
+        document.getElementById("updated").textContent = new Date().toLocaleTimeString();
+      } catch (e) { document.getElementById("reason").textContent = "Core unavailable"; }
+    }
+    tick(); setInterval(tick, 2000);
+  </script>
+</body>
+</html>"#;
 
 #[derive(Debug, Deserialize)]
 struct CodexObservationRequest {
@@ -5484,6 +6484,13 @@ async fn http_server() {
         .route("/metrics", get(handle_metrics))
         .route("/api/summary", get(handle_summary))
         .route("/api/guard-state", get(handle_guard_state))
+        .route("/companion", get(handle_companion_ui))
+        .route("/api/companion/sessions", get(handle_companion_sessions))
+        .route(
+            "/api/companion/session/:session_id",
+            get(handle_companion_session),
+        )
+        .route("/api/coach/hook", post(handle_coach_hook))
         .route("/api/observations/codex", post(handle_codex_observations))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -5691,32 +6698,34 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        build_codex_finalization_outcome, build_diagnosis_response_json,
-        build_fresh_diagnosis_report, build_session_summary_json, build_sessions_response_json,
-        build_summary_response_json, codex_request_headers_from_ext_proc,
-        codex_response_headers_from_ext_proc, codex_watch_event_is_duplicate_or_remember,
-        compact_response_summary, compute_estimated_costs_for_sessions, context_fill_percent,
-        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
-        drop_legacy_lifecycle_tables, ensure_codex_persistence_columns, ensure_session_columns,
-        ensure_session_diagnosis_columns, epoch_to_iso8601, event_matches_session, extract_header,
-        extract_headers, filter_codex_envoy_diagnosis_payload, history_contains_session_start,
+        build_codex_finalization_outcome, build_companion_snapshot_for_session,
+        build_diagnosis_response_json, build_fresh_diagnosis_report, build_session_summary_json,
+        build_sessions_response_json, build_summary_response_json,
+        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
+        codex_watch_event_is_duplicate_or_remember, compact_response_summary,
+        compute_estimated_costs_for_sessions, context_fill_percent, context_fill_ratio,
+        db_writer_loop, derive_display_name, diagnosis, drop_legacy_lifecycle_tables,
+        ensure_codex_persistence_columns, ensure_session_columns, ensure_session_diagnosis_columns,
+        epoch_to_iso8601, event_matches_session, extract_header, extract_headers,
+        filter_codex_envoy_diagnosis_payload, history_contains_session_start,
         infer_context_window_tokens, load_codex_observation_snapshot,
         load_degradation_view_from_db, load_persisted_watch_replay_events,
         load_recent_codex_session_rows, load_turn_snapshots_from_db,
         looks_like_machine_recall_line, make_block_response, maybe_broadcast_postmortem_ready,
         metrics, normalize_search_text, now_epoch_secs, parse_request_body_metadata,
-        persist_billing_reconciliation, persist_session_diagnosis_report,
-        persisted_session_display_name, policy_block_message, postmortem, pricing,
-        query_historical_metrics, query_summary, record_codex_turn_command,
-        repair_persisted_session_artifacts, repair_session_diagnosis_envoy_causes,
-        repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
-        score_recall_doc, seed_live_metric_labels_from_db, session_has_codex_evidence,
-        session_timeout_secs, should_skip_chatgpt_auxiliary_request_body, table_columns,
-        tokenize_search_text, BillingReconciliationInput, BillingReconciliationWriteError,
-        CodexCachedInputSummary, CostAccumulator, DbCommand, GuardBlockResponse, HttpHeaders,
-        ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
-        SelectedResponseAccumulator, SummaryWindowData, ESTIMATED_COST_SOURCE,
-        EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
+        parse_request_body_metadata_result, persist_billing_reconciliation,
+        persist_session_diagnosis_report, persisted_session_display_name, policy_block_message,
+        postmortem, pricing, process_coach_hook, query_historical_metrics, query_summary,
+        record_codex_turn_command, repair_persisted_session_artifacts,
+        repair_session_diagnosis_envoy_causes, repair_turn_snapshot_context_windows,
+        repo_name_from_codex_initial_prompt, score_recall_doc, seed_live_metric_labels_from_db,
+        session_has_codex_evidence, session_timeout_secs,
+        should_skip_chatgpt_auxiliary_request_body, table_columns, tokenize_search_text,
+        BillingReconciliationInput, BillingReconciliationWriteError, CodexCachedInputSummary,
+        CostAccumulator, DbCommand, GuardBlockResponse, HttpHeaders, ProtoHeaderValue,
+        RequestMetadataSource, SelectedFinalizationOutcome, SelectedResponseAccumulator,
+        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA,
+        STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     #[test]
@@ -5904,6 +6913,26 @@ mod tests {
             "Summarize the current repository status."
         );
         assert_ne!(metadata.session_hash, 0);
+    }
+
+    #[test]
+    fn codex_request_metadata_decodes_zstd_request_body_for_hot_path() {
+        let body = include_bytes!("../../test/fixtures/openai_responses_minimal_text_request.json");
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body.as_slice()), 0)
+            .expect("zstd encode");
+
+        let metadata = parse_request_body_metadata_result(
+            &compressed,
+            &super::codex_request::CodexRequestHeaders::default(),
+            "zstd",
+        )
+        .expect("parse zstd encoded codex fixture");
+
+        assert_eq!(metadata.source, RequestMetadataSource::CodexResponses);
+        assert_eq!(metadata.model, "gpt-codex-fixture");
+        assert_eq!(metadata.message_count, 1);
+        assert_eq!(metadata.estimated_input_tokens, body.len() / 4);
+        assert_eq!(metadata.session_id, "codex-session-fixture-001");
     }
 
     #[test]
@@ -7623,6 +8652,12 @@ mod tests {
         assert!(!should_skip_chatgpt_auxiliary_request_body(
             "/backend-api/codex/responses"
         ));
+        assert!(!should_skip_chatgpt_auxiliary_request_body(
+            "/backend-api/codex/responses?foo=bar"
+        ));
+        assert!(should_skip_chatgpt_auxiliary_request_body(
+            "/backend-api/codex/responses/compact"
+        ));
         assert!(!should_skip_chatgpt_auxiliary_request_body("/v1/messages"));
         assert!(!should_skip_chatgpt_auxiliary_request_body(""));
     }
@@ -8278,6 +9313,119 @@ mod tests {
         }
         drop(tx);
         handle.join().expect("join db writer");
+    }
+
+    #[test]
+    fn proxy_turns_are_normalized_for_companion_and_postmortem() {
+        let path = unique_test_db_path("coach-companion-proxy");
+        let request = parse_codex_fixture_request("coach-companion-proxy-session");
+        let response = accumulate_codex_fixture_response(
+            include_str!("../../test/fixtures/openai_responses_text_stream.sse"),
+            Some("gpt-codex-fixture"),
+        );
+        let outcome = build_codex_finalization_outcome(
+            "req-coach-companion-proxy",
+            &request,
+            &response,
+            Duration::from_millis(250),
+            STANDARD_CONTEXT_WINDOW_TOKENS,
+        );
+        run_db_writer_commands(
+            &path,
+            vec![record_codex_turn_command(
+                &outcome,
+                "2026-05-27T00:00:00Z".to_string(),
+            )],
+        );
+        let conn = Connection::open(&path).expect("open test db");
+
+        let snapshot = build_companion_snapshot_for_session(&conn, "coach-companion-proxy-session")
+            .expect("companion snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.state.latest_known_state, "ended");
+        assert_eq!(
+            snapshot.decision.state,
+            super::decision::DecisionState::Ended
+        );
+        assert!(snapshot
+            .decision
+            .evidence_sources
+            .iter()
+            .any(|source| source.evidence_source == "proxy"));
+        assert!(snapshot
+            .timeline
+            .iter()
+            .any(|event| event.category == super::coach::EventCategory::ModelTurnCompleted));
+        assert!(snapshot.timeline.iter().any(|event| {
+            event.evidence_source == super::coach::EvidenceSource::Proxy
+                && event.category == super::coach::EventCategory::StopObserved
+                && event.reason_code.as_deref() == Some("session_ended")
+        }));
+
+        let report = postmortem::build_postmortem_report(
+            &conn,
+            postmortem::PostmortemTarget::Session("coach-companion-proxy-session".to_string()),
+            true,
+        )
+        .expect("postmortem report");
+        assert_eq!(
+            report
+                .pointer("/coach/decision/correlation/session_id")
+                .and_then(Value::as_str),
+            Some("coach-companion-proxy-session")
+        );
+        assert_eq!(
+            report
+                .pointer("/coach/decision/state")
+                .and_then(Value::as_str),
+            Some("ended")
+        );
+        assert_eq!(
+            report
+                .pointer("/coach/decision/correlation/ended")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            report.pointer("/coach/privacy").and_then(Value::as_str),
+            Some("redacted_by_default")
+        );
+        cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn hook_handler_blocks_risky_supported_tool_and_stores_hook_evidence() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        let path = unique_test_db_path("coach-hook-risky");
+        std::env::set_var("CODEX_BLACKBOX_DB_PATH", &path);
+        let output = process_coach_hook(serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "coach-hook-risky-session",
+            "turn_id": "turn_1",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git reset --hard HEAD"}
+        }));
+        std::env::remove_var("CODEX_BLACKBOX_DB_PATH");
+
+        assert_eq!(
+            output
+                .pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(Value::as_str),
+            Some("deny")
+        );
+        let conn = Connection::open(&path).expect("open test db");
+        let block_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM coach_events \
+                 WHERE session_id = 'coach-hook-risky-session' \
+                   AND evidence_source = 'hook' \
+                   AND category = 'coach_block_emitted'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count hook events");
+        assert_eq!(block_events, 1);
+        cleanup_test_db(&path);
     }
 
     fn insert_session(

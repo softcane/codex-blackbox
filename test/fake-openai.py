@@ -57,7 +57,15 @@ class Handler(BaseHTTPRequestHandler):
         self._send_plain(404, "not found\n")
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/v1/responses":
+        path = urlparse(self.path).path
+        if path == "/backend-api/codex/responses/compact":
+            length = int(self.headers.get("content-length", "0") or "0")
+            if length:
+                self.rfile.read(length)
+            self._send_json(200, {"status": "compact ok", "received_bytes": length})
+            return
+
+        if path != "/v1/responses":
             self._send_plain(404, "not found\n")
             return
 

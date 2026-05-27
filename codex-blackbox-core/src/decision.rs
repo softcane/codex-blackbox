@@ -1,5 +1,29 @@
 use serde::Serialize;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct DecisionSignal {
+    pub signal_name: String,
+    pub severity: String,
+    pub reason_code: String,
+    pub evidence_source: String,
+    pub reason: String,
+    pub next_action: String,
+    pub advisory: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct EvidenceSourceCount {
+    pub evidence_source: String,
+    pub count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WarningFact {
+    pub reason_code: String,
+    pub evidence_source: String,
+    pub message: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionState {
@@ -61,6 +85,11 @@ pub struct ObservedSessionFacts {
     pub policy_block: Option<PolicyBlockFacts>,
     pub policy_issues: Vec<String>,
     pub cooldown: Option<CooldownFacts>,
+    pub active_signals: Vec<DecisionSignal>,
+    pub evidence_sources: Vec<EvidenceSourceCount>,
+    pub postmortem_available: bool,
+    pub postmortem_link: Option<String>,
+    pub warning_facts: Vec<WarningFact>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -85,6 +114,14 @@ pub struct Decision {
     pub drill_down_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_block: Option<PolicyBlockFacts>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_signals: Vec<DecisionSignal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_sources: Vec<EvidenceSourceCount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postmortem_link: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_facts: Vec<WarningFact>,
     pub correlation: DecisionCorrelation,
 }
 
@@ -119,6 +156,10 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: nonempty_or(&block.recovery_action, "restart narrower"),
             drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
             policy_block: Some(block.clone()),
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
     }
@@ -135,6 +176,10 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: "wait before retry".to_string(),
             drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
             policy_block: None,
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
     }
@@ -147,6 +192,10 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: "start codex-blackbox up".to_string(),
             drill_down_command: None,
             policy_block: None,
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
     }
@@ -168,6 +217,10 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: "wait for observed traffic".to_string(),
             drill_down_command: None,
             policy_block: None,
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
     }
@@ -180,8 +233,27 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: "wait for response evidence".to_string(),
             drill_down_command: None,
             policy_block: None,
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
+    }
+
+    if let Some(signal) = strongest_signal(facts.active_signals.as_slice()) {
+        if matches!(
+            signal.severity.as_str(),
+            "blocked" | "cooldown" | "stop" | "careful"
+        ) {
+            let state = match signal.severity.as_str() {
+                "blocked" => DecisionState::Blocked,
+                "cooldown" => DecisionState::Cooldown,
+                "stop" => DecisionState::Stop,
+                _ => DecisionState::Careful,
+            };
+            return signal_decision(state, signal, facts, correlation);
+        }
     }
 
     if facts.failed_responses > 0 {
@@ -260,8 +332,18 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
             next_action: "read postmortem".to_string(),
             drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
             policy_block: None,
+            active_signals: facts.active_signals.clone(),
+            evidence_sources: facts.evidence_sources.clone(),
+            postmortem_link: decision_postmortem_link(facts),
+            warning_facts: facts.warning_facts.clone(),
             correlation,
         };
+    }
+
+    if let Some(signal) = strongest_signal(facts.active_signals.as_slice()) {
+        if signal.severity == "watching" {
+            return signal_decision(DecisionState::Watching, signal, facts, correlation);
+        }
     }
 
     if facts.local_estimate_trusted_for_budget_enforcement == Some(false) {
@@ -278,6 +360,10 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
         next_action: "continue".to_string(),
         drill_down_command: None,
         policy_block: None,
+        active_signals: facts.active_signals.clone(),
+        evidence_sources: facts.evidence_sources.clone(),
+        postmortem_link: decision_postmortem_link(facts),
+        warning_facts: facts.warning_facts.clone(),
         correlation,
     }
 }
@@ -301,6 +387,10 @@ fn careful_decision(
         },
         drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
         policy_block: None,
+        active_signals: facts.active_signals.clone(),
+        evidence_sources: facts.evidence_sources.clone(),
+        postmortem_link: decision_postmortem_link(facts),
+        warning_facts: facts.warning_facts.clone(),
         correlation,
     }
 }
@@ -318,8 +408,59 @@ fn stop_decision(
         next_action: "inspect postmortem".to_string(),
         drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
         policy_block: None,
+        active_signals: facts.active_signals.clone(),
+        evidence_sources: facts.evidence_sources.clone(),
+        postmortem_link: decision_postmortem_link(facts),
+        warning_facts: facts.warning_facts.clone(),
         correlation,
     }
+}
+
+fn signal_decision(
+    state: DecisionState,
+    signal: &DecisionSignal,
+    facts: &ObservedSessionFacts,
+    correlation: DecisionCorrelation,
+) -> Decision {
+    Decision {
+        state,
+        primary_reason: nonempty_or(&signal.reason, signal.reason_code.as_str()),
+        secondary_reasons: vec![format!(
+            "{} from {}",
+            signal.reason_code, signal.evidence_source
+        )],
+        next_action: nonempty_or(&signal.next_action, "inspect companion"),
+        drill_down_command: Some(postmortem_command(facts.session_id.as_deref())),
+        policy_block: facts.policy_block.clone(),
+        active_signals: facts.active_signals.clone(),
+        evidence_sources: facts.evidence_sources.clone(),
+        postmortem_link: decision_postmortem_link(facts),
+        warning_facts: facts.warning_facts.clone(),
+        correlation,
+    }
+}
+
+fn strongest_signal(signals: &[DecisionSignal]) -> Option<&DecisionSignal> {
+    signals.iter().max_by_key(|signal| signal_rank(signal))
+}
+
+fn signal_rank(signal: &DecisionSignal) -> u8 {
+    match signal.severity.as_str() {
+        "blocked" => 6,
+        "cooldown" => 5,
+        "stop" => 4,
+        "careful" => 3,
+        "watching" => 2,
+        _ => 1,
+    }
+}
+
+fn decision_postmortem_link(facts: &ObservedSessionFacts) -> Option<String> {
+    facts.postmortem_link.clone().or_else(|| {
+        facts
+            .postmortem_available
+            .then(|| postmortem_command(facts.session_id.as_deref()))
+    })
 }
 
 fn postmortem_command(session_id: Option<&str>) -> String {

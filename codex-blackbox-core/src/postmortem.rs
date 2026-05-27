@@ -5,7 +5,7 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use super::diagnosis;
+use super::{coach, diagnosis};
 
 const PROVIDER: &str = "codex_responses";
 const DETAIL_UNAVAILABLE: &str = "detail unavailable";
@@ -117,6 +117,7 @@ pub(crate) fn build_postmortem_report(
     let redactor = Redactor::new(redact);
     let impact = impact_totals(&turns);
     let signals = build_signals(&turns);
+    let coach = build_coach_report(conn, &session_id, &turns);
     let flight_recorder = build_flight_recorder(&turns);
     let evidence = build_evidence(&turns, &redactor);
     let timeline = build_timeline(&session, &turns, diagnosis.degraded, &redactor);
@@ -164,6 +165,7 @@ pub(crate) fn build_postmortem_report(
             })),
         },
         "signals": signals,
+        "coach": coach,
         "flight_recorder": flight_recorder,
         "evidence": evidence,
         "timeline": timeline,
@@ -444,6 +446,118 @@ fn impact_totals(turns: &[TurnEvidence]) -> ImpactTotals {
             .saturating_add(turn.input_tokens.saturating_add(turn.output_tokens));
     }
     totals
+}
+
+fn build_coach_report(conn: &Connection, session_id: &str, turns: &[TurnEvidence]) -> Value {
+    let mut events = load_persisted_coach_events(conn, session_id).unwrap_or_default();
+    if events.is_empty() {
+        events = synthesize_coach_events_from_turns(session_id, turns);
+    }
+    if let Some(ended_at) = conn
+        .query_row(
+            "SELECT ended_at FROM sessions WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    {
+        events.push(
+            coach::NormalizedEvent::new(
+                ended_at,
+                coach::EvidenceSource::Proxy,
+                coach::EventCategory::StopObserved,
+            )
+            .with_session(session_id.to_string())
+            .with_reason("session_ended")
+            .with_privacy(coach::PrivacyClassification::PublicAggregate),
+        );
+    }
+    let mut state = coach::derive_session_state(&events);
+    state.session_id = Some(session_id.to_string());
+    state.postmortem_available = true;
+    state.postmortem_link = Some(format!("codex-blackbox postmortem {session_id}"));
+    let signals = coach::detect_signals(&state);
+    let decision = super::decision::decide(&coach::facts_from_state_and_signals(&state, &signals));
+    json!({
+        "decision": decision,
+        "signals": signals,
+        "evidence_sources": state.evidence_source_summary,
+        "privacy": "redacted_by_default",
+    })
+}
+
+fn load_persisted_coach_events(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Vec<coach::NormalizedEvent>> {
+    let mut stmt = match conn.prepare(
+        "SELECT timestamp, evidence_source, category, reason_code, privacy, confidence, \
+                session_id, turn_id, payload_summary \
+         FROM coach_events \
+         WHERE session_id = ?1 \
+         ORDER BY timestamp ASC, id ASC \
+         LIMIT 500",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
+        let payload_raw = row.get::<_, String>(8)?;
+        let payload_summary =
+            serde_json::from_str::<BTreeMap<String, Value>>(&payload_raw).unwrap_or_default();
+        Ok(coach::NormalizedEvent {
+            timestamp: row.get::<_, String>(0)?,
+            evidence_source: coach::EvidenceSource::from_str(&row.get::<_, String>(1)?),
+            category: coach::EventCategory::from_str(&row.get::<_, String>(2)?),
+            reason_code: row.get::<_, Option<String>>(3)?,
+            privacy: coach::PrivacyClassification::from_str(&row.get::<_, String>(4)?),
+            confidence: coach::ConfidenceLevel::from_str(&row.get::<_, String>(5)?),
+            session_id: row.get::<_, Option<String>>(6)?,
+            turn_id: row.get::<_, Option<String>>(7)?,
+            payload_summary,
+        })
+    })?;
+    rows.collect()
+}
+
+fn synthesize_coach_events_from_turns(
+    session_id: &str,
+    turns: &[TurnEvidence],
+) -> Vec<coach::NormalizedEvent> {
+    let mut events = Vec::new();
+    for turn in turns {
+        events.push(coach::proxy_turn_event(
+            turn.timestamp.clone(),
+            session_id.to_string(),
+            format!("turn_{}", turn.turn_number),
+            &turn.status,
+            coach::TokenTotals {
+                input_tokens: turn.input_tokens,
+                cached_input_tokens: turn.cached_input_tokens,
+                output_tokens: turn.output_tokens,
+                reasoning_output_tokens: turn.reasoning_output_tokens,
+                local_total_tokens: turn.input_tokens.saturating_add(turn.output_tokens),
+            },
+            Some((turn.context_utilization * 100.0).clamp(0.0, 100.0)),
+        ));
+        for tool in &turn.tool_calls {
+            events.push(
+                coach::NormalizedEvent::new(
+                    turn.timestamp.clone(),
+                    coach::EvidenceSource::Proxy,
+                    coach::EventCategory::ToolIntentObserved,
+                )
+                .with_session(session_id.to_string())
+                .with_turn(format!("turn_{}", turn.turn_number))
+                .with_reason("proxy_tool_intent")
+                .with_payload_value("tool_category", json!(coach::tool_category(&tool.name))),
+            );
+        }
+    }
+    events
 }
 
 fn build_flight_recorder(turns: &[TurnEvidence]) -> Vec<Value> {

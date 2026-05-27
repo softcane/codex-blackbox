@@ -35,6 +35,16 @@ static_resources:
                             body:
                               inline_string: "ready\n"
                         - match:
+                            prefix: "/backend-api/codex/responses/compact"
+                          route:
+                            cluster: fake_openai_upstream
+                            timeout: 300s
+                            host_rewrite_literal: fake-openai
+                          typed_per_filter_config:
+                            envoy.filters.http.ext_proc:
+                              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExtProcPerRoute
+                              disabled: true
+                        - match:
                             prefix: "/"
                           route:
                             cluster: fake_openai_upstream
@@ -50,6 +60,7 @@ static_resources:
                           timestamp: "%START_TIME%"
                           method: "%REQ(:METHOD)%"
                           path: "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%"
+                          upgrade: "%REQ(UPGRADE)%"
                           status: "%RESPONSE_CODE%"
                           duration_ms: "%DURATION%"
                           bytes_rx: "%BYTES_RECEIVED%"

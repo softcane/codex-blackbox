@@ -307,6 +307,38 @@ send_parallel_requests() {
     pass "Parallel fake Responses requests completed"
 }
 
+assert_large_compact_bypasses_ext_proc_buffer() {
+    local request_path="$REQUEST_DIR/compact-large.json"
+    local response_path="$RESPONSE_DIR/compact-large.json"
+    local error_path="$RESPONSE_DIR/compact-large.err"
+
+    REQUEST_PATH="$request_path" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+body = {
+    "model": "gpt-codex-fixture",
+    "input": "x" * 1_078_730,
+}
+Path(os.environ["REQUEST_PATH"]).write_text(json.dumps(body), encoding="utf-8")
+PY
+
+    local http_code
+    if ! http_code=$(curl -sS --max-time 30 \
+        -w "%{http_code}" \
+        -o "$response_path" \
+        -H "authorization: Bearer fake-openai-full-fake" \
+        -H "content-type: application/json" \
+        --data-binary @"$request_path" \
+        "$ENVOY_URL/backend-api/codex/responses/compact" 2>"$error_path"); then
+        fail "large compact curl failed; stderr in $error_path"
+    fi
+
+    [ "$http_code" = "200" ] || fail "large compact expected HTTP 200, got $http_code; response in $response_path"
+    assert_file_contains "$response_path" "compact ok" "Large compact request reaches fake upstream"
+}
+
 expected_status_for_fixture() {
     case "$1" in
         failed) printf "failed" ;;
@@ -818,6 +850,7 @@ wait_for_http "prometheus" "$PROMETHEUS_URL/-/ready"
 wait_for_http "grafana" "$GRAFANA_URL/api/health"
 pass "Core, Envoy, Prometheus, and Grafana are reachable"
 
+assert_large_compact_bypasses_ext_proc_buffer
 send_parallel_requests
 assert_watch_replay
 assert_diagnosis_api

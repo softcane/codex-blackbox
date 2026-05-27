@@ -1,4 +1,11 @@
+mod baseline_commands;
+mod coach_commands;
 mod tmux;
+mod ui_commands;
+mod ui_config;
+mod ui_launch;
+mod ui_process;
+mod ui_status;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -193,6 +200,18 @@ enum Commands {
         target: String,
     },
 
+    /// Install, inspect, or run the Codex Blackbox hook coach
+    Coach {
+        #[command(subcommand)]
+        command: CoachCommands,
+    },
+
+    /// Manage optional derived-only local baseline learning
+    Baseline {
+        #[command(subcommand)]
+        command: BaselineCommands,
+    },
+
     /// Search across past session prompts and final summaries
     Recall {
         /// Base URL of codex-blackbox-core
@@ -263,6 +282,20 @@ enum Commands {
         command: ConfigCommands,
     },
 
+    /// Experimental local Codex Desktop/IDE UI integration
+    Ui {
+        /// Codex user config path; defaults to CODEX_HOME/config.toml or ~/.codex/config.toml
+        #[arg(long)]
+        config: Option<PathBuf>,
+
+        /// Codex Blackbox UI state directory; tests can override this to avoid user state
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+
+        #[command(subcommand)]
+        command: UiCommands,
+    },
+
     /// Manual preflight checks for live smoke tests; never launches Codex turns
     Preflight {
         #[command(subcommand)]
@@ -274,6 +307,163 @@ enum Commands {
 enum ConfigCommands {
     /// Print the Codex proxy configuration used by the run wrapper without applying it
     Codex,
+}
+
+#[derive(Debug, Subcommand)]
+enum UiCommands {
+    /// Check experimental Codex UI mode configuration and local stack readiness
+    Doctor {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+
+    /// Enable experimental Codex UI mode in the user Codex config
+    Enable {
+        /// Print intended changes without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite an existing user-owned codex-blackbox-chatgpt provider
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Disable experimental Codex UI mode using Blackbox-owned state
+    Disable,
+
+    /// Show experimental Codex UI observation status
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Age threshold for recent observed traffic
+        #[arg(long, default_value = "900")]
+        recent_seconds: u64,
+    },
+
+    /// Start or focus Codex Desktop where supported
+    Launch {
+        /// Print the platform launch action without running it
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Guided live UI smoke checklist; never starts live model traffic by default
+    Smoke,
+}
+
+#[derive(Debug, Subcommand)]
+enum CoachCommands {
+    /// Preview the project-local hooks.json that would be installed
+    Preview {
+        /// hooks.json path; defaults to .codex/hooks.json in the current repo
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+
+        /// Base URL of codex-blackbox-core used by the hook command
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+
+    /// Install project-local hook coach entries
+    Install {
+        /// hooks.json path; defaults to .codex/hooks.json in the current repo
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+
+        /// Print intended changes without modifying files
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Replace an invalid existing hooks.json with the Blackbox hook set
+        #[arg(long)]
+        force: bool,
+
+        /// Base URL of codex-blackbox-core used by the hook command
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+
+    /// Remove Blackbox-owned hook coach entries
+    Uninstall {
+        /// hooks.json path; defaults to .codex/hooks.json in the current repo
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+    },
+
+    /// Show whether Blackbox hook coach entries are installed
+    Status {
+        /// hooks.json path; defaults to .codex/hooks.json in the current repo
+        #[arg(long)]
+        hooks_file: Option<PathBuf>,
+
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run as a Codex command hook: read hook JSON from stdin and emit hook JSON on stdout
+    Handle {
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BaselineCommands {
+    /// Preview derived-only baseline facts from companion API snapshots
+    Preview {
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+    },
+
+    /// Store derived-only baseline facts locally
+    Learn {
+        /// Base URL of codex-blackbox-core
+        #[arg(long, default_value = "http://localhost:9091")]
+        url: String,
+
+        /// Baseline file path
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
+
+    /// Show the stored baseline
+    Show {
+        /// Baseline file path
+        #[arg(long)]
+        state: Option<PathBuf>,
+
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove the stored baseline
+    Reset {
+        /// Baseline file path
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
+
+    /// Disable baseline learning while keeping a derived-only marker
+    Disable {
+        /// Baseline file path
+        #[arg(long)]
+        state: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -3341,6 +3531,45 @@ async fn main() {
                 std::process::exit(1);
             }
         },
+        Commands::Coach { command } => match command {
+            CoachCommands::Preview { hooks_file, url } => {
+                std::process::exit(coach_commands::run_preview(hooks_file, url));
+            }
+            CoachCommands::Install {
+                hooks_file,
+                dry_run,
+                force,
+                url,
+            } => {
+                std::process::exit(coach_commands::run_install(hooks_file, dry_run, force, url));
+            }
+            CoachCommands::Uninstall { hooks_file } => {
+                std::process::exit(coach_commands::run_uninstall(hooks_file));
+            }
+            CoachCommands::Status { hooks_file, json } => {
+                std::process::exit(coach_commands::run_status(hooks_file, json));
+            }
+            CoachCommands::Handle { url } => {
+                std::process::exit(coach_commands::run_handle(url).await);
+            }
+        },
+        Commands::Baseline { command } => match command {
+            BaselineCommands::Preview { url } => {
+                std::process::exit(baseline_commands::run_preview(url).await);
+            }
+            BaselineCommands::Learn { url, state } => {
+                std::process::exit(baseline_commands::run_learn(url, state).await);
+            }
+            BaselineCommands::Show { state, json } => {
+                std::process::exit(baseline_commands::run_show(state, json));
+            }
+            BaselineCommands::Reset { state } => {
+                std::process::exit(baseline_commands::run_reset(state));
+            }
+            BaselineCommands::Disable { state } => {
+                std::process::exit(baseline_commands::run_disable(state));
+            }
+        },
         Commands::Recall {
             url,
             limit,
@@ -3401,6 +3630,43 @@ async fn main() {
         Commands::Config { command } => match command {
             ConfigCommands::Codex => {
                 print_codex_config_preview();
+            }
+        },
+        Commands::Ui {
+            config,
+            state_dir,
+            command,
+        } => match command {
+            UiCommands::Doctor { json, url } => {
+                std::process::exit(ui_commands::run_doctor(config, state_dir, url, json).await);
+            }
+            UiCommands::Enable { dry_run, force } => {
+                std::process::exit(ui_commands::run_enable(config, state_dir, dry_run, force));
+            }
+            UiCommands::Disable => {
+                std::process::exit(ui_commands::run_disable(config, state_dir));
+            }
+            UiCommands::Status {
+                json,
+                url,
+                recent_seconds,
+            } => {
+                std::process::exit(
+                    ui_commands::run_status(config, state_dir, url, json, recent_seconds).await,
+                );
+            }
+            UiCommands::Launch { dry_run } => {
+                std::process::exit(ui_commands::run_launch(dry_run));
+            }
+            UiCommands::Smoke => {
+                println!("Codex Blackbox UI smoke is guided only.");
+                println!("No live model traffic was started by this command.");
+                println!(
+                    "Before a real smoke: run `codex-blackbox up` and `codex-blackbox ui enable`."
+                );
+                println!("Then restart local Codex Desktop or the local IDE extension app-server.");
+                println!("After explicit user approval, send one small UI prompt and run `codex-blackbox ui status --json`.");
+                println!("Live UI support proof requires observed provider=\"codex_responses\" traffic from that real Desktop/IDE smoke.");
             }
         },
         Commands::Preflight { command } => match command {
