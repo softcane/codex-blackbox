@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use clap::{Parser, Subcommand, ValueEnum};
 use codex_blackbox_core::decision::{
-    decide, CooldownFacts, Decision, DecisionState, ObservedSessionFacts,
+    decide, CooldownFacts, Decision, DecisionSignal, DecisionState, EvidenceSourceCount,
+    ObservedSessionFacts, WarningFact,
 };
 use codex_blackbox_core::guard_policy::{
     evaluate_guard_policy, load_guard_policy_from_env, load_guard_policy_from_path,
@@ -3908,6 +3909,89 @@ fn status_count(report: &serde_json::Value, status: &str) -> u32 {
         .min(u32::MAX as u64) as u32
 }
 
+fn coach_decision_signals_from_report(report: &serde_json::Value) -> Vec<DecisionSignal> {
+    report
+        .pointer("/coach/signals")
+        .and_then(|value| value.as_array())
+        .map(|signals| {
+            signals
+                .iter()
+                .filter_map(|signal| {
+                    let signal_name = json_str(signal, "signal_name")?;
+                    let reason_code = json_str(signal, "reason_code").unwrap_or(signal_name);
+                    Some(DecisionSignal {
+                        signal_name: signal_name.to_string(),
+                        severity: json_str(signal, "severity")
+                            .unwrap_or("watching")
+                            .to_string(),
+                        reason_code: reason_code.to_string(),
+                        evidence_source: json_str(signal, "evidence_source")
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        reason: json_str(signal, "reason")
+                            .unwrap_or(reason_code)
+                            .to_string(),
+                        next_action: json_str(signal, "next_action")
+                            .unwrap_or("inspect companion")
+                            .to_string(),
+                        advisory: signal
+                            .get("advisory")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(true),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn coach_evidence_sources_from_report(report: &serde_json::Value) -> Vec<EvidenceSourceCount> {
+    if let Some(items) = report
+        .pointer("/coach/decision/evidence_sources")
+        .and_then(|value| value.as_array())
+    {
+        return items
+            .iter()
+            .filter_map(|item| {
+                Some(EvidenceSourceCount {
+                    evidence_source: json_str(item, "evidence_source")?.to_string(),
+                    count: item
+                        .get("count")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0)
+                        .min(u32::MAX as u64) as u32,
+                })
+            })
+            .collect();
+    }
+
+    report
+        .pointer("/coach/evidence_sources")
+        .and_then(|value| value.as_object())
+        .map(|sources| {
+            sources
+                .iter()
+                .map(|(source, count)| EvidenceSourceCount {
+                    evidence_source: source.to_string(),
+                    count: count.as_u64().unwrap_or(0).min(u32::MAX as u64) as u32,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn coach_warnings_from_signals(signals: &[DecisionSignal]) -> Vec<WarningFact> {
+    signals
+        .iter()
+        .filter(|signal| signal.severity == "careful")
+        .map(|signal| WarningFact {
+            reason_code: signal.reason_code.clone(),
+            evidence_source: signal.evidence_source.clone(),
+            message: signal.reason.clone(),
+        })
+        .collect()
+}
+
 fn status_report_to_facts(report: &serde_json::Value) -> ObservedSessionFacts {
     let summary = report.get("summary").unwrap_or(&serde_json::Value::Null);
     let impact = report.get("impact").unwrap_or(&serde_json::Value::Null);
@@ -3924,6 +4008,8 @@ fn status_report_to_facts(report: &serde_json::Value) -> ObservedSessionFacts {
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     let has_ended_at = json_str(summary, "ended_at").is_some_and(|value| !value.trim().is_empty());
+    let active_signals = coach_decision_signals_from_report(report);
+    let warning_facts = coach_warnings_from_signals(&active_signals);
 
     ObservedSessionFacts {
         session_id: json_str(report, "session_id").map(ToString::to_string),
@@ -3954,6 +4040,17 @@ fn status_report_to_facts(report: &serde_json::Value) -> ObservedSessionFacts {
         local_estimate_trusted_for_budget_enforcement: impact
             .get("local_estimate_trusted_for_budget_enforcement")
             .and_then(|value| value.as_bool()),
+        active_signals,
+        evidence_sources: coach_evidence_sources_from_report(report),
+        postmortem_available: true,
+        postmortem_link: json_str(
+            report
+                .pointer("/coach/decision")
+                .unwrap_or(&serde_json::Value::Null),
+            "postmortem_link",
+        )
+        .map(ToString::to_string),
+        warning_facts,
         ..Default::default()
     }
 }
@@ -6474,6 +6571,116 @@ mod tests {
 
         assert_eq!(decision.state, DecisionState::Ended);
         assert_eq!(decision.primary_reason, "1 turns, 18K tokens");
+    }
+
+    #[test]
+    fn status_and_guard_keep_ended_for_untrusted_pricing_only_coach_signal() {
+        let report = serde_json::json!({
+            "session_id": "session_status",
+            "partial": false,
+            "summary": {
+                "turn_count": 1,
+                "ended_at": "2026-05-16T19:34:31Z"
+            },
+            "impact": {
+                "local_total_tokens": 18446,
+                "local_estimate_trusted_for_budget_enforcement": false
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 1,
+                    "failed": 0,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 9.2},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": "none"},
+            "coach": {
+                "signals": [{
+                    "signal_name": "untrusted_pricing",
+                    "severity": "careful",
+                    "reason_code": "untrusted_pricing",
+                    "evidence_source": "user_policy",
+                    "reason": "dollar budget uses untrusted pricing",
+                    "next_action": "keep budgets advisory",
+                    "advisory": true
+                }],
+                "decision": {
+                    "evidence_sources": [{"evidence_source": "proxy", "count": 1}],
+                    "postmortem_link": "codex-blackbox postmortem session_status"
+                }
+            }
+        });
+
+        let status_decision = decide(&status_report_to_facts(&report));
+        let guard_decision = guard_report_to_decision(
+            &report,
+            &codex_blackbox_core::guard_policy::GuardPolicy::default(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(status_decision.state, DecisionState::Ended);
+        assert_eq!(guard_decision.state, DecisionState::Ended);
+        assert_eq!(status_decision.primary_reason, "1 turns, 18K tokens");
+        assert_eq!(guard_decision.primary_reason, "1 turns, 18K tokens");
+    }
+
+    #[test]
+    fn status_report_reuses_coach_signals_for_decision_reason() {
+        let report = serde_json::json!({
+            "session_id": "session_high_context",
+            "partial": false,
+            "summary": {
+                "turn_count": 1,
+                "ended_at": "2026-05-16T19:34:31Z"
+            },
+            "impact": {
+                "local_total_tokens": 91000,
+                "local_estimate_trusted_for_budget_enforcement": false
+            },
+            "signals": {
+                "response_statuses": {
+                    "completed": 1,
+                    "failed": 0,
+                    "incomplete": 0,
+                    "unknown": 0
+                },
+                "context_fill": {"max_percent": 90.0},
+                "model_mismatches": [],
+                "accounting_anomaly_count": 0
+            },
+            "diagnosis": {"primary_cause_type": "none"},
+            "coach": {
+                "signals": [{
+                    "signal_name": "high_context",
+                    "severity": "stop",
+                    "reason_code": "high_context_stop",
+                    "evidence_source": "proxy",
+                    "reason": "context pressure is critical",
+                    "next_action": "summarize and restart narrower",
+                    "advisory": false
+                }],
+                "decision": {
+                    "evidence_sources": [{"evidence_source": "proxy", "count": 2}],
+                    "postmortem_link": "codex-blackbox postmortem session_high_context"
+                }
+            }
+        });
+        let decision = decide(&status_report_to_facts(&report));
+
+        assert_eq!(decision.state, DecisionState::Stop);
+        assert_eq!(decision.primary_reason, "context pressure is critical");
+        assert_eq!(decision.next_action, "summarize and restart narrower");
+        assert_eq!(
+            decision.secondary_reasons,
+            vec!["high_context_stop from proxy"]
+        );
+        assert_eq!(decision.active_signals.len(), 1);
+        assert_eq!(decision.evidence_sources.len(), 1);
     }
 
     #[test]

@@ -453,27 +453,29 @@ fn build_coach_report(conn: &Connection, session_id: &str, turns: &[TurnEvidence
     if events.is_empty() {
         events = synthesize_coach_events_from_turns(session_id, turns);
     }
-    if let Some(ended_at) = conn
-        .query_row(
-            "SELECT ended_at FROM sessions WHERE session_id = ?1",
-            rusqlite::params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .flatten()
-    {
-        events.push(
-            coach::NormalizedEvent::new(
-                ended_at,
-                coach::EvidenceSource::Proxy,
-                coach::EventCategory::StopObserved,
+    if super::session_has_codex_evidence(conn, session_id).unwrap_or(false) {
+        if let Some(ended_at) = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, Option<String>>(0),
             )
-            .with_session(session_id.to_string())
-            .with_reason("session_ended")
-            .with_privacy(coach::PrivacyClassification::PublicAggregate),
-        );
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+        {
+            events.push(
+                coach::NormalizedEvent::new(
+                    ended_at,
+                    coach::EvidenceSource::Proxy,
+                    coach::EventCategory::StopObserved,
+                )
+                .with_session(session_id.to_string())
+                .with_reason("session_ended")
+                .with_privacy(coach::PrivacyClassification::PublicAggregate),
+            );
+        }
     }
     let mut state = coach::derive_session_state(&events);
     state.session_id = Some(session_id.to_string());

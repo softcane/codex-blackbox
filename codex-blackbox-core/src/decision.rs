@@ -241,7 +241,7 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
         };
     }
 
-    if let Some(signal) = strongest_signal(facts.active_signals.as_slice()) {
+    if let Some(signal) = strongest_signal(facts.active_signals.as_slice(), facts) {
         if matches!(
             signal.severity.as_str(),
             "blocked" | "cooldown" | "stop" | "careful"
@@ -340,7 +340,7 @@ pub fn decide(facts: &ObservedSessionFacts) -> Decision {
         };
     }
 
-    if let Some(signal) = strongest_signal(facts.active_signals.as_slice()) {
+    if let Some(signal) = strongest_signal(facts.active_signals.as_slice(), facts) {
         if signal.severity == "watching" {
             return signal_decision(DecisionState::Watching, signal, facts, correlation);
         }
@@ -440,8 +440,20 @@ fn signal_decision(
     }
 }
 
-fn strongest_signal(signals: &[DecisionSignal]) -> Option<&DecisionSignal> {
-    signals.iter().max_by_key(|signal| signal_rank(signal))
+fn strongest_signal<'a>(
+    signals: &'a [DecisionSignal],
+    facts: &ObservedSessionFacts,
+) -> Option<&'a DecisionSignal> {
+    signals
+        .iter()
+        .filter(|signal| signal_should_drive_decision(signal, facts))
+        .max_by_key(|signal| signal_rank(signal))
+}
+
+fn signal_should_drive_decision(signal: &DecisionSignal, facts: &ObservedSessionFacts) -> bool {
+    !(facts.ended
+        && signal.severity == "careful"
+        && (signal.signal_name == "untrusted_pricing" || signal.reason_code == "untrusted_pricing"))
 }
 
 fn signal_rank(signal: &DecisionSignal) -> u8 {
@@ -502,7 +514,10 @@ fn format_tokens(tokens: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decide, CooldownFacts, DecisionState, ObservedSessionFacts, PolicyBlockFacts};
+    use super::{
+        decide, CooldownFacts, DecisionSignal, DecisionState, ObservedSessionFacts,
+        PolicyBlockFacts,
+    };
 
     fn observed() -> ObservedSessionFacts {
         ObservedSessionFacts {
@@ -798,6 +813,30 @@ mod tests {
 
         assert_eq!(decision.state, DecisionState::Ended);
         assert_eq!(decision.primary_reason, "5 turns, 84K tokens");
+    }
+
+    #[test]
+    fn decision_keeps_ended_when_only_active_signal_is_untrusted_pricing() {
+        let mut facts = observed();
+        facts.ended = true;
+        facts.total_turns = 5;
+        facts.total_tokens = 84_000;
+        facts.local_estimate_trusted_for_budget_enforcement = Some(false);
+        facts.active_signals = vec![DecisionSignal {
+            signal_name: "untrusted_pricing".to_string(),
+            severity: "careful".to_string(),
+            reason_code: "untrusted_pricing".to_string(),
+            evidence_source: "user_policy".to_string(),
+            reason: "dollar budget uses untrusted pricing".to_string(),
+            next_action: "keep budgets advisory".to_string(),
+            advisory: true,
+        }];
+
+        let decision = decide(&facts);
+
+        assert_eq!(decision.state, DecisionState::Ended);
+        assert_eq!(decision.primary_reason, "5 turns, 84K tokens");
+        assert_eq!(decision.active_signals.len(), 1);
     }
 
     #[test]

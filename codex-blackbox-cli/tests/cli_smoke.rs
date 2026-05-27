@@ -249,6 +249,8 @@ fn ui_enable_dry_run_prints_exact_config_without_mutating_files() {
     let out = stdout(&output);
     assert!(out.contains("Codex Blackbox UI enable preview"));
     assert!(out.contains("Dry run: no files modified"));
+    assert!(out.contains("HTTP Responses fallback traffic observed through Envoy/core"));
+    assert!(out.contains("WebSocket-only traffic is unobservable, unsupported, and deferred"));
     assert!(out.contains(config_path.to_str().expect("utf8 config")));
     assert!(out.contains(r#"openai_base_url = "http://127.0.0.1:10000/backend-api/codex""#));
     assert!(out.contains("[features]"));
@@ -388,6 +390,14 @@ fn ui_doctor_json_reports_missing_config_stack_readiness_and_restart_warning() {
         value.get("restart_required").and_then(|v| v.as_bool()),
         Some(true)
     );
+    assert!(value
+        .get("evidence_rule")
+        .and_then(|v| v.as_str())
+        .is_some_and(
+            |rule| rule.contains("HTTP Responses traffic observed through Envoy/core")
+                && rule
+                    .contains("WebSocket-only traffic is unobservable, unsupported, and deferred")
+        ));
     assert_eq!(
         value
             .pointer("/active_app_server_processes/0/pid")
@@ -629,6 +639,54 @@ fn ui_status_json_reports_http_unparsed_when_proxy_sees_post_without_core_eviden
 }
 
 #[test]
+fn ui_status_plain_labels_websocket_only_as_unobservable_unsupported_and_deferred() {
+    let dir = unique_test_dir("ui-status-websocket-plain");
+    let config_path = dir.join("config.toml");
+    let state_dir = dir.join("state");
+    let envoy_logs = r#"{"status":426,"method":"GET","path":"/backend-api/codex/responses","upgrade":"websocket"}"#;
+    let envs = [
+        (
+            "CODEX_BLACKBOX_CODEX_CONFIG",
+            config_path.to_str().expect("utf8 config"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_STATE_DIR",
+            state_dir.to_str().expect("utf8 state"),
+        ),
+        (
+            "CODEX_BLACKBOX_UI_PROCESS_FIXTURE",
+            "102 /usr/local/bin/codex app-server --port 1234",
+        ),
+        ("CODEX_BLACKBOX_UI_ENVOY_LOG_FIXTURE", envoy_logs),
+    ];
+    let enable = codex_blackbox_with_env(&["ui", "enable"], &envs);
+    assert!(enable.status.success(), "stderr:\n{}", stderr(&enable));
+    let (url, request_rx) = serve_json_once(
+        r#"{"provider":"codex_responses","request_count":0,"latest_request_rowid":0,"matched":false}"#,
+    );
+
+    let output = codex_blackbox_with_env(&["ui", "status", "--url", &url], &envs);
+
+    assert!(output.status.success(), "stderr:\n{}", stderr(&output));
+    let request = captured_request(request_rx);
+    assert!(
+        request.starts_with("POST /api/observations/codex "),
+        "unexpected request:\n{request}"
+    );
+    let out = stdout(&output);
+    assert!(out.contains("codex-blackbox ui: websocket_only_unobservable"));
+    assert!(out.contains("HTTP Responses via Envoy/core"));
+    assert!(
+        out.contains("WebSocket-only frame contents are unobservable, unsupported, and deferred")
+    );
+    assert!(!out
+        .to_ascii_lowercase()
+        .contains("websocket frame observation"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn ui_status_json_does_not_treat_fake_fixture_sessions_as_live_ui_evidence() {
     let dir = unique_test_dir("ui-status-fake-fixture");
     let config_path = dir.join("config.toml");
@@ -734,6 +792,14 @@ fn ui_status_json_reports_recent_observed_traffic_from_core_fixtures() {
         value.get("state").and_then(|v| v.as_str()),
         Some("observing_recent_ui_traffic")
     );
+    assert!(value
+        .get("evidence")
+        .and_then(|v| v.as_str())
+        .is_some_and(|evidence| evidence
+            == "HTTP Responses via Envoy/core provider=\"codex_responses\" traffic only"));
+    assert!(value.get("caveat").and_then(|v| v.as_str()).is_some_and(
+        |caveat| caveat.contains("WebSocket-only traffic is unobservable/unsupported/deferred")
+    ));
     assert_eq!(
         value
             .get("observed_codex_responses")
@@ -935,6 +1001,8 @@ fn coach_install_status_and_uninstall_round_trip_through_temp_hooks_file() {
     let installed = fs::read_to_string(&hooks_file).expect("read hooks");
     assert!(installed.contains("codex-blackbox coach handle"));
     assert!(installed.contains("UserPromptSubmit"));
+    assert!(installed.contains("PreCompact"));
+    assert!(installed.contains("PostCompact"));
 
     let status = codex_blackbox(&[
         "coach",
@@ -947,7 +1015,7 @@ fn coach_install_status_and_uninstall_round_trip_through_temp_hooks_file() {
     let value: serde_json::Value = serde_json::from_str(&stdout(&status)).expect("status json");
     assert_eq!(
         value.get("installed_handlers").and_then(|v| v.as_u64()),
-        Some(4)
+        Some(6)
     );
 
     let uninstall = codex_blackbox(&[

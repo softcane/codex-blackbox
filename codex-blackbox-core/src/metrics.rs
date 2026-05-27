@@ -29,19 +29,22 @@ const LIVE_TOKEN_KINDS: [&str; 6] = [
 ];
 const LIVE_CONTEXT_PROVIDERS: [&str; 2] = ["codex_responses", "unknown"];
 const LIVE_CODEX_RESPONSE_STATUSES: [&str; 4] = ["completed", "failed", "incomplete", "unknown"];
-const HOOK_EVENTS: [&str; 5] = [
+const HOOK_EVENTS: [&str; 7] = [
     "pre_tool_use",
     "post_tool_use",
     "user_prompt_submit",
     "stop",
+    "pre_compact",
+    "post_compact",
     "other",
 ];
 const HOOK_TOOL_CATEGORIES: [&str; 4] = ["bash", "apply_patch", "mcp", "other"];
 const HOOK_RESULTS: [&str; 4] = ["success", "failure", "blocked", "unknown"];
 const VALIDATION_CATEGORIES: [&str; 5] = ["test", "lint", "typecheck", "build", "unknown"];
 const VALIDATION_RESULTS: [&str; 3] = ["success", "failure", "unknown"];
-const LOOP_SIGNALS: [&str; 10] = [
+const LOOP_SIGNALS: [&str; 13] = [
     "repeated_validation_failure",
+    "repeated_tool_failure",
     "blind_retry",
     "unvalidated_edit",
     "high_context",
@@ -49,6 +52,8 @@ const LOOP_SIGNALS: [&str; 10] = [
     "failed_response",
     "unknown_response",
     "risky_supported_tool_call",
+    "untrusted_pricing",
+    "rate_limit_pressure",
     "missing_durable_evidence",
     "other",
 ];
@@ -600,6 +605,8 @@ fn normalize_hook_event(event: &str) -> &'static str {
         "PostToolUse" | "post_tool_use" => "post_tool_use",
         "UserPromptSubmit" | "user_prompt_submit" => "user_prompt_submit",
         "Stop" | "stop" => "stop",
+        "PreCompact" | "pre_compact" => "pre_compact",
+        "PostCompact" | "post_compact" => "post_compact",
         _ => "other",
     }
 }
@@ -643,6 +650,7 @@ fn normalize_validation_result(result: &str) -> &'static str {
 fn normalize_loop_signal(signal: &str) -> &'static str {
     match signal {
         "repeated_validation_failure" => "repeated_validation_failure",
+        "repeated_tool_failure" => "repeated_tool_failure",
         "blind_retry" => "blind_retry",
         "unvalidated_edit" => "unvalidated_edit",
         "high_context" => "high_context",
@@ -650,6 +658,8 @@ fn normalize_loop_signal(signal: &str) -> &'static str {
         "failed_response" => "failed_response",
         "unknown_response" => "unknown_response",
         "risky_supported_tool_call" => "risky_supported_tool_call",
+        "untrusted_pricing" => "untrusted_pricing",
+        "rate_limit_pressure" => "rate_limit_pressure",
         "missing_durable_evidence" => "missing_durable_evidence",
         _ => "other",
     }
@@ -746,6 +756,7 @@ mod tests {
         });
         record_codex_response_status("failed", "gpt-5.5");
         record_hook_event("PreToolUse", "bash", "blocked");
+        record_hook_event("PreCompact", "other", "success");
         record_validation_run("test", "failure");
         record_loop_signal(
             "session-id-like-cause-phase-8b",
@@ -753,6 +764,7 @@ mod tests {
             "session-id-like-source",
         );
         record_loop_signal("unvalidated_edit", "careful", "hook");
+        record_loop_signal("repeated_tool_failure", "careful", "hook");
         record_coach_action("block", "risky_supported_tool_call");
         record_guard_block("session-id-like-cause-phase-8b");
         record_baseline_build("project", "learned");
@@ -772,10 +784,16 @@ mod tests {
             "codex_blackbox_hook_events_total{event=\"pre_tool_use\",result=\"blocked\",tool_category=\"bash\"} 1"
         ));
         assert!(body.contains(
+            "codex_blackbox_hook_events_total{event=\"pre_compact\",result=\"success\",tool_category=\"other\"} 1"
+        ));
+        assert!(body.contains(
             "codex_blackbox_validation_runs_total{category=\"test\",result=\"failure\"} 1"
         ));
         assert!(body.contains(
             "codex_blackbox_loop_signals_total{evidence_source=\"hook\",severity=\"careful\",signal=\"unvalidated_edit\"} 1"
+        ));
+        assert!(body.contains(
+            "codex_blackbox_loop_signals_total{evidence_source=\"hook\",severity=\"careful\",signal=\"repeated_tool_failure\"} 1"
         ));
         assert!(body.contains(
             "codex_blackbox_coach_actions_total{action=\"block\",reason_code=\"risky_supported_tool_call\"} 1"

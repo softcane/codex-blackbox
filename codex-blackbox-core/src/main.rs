@@ -4682,29 +4682,32 @@ fn build_companion_snapshot_for_session(
     if events.is_empty() {
         return Ok(None);
     }
-    if let Some(ended_at) = conn
-        .query_row(
-            "SELECT ended_at FROM sessions WHERE session_id = ?1",
-            rusqlite::params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten()
-    {
-        events.push(
-            coach::NormalizedEvent::new(
-                ended_at,
-                coach::EvidenceSource::Proxy,
-                coach::EventCategory::StopObserved,
+    let has_codex_evidence = session_has_codex_evidence(conn, session_id).unwrap_or(false);
+    if has_codex_evidence {
+        if let Some(ended_at) = conn
+            .query_row(
+                "SELECT ended_at FROM sessions WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |row| row.get::<_, Option<String>>(0),
             )
-            .with_session(session_id.to_string())
-            .with_reason("session_ended")
-            .with_privacy(coach::PrivacyClassification::PublicAggregate),
-        );
+            .optional()?
+            .flatten()
+        {
+            events.push(
+                coach::NormalizedEvent::new(
+                    ended_at,
+                    coach::EvidenceSource::Proxy,
+                    coach::EventCategory::StopObserved,
+                )
+                .with_session(session_id.to_string())
+                .with_reason("session_ended")
+                .with_privacy(coach::PrivacyClassification::PublicAggregate),
+            );
+        }
     }
     let mut state = coach::derive_session_state(&events);
     state.session_id = Some(session_id.to_string());
-    state.postmortem_available = session_has_codex_evidence(conn, session_id).unwrap_or(false);
+    state.postmortem_available = has_codex_evidence;
     if state.postmortem_available {
         state.postmortem_link = Some(format!("/api/postmortem/{session_id}?redact=true"));
     }
@@ -4718,6 +4721,45 @@ fn build_companion_snapshot_for_session(
     }))
 }
 
+fn load_recent_coach_session_rows(
+    conn: &Connection,
+    since: &str,
+    limit: i64,
+) -> rusqlite::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT ce.session_id, COALESCE(s.started_at, MIN(ce.timestamp)) AS started_at, \
+                COALESCE(s.ended_at, MAX(ce.timestamp)) AS observed_at \
+         FROM coach_events ce \
+         LEFT JOIN sessions s ON s.session_id = ce.session_id \
+         WHERE ce.session_id IS NOT NULL AND trim(ce.session_id) != '' \
+         GROUP BY ce.session_id \
+         HAVING observed_at >= ?1 \
+         ORDER BY observed_at DESC LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![since, limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect()
+}
+
+fn companion_session_summary(
+    session_id: String,
+    started_at: Option<String>,
+    snapshot: coach::CompanionSnapshot,
+) -> Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "started_at": started_at,
+        "state": snapshot.decision.state,
+        "primary_reason": snapshot.decision.primary_reason,
+        "next_action": snapshot.decision.next_action,
+        "turn_count": snapshot.state.turn_count,
+        "tokens": snapshot.state.token_totals.local_total_tokens,
+        "evidence_sources": snapshot.decision.evidence_sources,
+        "postmortem_link": snapshot.state.postmortem_link,
+    })
+}
+
 fn build_companion_sessions_response(
     conn: &Connection,
     limit: i64,
@@ -4726,21 +4768,36 @@ fn build_companion_sessions_response(
     initialize_persistence_schema(conn)?;
     let since_secs = now_epoch_secs().saturating_sub(days.max(0) as u64 * 86400);
     let since = epoch_to_iso8601(since_secs);
+    let limit = limit.max(0);
     let rows = load_recent_codex_session_rows(conn, &since, limit)?;
     let mut sessions = Vec::new();
+    let mut seen = HashSet::new();
     for row in rows {
         if let Some(snapshot) = build_companion_snapshot_for_session(conn, &row.session_id)? {
-            sessions.push(serde_json::json!({
-                "session_id": row.session_id,
-                "started_at": row.started_at,
-                "state": snapshot.decision.state,
-                "primary_reason": snapshot.decision.primary_reason,
-                "next_action": snapshot.decision.next_action,
-                "turn_count": snapshot.state.turn_count,
-                "tokens": snapshot.state.token_totals.local_total_tokens,
-                "evidence_sources": snapshot.decision.evidence_sources,
-                "postmortem_link": snapshot.state.postmortem_link,
-            }));
+            seen.insert(row.session_id.clone());
+            sessions.push(companion_session_summary(
+                row.session_id,
+                row.started_at,
+                snapshot,
+            ));
+        }
+    }
+    if (sessions.len() as i64) < limit {
+        for (session_id, started_at) in load_recent_coach_session_rows(conn, &since, limit)? {
+            if seen.contains(&session_id) {
+                continue;
+            }
+            if let Some(snapshot) = build_companion_snapshot_for_session(conn, &session_id)? {
+                seen.insert(session_id.clone());
+                sessions.push(companion_session_summary(
+                    session_id,
+                    Some(started_at),
+                    snapshot,
+                ));
+                if (sessions.len() as i64) >= limit {
+                    break;
+                }
+            }
         }
     }
     Ok(serde_json::json!({
@@ -5096,6 +5153,7 @@ fn process_coach_hook(input: Value) -> Value {
             ));
         }
         "PreCompact" | "PostCompact" => {
+            metrics::record_hook_event(event_name.as_str(), "other", "success");
             events.push(hook_event_base(
                 &input,
                 coach::EventCategory::CompactionObserved,
@@ -6698,34 +6756,34 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        build_codex_finalization_outcome, build_companion_snapshot_for_session,
-        build_diagnosis_response_json, build_fresh_diagnosis_report, build_session_summary_json,
-        build_sessions_response_json, build_summary_response_json,
-        codex_request_headers_from_ext_proc, codex_response_headers_from_ext_proc,
-        codex_watch_event_is_duplicate_or_remember, compact_response_summary,
-        compute_estimated_costs_for_sessions, context_fill_percent, context_fill_ratio,
-        db_writer_loop, derive_display_name, diagnosis, drop_legacy_lifecycle_tables,
-        ensure_codex_persistence_columns, ensure_session_columns, ensure_session_diagnosis_columns,
-        epoch_to_iso8601, event_matches_session, extract_header, extract_headers,
-        filter_codex_envoy_diagnosis_payload, history_contains_session_start,
-        infer_context_window_tokens, load_codex_observation_snapshot,
-        load_degradation_view_from_db, load_persisted_watch_replay_events,
-        load_recent_codex_session_rows, load_turn_snapshots_from_db,
-        looks_like_machine_recall_line, make_block_response, maybe_broadcast_postmortem_ready,
-        metrics, normalize_search_text, now_epoch_secs, parse_request_body_metadata,
-        parse_request_body_metadata_result, persist_billing_reconciliation,
-        persist_session_diagnosis_report, persisted_session_display_name, policy_block_message,
-        postmortem, pricing, process_coach_hook, query_historical_metrics, query_summary,
-        record_codex_turn_command, repair_persisted_session_artifacts,
-        repair_session_diagnosis_envoy_causes, repair_turn_snapshot_context_windows,
-        repo_name_from_codex_initial_prompt, score_recall_doc, seed_live_metric_labels_from_db,
-        session_has_codex_evidence, session_timeout_secs,
-        should_skip_chatgpt_auxiliary_request_body, table_columns, tokenize_search_text,
-        BillingReconciliationInput, BillingReconciliationWriteError, CodexCachedInputSummary,
-        CostAccumulator, DbCommand, GuardBlockResponse, HttpHeaders, ProtoHeaderValue,
-        RequestMetadataSource, SelectedFinalizationOutcome, SelectedResponseAccumulator,
-        SummaryWindowData, ESTIMATED_COST_SOURCE, EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA,
-        STANDARD_CONTEXT_WINDOW_TOKENS,
+        build_codex_finalization_outcome, build_companion_sessions_response,
+        build_companion_snapshot_for_session, build_diagnosis_response_json,
+        build_fresh_diagnosis_report, build_session_summary_json, build_sessions_response_json,
+        build_summary_response_json, coach, codex_request_headers_from_ext_proc,
+        codex_response_headers_from_ext_proc, codex_watch_event_is_duplicate_or_remember,
+        compact_response_summary, compute_estimated_costs_for_sessions, context_fill_percent,
+        context_fill_ratio, db_writer_loop, derive_display_name, diagnosis,
+        drop_legacy_lifecycle_tables, ensure_codex_persistence_columns, ensure_session_columns,
+        ensure_session_diagnosis_columns, epoch_to_iso8601, event_matches_session, extract_header,
+        extract_headers, filter_codex_envoy_diagnosis_payload, history_contains_session_start,
+        infer_context_window_tokens, initialize_persistence_schema, insert_coach_event,
+        load_codex_observation_snapshot, load_degradation_view_from_db,
+        load_persisted_watch_replay_events, load_recent_codex_session_rows,
+        load_turn_snapshots_from_db, looks_like_machine_recall_line, make_block_response,
+        maybe_broadcast_postmortem_ready, metrics, normalize_search_text, now_epoch_secs,
+        parse_request_body_metadata, parse_request_body_metadata_result,
+        persist_billing_reconciliation, persist_session_diagnosis_report,
+        persisted_session_display_name, policy_block_message, postmortem, pricing,
+        process_coach_hook, query_historical_metrics, query_summary, record_codex_turn_command,
+        repair_persisted_session_artifacts, repair_session_diagnosis_envoy_causes,
+        repair_turn_snapshot_context_windows, repo_name_from_codex_initial_prompt,
+        score_recall_doc, seed_live_metric_labels_from_db, session_has_codex_evidence,
+        session_timeout_secs, should_skip_chatgpt_auxiliary_request_body, table_columns,
+        tokenize_search_text, BillingReconciliationInput, BillingReconciliationWriteError,
+        CodexCachedInputSummary, CostAccumulator, DbCommand, GuardBlockResponse, HttpHeaders,
+        ProtoHeaderValue, RequestMetadataSource, SelectedFinalizationOutcome,
+        SelectedResponseAccumulator, SummaryWindowData, ESTIMATED_COST_SOURCE,
+        EXTENDED_CONTEXT_WINDOW_TOKENS, SCHEMA, STANDARD_CONTEXT_WINDOW_TOKENS,
     };
 
     #[test]
@@ -9338,6 +9396,20 @@ mod tests {
             )],
         );
         let conn = Connection::open(&path).expect("open test db");
+        insert_coach_event(
+            &conn,
+            &coach::NormalizedEvent::new(
+                "2026-05-27T00:00:02Z",
+                coach::EvidenceSource::UserPolicy,
+                coach::EventCategory::PricingTrustObserved,
+            )
+            .with_session("coach-companion-proxy-session")
+            .with_turn("turn_1")
+            .with_reason("untrusted_pricing")
+            .with_payload_value("trusted_for_budget_enforcement", serde_json::json!(false))
+            .with_payload_value("dollar_budget_configured", serde_json::json!(true)),
+        )
+        .expect("insert user policy pricing event");
 
         let snapshot = build_companion_snapshot_for_session(&conn, "coach-companion-proxy-session")
             .expect("companion snapshot")
@@ -9356,6 +9428,11 @@ mod tests {
             .timeline
             .iter()
             .any(|event| event.category == super::coach::EventCategory::ModelTurnCompleted));
+        assert!(snapshot
+            .decision
+            .active_signals
+            .iter()
+            .any(|signal| signal.signal_name == "untrusted_pricing"));
         assert!(snapshot.timeline.iter().any(|event| {
             event.evidence_source == super::coach::EvidenceSource::Proxy
                 && event.category == super::coach::EventCategory::StopObserved
@@ -9382,6 +9459,12 @@ mod tests {
         );
         assert_eq!(
             report
+                .pointer("/coach/decision/active_signals/0/signal_name")
+                .and_then(Value::as_str),
+            Some("untrusted_pricing")
+        );
+        assert_eq!(
+            report
                 .pointer("/coach/decision/correlation/ended")
                 .and_then(Value::as_bool),
             Some(true)
@@ -9391,6 +9474,73 @@ mod tests {
             Some("redacted_by_default")
         );
         cleanup_test_db(&path);
+    }
+
+    #[test]
+    fn hook_only_companion_session_does_not_claim_durable_proxy_evidence() {
+        let conn = Connection::open_in_memory().expect("open test db");
+        initialize_persistence_schema(&conn).expect("schema");
+        let now = epoch_to_iso8601(now_epoch_secs());
+        insert_session(
+            &conn,
+            "coach-hook-only-session",
+            &now,
+            Some(&now),
+            "gpt-codex-fixture",
+            None,
+        );
+        insert_coach_event(
+            &conn,
+            &coach::NormalizedEvent::new(
+                now.clone(),
+                coach::EvidenceSource::Hook,
+                coach::EventCategory::StopObserved,
+            )
+            .with_session("coach-hook-only-session")
+            .with_reason("stop_observed"),
+        )
+        .expect("insert hook event");
+
+        let snapshot = build_companion_snapshot_for_session(&conn, "coach-hook-only-session")
+            .expect("companion snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.state.turn_count, 0);
+        assert_eq!(snapshot.state.token_totals.local_total_tokens, 0);
+        assert_eq!(snapshot.state.max_context_fill_percent, None);
+        assert!(snapshot.state.missing_durable_evidence);
+        assert!(!snapshot.state.postmortem_available);
+        assert!(snapshot.state.postmortem_link.is_none());
+        assert!(snapshot
+            .state
+            .evidence_source_summary
+            .contains_key(&coach::EvidenceSource::Hook));
+        assert!(!snapshot
+            .state
+            .evidence_source_summary
+            .contains_key(&coach::EvidenceSource::Proxy));
+        assert!(!snapshot.decision.correlation.observed_codex_responses);
+        assert!(snapshot.timeline.iter().all(|event| {
+            !(event.evidence_source == coach::EvidenceSource::Proxy
+                && event.reason_code.as_deref() == Some("session_ended"))
+        }));
+
+        let sessions = build_companion_sessions_response(&conn, 10, 30).expect("sessions");
+        assert!(sessions
+            .get("sessions")
+            .and_then(Value::as_array)
+            .expect("session list")
+            .iter()
+            .any(|session| {
+                session.get("session_id").and_then(Value::as_str) == Some("coach-hook-only-session")
+            }));
+        assert!(matches!(
+            postmortem::build_postmortem_report(
+                &conn,
+                postmortem::PostmortemTarget::Session("coach-hook-only-session".to_string()),
+                true,
+            ),
+            Err(postmortem::PostmortemBuildError::NotFound)
+        ));
     }
 
     #[test]

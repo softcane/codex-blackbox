@@ -9,7 +9,7 @@ use crate::{ui_config, ui_launch, ui_process, ui_status};
 
 pub(crate) fn render_enable_preview(paths: &ui_config::UiConfigPaths) -> String {
     format!(
-        "Codex Blackbox UI enable preview\nStatus: experimental local Codex Desktop/IDE app-server mode.\nConfig file: {}\nState directory: {}\nDry run: no files modified\n\n{}\nEvidence rule: fake fixtures prove local contracts only; live UI support requires observed provider=\"codex_responses\" traffic from a real Desktop/IDE smoke.\n",
+        "Codex Blackbox UI enable preview\nStatus: experimental local Codex Desktop/IDE app-server mode.\nConfig file: {}\nState directory: {}\nDry run: no files modified\n\n{}\nEvidence rule: fake fixtures prove local contracts only; live UI/Desktop support requires local HTTP Responses fallback traffic observed through Envoy/core as provider=\"codex_responses\". WebSocket-only traffic is unobservable, unsupported, and deferred.\n",
         paths.config_path.display(),
         paths.state_dir.display(),
         ui_config::target_config_toml()
@@ -170,7 +170,7 @@ async fn build_doctor_report(
         experimental: true,
         scope: "local Codex Desktop and local IDE extension app-server traffic only".to_string(),
         evidence_rule:
-            "live UI support requires real provider=\"codex_responses\" traffic observed by core"
+            "live UI/Desktop support requires local HTTP Responses traffic observed through Envoy/core as provider=\"codex_responses\"; WebSocket-only traffic is unobservable, unsupported, and deferred"
                 .to_string(),
     })
 }
@@ -280,8 +280,8 @@ async fn build_status_report(
         recent_http_responses_post: recent_envoy_ui_traffic.http_responses_post,
         recent_websocket_upgrade_required: recent_envoy_ui_traffic.websocket_upgrade_required,
         active_app_server_processes,
-        evidence: "Envoy-observed provider=\"codex_responses\" traffic only".to_string(),
-        caveat: "Experimental local Desktop/IDE app-server mode; fake fixtures are not live UI support proof.".to_string(),
+        evidence: "HTTP Responses via Envoy/core provider=\"codex_responses\" traffic only".to_string(),
+        caveat: "Experimental local Desktop/IDE app-server mode; fake fixtures are not live UI support proof, and WebSocket-only traffic is unobservable/unsupported/deferred.".to_string(),
     })
 }
 
@@ -520,7 +520,7 @@ fn print_status_report(report: &UiStatusReport) {
     } else if report.state == ui_status::UiStatusState::WebsocketOnlyUnobservable {
         println!("WebSocket: recent 426 GET /backend-api/codex/responses attempts observed.");
         println!(
-            "Result: current safe UI mode cannot observe those turns because Codex UI did not fall back to HTTP Responses."
+            "Result: current safe UI mode cannot observe those turns; WebSocket-only frame contents are unobservable, unsupported, and deferred unless a future relay is implemented."
         );
     } else if !report.active_app_server_processes.is_empty() {
         println!("Restart required: active local Codex UI/app-server process detected.");

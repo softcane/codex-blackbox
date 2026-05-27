@@ -224,6 +224,22 @@ fn desired_hooks_value(url: &str) -> Value {
                     "timeout": 10,
                     "statusMessage": "Checking Codex Blackbox stop state"
                 }]
+            }],
+            "PreCompact": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "timeout": 10,
+                    "statusMessage": "Recording Codex Blackbox compaction evidence"
+                }]
+            }],
+            "PostCompact": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": command,
+                    "timeout": 10,
+                    "statusMessage": "Recording Codex Blackbox compaction evidence"
+                }]
             }]
         }
     })
