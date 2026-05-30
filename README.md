@@ -121,6 +121,74 @@ Preview those overrides without launching Codex:
 codex-blackbox config codex
 ```
 
+## Experimental Codex UI Routing
+
+Codex Desktop/UI routing is manual and experimental. The release installer does
+not enable it, and `codex-blackbox run` still does not edit
+`~/.codex/config.toml`.
+
+Use this only if you are comfortable changing global Codex config. Start the
+stack first:
+
+```bash
+codex-blackbox up
+```
+
+Back up `~/.codex/config.toml`, then add these root-level keys before any
+`[section]` header:
+
+```toml
+chatgpt_base_url = "http://127.0.0.1:10000/backend-api"
+model_provider = "openai_custom"
+```
+
+Add the provider definition:
+
+```toml
+[model_providers.openai_custom]
+name = "OpenAI"
+base_url = "http://127.0.0.1:10000/backend-api/codex"
+wire_api = "responses"
+requires_openai_auth = true
+supports_websockets = false
+```
+
+Disable request compression. If `[features]` already exists, add the key there
+instead of creating a second `[features]` table:
+
+```toml
+[features]
+enable_request_compression = false
+```
+
+Restart Codex Desktop/UI after editing the config. In a local smoke test, this
+routed UI model turns through:
+
+```text
+/backend-api/codex/responses
+```
+
+and produced `provider="codex_responses"` watch and metrics evidence.
+
+Gotchas:
+
+- `model_provider = "openai_custom"` changes the active provider identity. Past
+  Codex UI sessions may appear missing while that provider is active; they are
+  expected to reappear when you switch back to your original provider config.
+- If `codex-blackbox up` is not running, Codex UI requests that depend on the
+  proxy can fail.
+- This is not a `codex-blackbox ui enable` feature yet. Disable it by removing
+  the manual `chatgpt_base_url`, `model_provider`, and
+  `[model_providers.openai_custom]` entries, or by restoring your backup, then
+  restart Codex.
+
+Verify the route while submitting one small UI prompt:
+
+```bash
+codex-blackbox watch
+curl -fsS http://127.0.0.1:9091/metrics | grep 'provider="codex_responses"'
+```
+
 ## Read The Session
 
 After or during a run:
