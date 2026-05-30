@@ -12,6 +12,29 @@ in a failed or incomplete response.
 
 ![Codex Blackbox dashboard demo](demo.png)
 
+## Install
+
+Install a published release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh
+```
+
+Install from source when you want the current checkout:
+
+```bash
+git clone https://github.com/softcane/codex-blackbox.git
+cd codex-blackbox
+cargo install --path codex-blackbox-cli
+```
+
+Requirements:
+
+- Docker Desktop or Docker Engine.
+- Docker Compose v2, or `docker-compose`.
+- Codex CLI.
+- A Codex ChatGPT login for subscription mode.
+
 ## Start With Your Own Session
 
 Use this when you want to visualize a live Codex session:
@@ -49,29 +72,6 @@ evidence still lives in SQLite and in postmortems.
 
 Tool-call panels show model-side intent only. They do not prove a local tool ran
 or completed.
-
-## Install
-
-Install a published release:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh
-```
-
-Install from source when you want the current checkout:
-
-```bash
-git clone https://github.com/softcane/codex-blackbox.git
-cd codex-blackbox
-cargo install --path codex-blackbox-cli
-```
-
-Requirements:
-
-- Docker Desktop or Docker Engine.
-- Docker Compose v2, or `docker-compose`.
-- Codex CLI.
-- A Codex ChatGPT login for subscription mode.
 
 ## Confirm The Machine
 
@@ -243,11 +243,7 @@ Token accounting follows the Codex Responses rules:
 - reasoning output is output-side detail
 - local total tokens are `input + output`
 
-Dollar estimates are intentionally not graphed on the dashboard. Redacted
-postmortems label local estimates and whether they are trusted for budget
-enforcement.
-
-## Confirmed Command Surface
+## Commands
 
 These are the enabled commands documented here:
 
@@ -262,9 +258,6 @@ codex-blackbox status
 codex-blackbox guard
 codex-blackbox postmortem last
 ```
-
-Disabled or unverified surfaces are intentionally not documented as user
-features.
 
 Architecture and development notes live in [ARCHITECTURE.md](ARCHITECTURE.md)
 and [docs/index.md](docs/index.md).
