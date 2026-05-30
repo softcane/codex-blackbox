@@ -28,7 +28,7 @@ impl EvidenceSource {
         }
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_db_str(value: &str) -> Self {
         match value {
             "proxy" => Self::Proxy,
             "hook" => Self::Hook,
@@ -55,7 +55,7 @@ pub enum ConfidenceLevel {
 }
 
 impl ConfidenceLevel {
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_db_str(value: &str) -> Self {
         match value {
             "medium" => Self::Medium,
             "low" => Self::Low,
@@ -73,7 +73,7 @@ pub enum PrivacyClassification {
 }
 
 impl PrivacyClassification {
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_db_str(value: &str) -> Self {
         match value {
             "public_aggregate" => Self::PublicAggregate,
             "sensitive_redacted" => Self::SensitiveRedacted,
@@ -139,7 +139,7 @@ impl EventCategory {
         }
     }
 
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_db_str(value: &str) -> Self {
         match value {
             "model_turn_started" => Self::ModelTurnStarted,
             "model_turn_completed" => Self::ModelTurnCompleted,

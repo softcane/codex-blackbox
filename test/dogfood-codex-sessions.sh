@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Phase 9C real Codex multi-session dogfood feedback harness.
+# Real Codex multi-session dogfood feedback harness.
 #
 # In --mode real this launches real Codex sessions through Codex Blackbox's
 # ChatGPT/Codex subscription proxy path. It uses the existing local Codex
 # ChatGPT login, can contact chatgpt.com, and must not edit ~/.codex/config.toml.
-# Run the fake regression gate first:
+# Run the static and fake gates first:
 #
+#   ./test/validate-openai-config.sh
 #   ./test/e2e-openai-responses-full.sh
 #
 # The harness writes a report that names passed, failed, skipped, and missing
@@ -42,10 +43,10 @@ Usage: ./test/dogfood-codex-sessions.sh [options]
 Options:
   --mode real|fixture       real launches Codex; fixture delegates to the fake regression
   --sessions N             number of sessions to launch in real mode, 1-4 (default: 4)
-  --repos same|mixed       run only the current repo or include another repo (default: mixed)
+  --repos same|mixed       accepted for compatibility; real mode always creates disposable repos
   --include-mcp            include an MCP-oriented prompt when MCP config exists
-  --same-repo PATH         primary repo for same-repo sessions (default: cwd)
-  --other-repo PATH        repo/path for mixed-repo coverage; auto-created if omitted
+  --same-repo PATH         trusted parent repo used for the report directory (default: cwd)
+  --other-repo PATH        accepted for compatibility; disposable repos are auto-created
   --report-dir PATH        report artifact directory (default: reports/dogfood/<timestamp>)
   --timeout-seconds N      per-session timeout (default: 360)
   --no-json                accepted target-path flag; stdout telemetry parsing is disabled
@@ -141,6 +142,7 @@ CODEX_BIN="${CODEX_BIN:-codex}"
 CODEX_BLACKBOX_BIN="${CODEX_BLACKBOX_BIN:-}"
 STACK_ALREADY_READY=0
 WATCH_PID=""
+DOGFOOD_CODEX_HOME=""
 
 : >"$CHECKS_TSV"
 : >"$COMMAND_LOG"
@@ -186,6 +188,91 @@ run_with_optional_timeout() {
         gtimeout "$seconds" "$@"
     else
         "$@"
+    fi
+}
+
+capture_for_seconds() {
+    local seconds="$1"
+    shift
+    "$@" &
+    local pid="$!"
+    sleep "$seconds"
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+}
+
+file_mtime() {
+    local path="$1"
+    if [ ! -e "$path" ]; then
+        printf "missing"
+        return 0
+    fi
+    stat -f "%m" "$path" 2>/dev/null || stat -c "%Y" "$path"
+}
+
+file_hash() {
+    local path="$1"
+    if [ ! -e "$path" ]; then
+        printf "missing"
+        return 0
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        LC_ALL=C LANG=C shasum -a 256 "$path" | awk '{print $1}'
+    else
+        LC_ALL=C LANG=C sha256sum "$path" | awk '{print $1}'
+    fi
+}
+
+snapshot_codex_config_before() {
+    CODEX_CONFIG_PATH="${CODEX_HOME:-$HOME/.codex}/config.toml"
+    CODEX_CONFIG_BEFORE_MTIME="$(file_mtime "$CODEX_CONFIG_PATH")"
+    CODEX_CONFIG_BEFORE_HASH="$(file_hash "$CODEX_CONFIG_PATH")"
+    CODEX_CONFIG_SNAPSHOT_TAKEN=1
+    {
+        printf "path\t%s\n" "$CODEX_CONFIG_PATH"
+        printf "mtime\t%s\n" "$CODEX_CONFIG_BEFORE_MTIME"
+        printf "sha256\t%s\n" "$CODEX_CONFIG_BEFORE_HASH"
+    } >"$REPORT_DIR/codex-config-before.tsv"
+}
+
+prepare_temp_codex_home() {
+    local real_codex_home="${CODEX_HOME:-$HOME/.codex}"
+    DOGFOOD_CODEX_HOME="$(mktemp -d "${TMPDIR:-/tmp}/codex-blackbox-dogfood-codex-home.XXXXXX")"
+    if [ ! -f "$real_codex_home/auth.json" ]; then
+        record failed "temporary_codex_home" "$real_codex_home/auth.json is required for real Codex auth"
+        return 1
+    fi
+    ln -s "$real_codex_home/auth.json" "$DOGFOOD_CODEX_HOME/auth.json"
+    if [ -f "$real_codex_home/installation_id" ]; then
+        ln -s "$real_codex_home/installation_id" "$DOGFOOD_CODEX_HOME/installation_id"
+    fi
+    printf "# Codex Blackbox dogfood temp config. Project trust writes here must not touch user config.\n" \
+        >"$DOGFOOD_CODEX_HOME/config.toml"
+    record passed "temporary_codex_home" "$DOGFOOD_CODEX_HOME"
+}
+
+check_codex_config_unchanged() {
+    if [ "${CODEX_CONFIG_SNAPSHOT_TAKEN:-0}" != "1" ]; then
+        return 0
+    fi
+    local after_mtime
+    local after_hash
+    after_mtime="$(file_mtime "$CODEX_CONFIG_PATH")"
+    after_hash="$(file_hash "$CODEX_CONFIG_PATH")"
+    {
+        printf "path\t%s\n" "$CODEX_CONFIG_PATH"
+        printf "mtime\t%s\n" "$after_mtime"
+        printf "sha256\t%s\n" "$after_hash"
+    } >"$REPORT_DIR/codex-config-after.tsv"
+    if [ "$after_mtime" = "$CODEX_CONFIG_BEFORE_MTIME" ] \
+        && [ "$after_hash" = "$CODEX_CONFIG_BEFORE_HASH" ]; then
+        record passed "codex_config_unchanged" "$CODEX_CONFIG_PATH mtime/hash unchanged"
+        CODEX_CONFIG_SNAPSHOT_TAKEN=checked
+        return 0
+    else
+        record failed "codex_config_unchanged" "$CODEX_CONFIG_PATH changed during real validation"
+        CODEX_CONFIG_SNAPSHOT_TAKEN=checked
+        return 1
     fi
 }
 
@@ -238,6 +325,12 @@ stop_watch_capture() {
 cleanup() {
     stop_watch_capture
     capture_compose_logs
+    if [ -n "$DOGFOOD_CODEX_HOME" ] && [ -f "$DOGFOOD_CODEX_HOME/config.toml" ]; then
+        cp "$DOGFOOD_CODEX_HOME/config.toml" "$REPORT_DIR/temp-codex-config-after.toml" 2>/dev/null || true
+    fi
+    if [ -n "$DOGFOOD_CODEX_HOME" ] && [ -d "$DOGFOOD_CODEX_HOME" ]; then
+        rm -rf "$DOGFOOD_CODEX_HOME"
+    fi
     if [ "$MODE" = "real" ] && [ "$KEEP_STACK" = "0" ] && [ "$STACK_ALREADY_READY" = "0" ]; then
         compose down --remove-orphans -t 5 >"$REPORT_DIR/compose-down.log" 2>&1 || true
     fi
@@ -274,6 +367,7 @@ checks_tsv = Path(os.environ["CHECKS_TSV"])
 manifest_path = Path(os.environ["SESSION_MANIFEST"])
 watch_sse_path = Path(os.environ["WATCH_SSE"])
 watch_ndjson_path = Path(os.environ["WATCH_NDJSON"])
+watch_replay_sse_path = report_dir / "watch-replay.sse"
 summary_json_path = Path(os.environ["SUMMARY_JSON"])
 summary_md_path = Path(os.environ["SUMMARY_MD"])
 prompt_marker = os.environ["PROMPT_MARKER"]
@@ -344,17 +438,40 @@ for item in manifest:
     else:
         add("failed", name, f"exit {item['exit_code']}; see {item['stderr_path']}")
 
-same_repo = sum(1 for item in manifest if item["repo_kind"] == "same")
-other_repo = sum(1 for item in manifest if item["repo_kind"] == "other")
-tool_prompt_planned = any("tool" in item["case"] for item in manifest)
-if same_repo >= 2:
-    add("passed", "same_repo_session_coverage", f"{same_repo} sessions")
+repo_paths = {item["repo"] for item in manifest}
+workflow_kinds = {item["repo_kind"] for item in manifest}
+if len(repo_paths) >= 3:
+    add("passed", "disposable_repo_coverage", f"{len(repo_paths)} disposable repos")
 else:
-    add("skipped" if expected_sessions < 3 else "missing", "same_repo_session_coverage", f"{same_repo} sessions")
-if other_repo >= 1:
-    add("passed", "different_repo_session_coverage", f"{other_repo} sessions")
-else:
-    add("skipped" if expected_sessions < 3 else "missing", "different_repo_session_coverage", "no different-repo session")
+    add("failed", "disposable_repo_coverage", f"{len(repo_paths)} disposable repos")
+for workflow in ["read", "write", "delete", "test"]:
+    if workflow in workflow_kinds:
+        add("passed", f"{workflow}_workflow_session", "planned real Codex session")
+    else:
+        add("failed", f"{workflow}_workflow_session", "missing planned real Codex session")
+for item in manifest:
+    repo = Path(item["repo"])
+    if item["repo_kind"] == "write":
+        notes = repo / "notes.md"
+        if notes.exists() and prompt_marker in notes.read_text(encoding="utf-8", errors="replace"):
+            add("passed", "write_workflow_artifact", str(notes))
+        else:
+            add("missing", "write_workflow_artifact", f"{notes} missing marker")
+    elif item["repo_kind"] == "delete":
+        obsolete = repo / "obsolete.txt"
+        keep = repo / "keep.txt"
+        if not obsolete.exists() and keep.exists():
+            add("passed", "delete_workflow_artifact", "obsolete.txt removed and keep.txt preserved")
+        else:
+            add("missing", "delete_workflow_artifact", "delete workflow did not leave expected files")
+    elif item["repo_kind"] == "test":
+        stdout_body = Path(item["stdout_path"]).read_text(encoding="utf-8", errors="replace") if Path(item["stdout_path"]).exists() else ""
+        stderr_body = Path(item["stderr_path"]).read_text(encoding="utf-8", errors="replace") if Path(item["stderr_path"]).exists() else ""
+        combined = stdout_body + "\n" + stderr_body
+        if "python3 -m unittest test_calc.py" in combined and ("OK" in combined or "Ran 1 test" in combined):
+            add("passed", "test_workflow_artifact", "unittest command/result appeared in session output")
+        else:
+            add("missing", "test_workflow_artifact", "unittest command/result not found in captured output")
 
 watch_events = []
 if watch_sse_path.exists():
@@ -368,6 +485,21 @@ if watch_sse_path.exists():
                 continue
             try:
                 watch_events.append(json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+
+watch_replay_events = []
+if watch_replay_sse_path.exists():
+    with watch_replay_sse_path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                watch_replay_events.append(json.loads(payload))
             except json.JSONDecodeError:
                 continue
 
@@ -419,6 +551,16 @@ if cache_events:
     add("failed", "watch_no_codex_cache_event", f"unexpected cache events: {len(cache_events)}")
 else:
     add("passed", "watch_no_codex_cache_event", "no cache_event observed for marker sessions")
+replay_turns = [
+    event for event in watch_replay_events
+    if isinstance(event, dict)
+    and event.get("type") == "codex_turn_summary"
+    and (not session_ids or event.get("session_id") in session_ids)
+]
+if replay_turns:
+    add("passed", "watch_replay_codex_turn_summary", f"{len(replay_turns)} replayed turn summaries")
+else:
+    add("missing", "watch_replay_codex_turn_summary", "no persisted Codex turn summaries replayed")
 add("skipped", "tool_watch_events", "Envoy does not prove local tool result lifecycle")
 add("skipped", "mcp_watch_events", "non-Envoy activity is outside the Codex telemetry surface")
 
@@ -463,6 +605,24 @@ if db_path.exists():
             add("passed", "sqlite_codex_requests", f"{len(db_session_ids)} sessions")
         else:
             add("missing", "sqlite_codex_requests", f"{len(db_session_ids)} sessions")
+        if db_session_ids:
+            db_placeholders = ",".join("?" for _ in db_session_ids)
+            session_row_count = conn.execute(
+                f"SELECT COUNT(*) FROM sessions WHERE session_id IN ({db_placeholders})",
+                sorted(db_session_ids),
+            ).fetchone()[0]
+            turn_row_count = conn.execute(
+                f"SELECT COUNT(*) FROM turn_snapshots WHERE provider = 'codex_responses' AND session_id IN ({db_placeholders})",
+                sorted(db_session_ids),
+            ).fetchone()[0]
+            if session_row_count >= len(db_session_ids):
+                add("passed", "sqlite_session_rows", f"{session_row_count} session rows")
+            else:
+                add("missing", "sqlite_session_rows", f"{session_row_count} session rows for {len(db_session_ids)} sessions")
+            if turn_row_count >= len(db_session_ids):
+                add("passed", "sqlite_turn_rows", f"{turn_row_count} Codex turn rows")
+            else:
+                add("missing", "sqlite_turn_rows", f"{turn_row_count} Codex turn rows for {len(db_session_ids)} sessions")
         bad_math = []
         served_model_rows = 0
         for row in rows:
@@ -513,6 +673,18 @@ else:
 def get_json(base_url, path, params=None, timeout=8):
     query = "" if params is None else "?" + urllib.parse.urlencode(params, doseq=True)
     with urllib.request.urlopen(base_url + path + query, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def post_json(base_url, path, payload, timeout=12):
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        base_url + path,
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -597,6 +769,31 @@ except Exception as exc:
     encoding="utf-8",
 )
 
+metrics_prom = report_dir / "metrics.prom"
+if metrics_prom.exists():
+    metrics_body = metrics_prom.read_text(encoding="utf-8", errors="replace")
+    forbidden_metric_terms = [
+        "codex_blackbox_baseline_builds_total",
+        "codex_blackbox_coach_actions_total",
+        "codex_blackbox_hook_events_total",
+        "codex_blackbox_loop_signals_total",
+        "codex_blackbox_unvalidated_edit_signals_total",
+        "codex_blackbox_validation_runs_total",
+        "codex_blackbox_cache_events_total",
+        "codex_blackbox_mcp_",
+        "codex_blackbox_skill_events_total",
+        "codex_blackbox_tool_failures_total",
+        "quota",
+        "tool_result",
+    ]
+    leaks = [term for term in forbidden_metric_terms if term in metrics_body]
+    if leaks:
+        add("failed", "metrics_disabled_surface_absent", ", ".join(leaks))
+    else:
+        add("passed", "metrics_disabled_surface_absent", "disabled metric families absent from rendered /metrics")
+else:
+    add("missing", "metrics_disabled_surface_absent", "metrics.prom artifact missing")
+
 try:
     health = get_json(grafana_url, "/api/health")
     search = get_json(grafana_url, "/api/search", {"query": "Codex Blackbox"})
@@ -624,6 +821,25 @@ try:
         add("passed", "grafana_dashboard_uid", dashboard.get("title", ""))
     else:
         add("missing", "grafana_dashboard_uid", str(dashboard.get("uid")))
+    dashboard_text = json.dumps(dashboard, sort_keys=True)
+    forbidden_dashboard_terms = [
+        "codex_blackbox_baseline_builds_total",
+        "codex_blackbox_coach_actions_total",
+        "codex_blackbox_hook_events_total",
+        "codex_blackbox_loop_signals_total",
+        "codex_blackbox_unvalidated_edit_signals_total",
+        "codex_blackbox_validation_runs_total",
+        "tool success",
+        "succeeded",
+        "preflight",
+        "reconcile",
+        "tmux",
+    ]
+    leaks = [term for term in forbidden_dashboard_terms if term in dashboard_text]
+    if leaks:
+        add("failed", "grafana_disabled_surface_absent", ", ".join(leaks))
+    else:
+        add("passed", "grafana_disabled_surface_absent", "dashboard contains no disabled metric families or feature wording")
     metric_names = {
         item.get("metric", {}).get("__name__")
         for item in prom_query('{__name__=~"codex_blackbox_.*"}')
@@ -643,11 +859,55 @@ try:
         add("failed", "grafana_panel_metrics", json.dumps(missing_panel_metrics[:5], sort_keys=True))
     else:
         add("passed", "grafana_panel_metrics", "Codex panel metrics are present in Prometheus")
+    panel_exprs = [
+        target.get("expr", "")
+        for panel in dashboard.get("panels", [])
+        for target in panel.get("targets", []) or []
+        if target.get("expr")
+    ]
+    if any("codex_blackbox_turn_duration_seconds_bucket" in expr for expr in panel_exprs):
+        add("passed", "grafana_latency_panel", "turn duration histogram is dashboarded")
+    else:
+        add("failed", "grafana_latency_panel", "turn duration histogram query missing")
+    if any("codex_blackbox_tool_calls_total" in expr for expr in panel_exprs) and "Tool-Call Intent" in dashboard_text:
+        add("passed", "grafana_tool_intent_panel", "tool-call intent panel present")
+    else:
+        add("failed", "grafana_tool_intent_panel", "tool-call intent panel missing")
+    try:
+        now_ms = int(time.time() * 1000)
+        datasource_payload = post_json(
+            grafana_url,
+            "/api/ds/query",
+            {
+                "from": str(now_ms - 6 * 60 * 60 * 1000),
+                "to": str(now_ms),
+                "queries": [
+                    {
+                        "refId": "A",
+                        "datasource": {"type": "prometheus", "uid": "prometheus"},
+                        "expr": 'sum(codex_blackbox_requests_total{provider="codex_responses"})',
+                        "instant": True,
+                        "range": False,
+                        "intervalMs": 30000,
+                        "maxDataPoints": 1,
+                    }
+                ],
+            },
+        )
+        (report_dir / "grafana-datasource-query.json").write_text(
+            json.dumps(datasource_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        add("passed", "grafana_datasource_query_values", "queried codex request total through Grafana datasource")
+    except Exception as exc:
+        add("missing", "grafana_datasource_query_values", str(exc))
 except Exception as exc:
     add("failed", "grafana_query", str(exc))
 
 diagnosis_dir = report_dir / "diagnosis"
 diagnosis_dir.mkdir(exist_ok=True)
+postmortem_dir = report_dir / "postmortem"
+postmortem_dir.mkdir(exist_ok=True)
 for session_id in sorted(session_ids | db_session_ids):
     try:
         with urllib.request.urlopen(f"{core_url}/api/diagnosis/{urllib.parse.quote(session_id)}", timeout=8) as response:
@@ -655,6 +915,21 @@ for session_id in sorted(session_ids | db_session_ids):
         (diagnosis_dir / f"{session_id}.json").write_text(body, encoding="utf-8")
     except Exception:
         continue
+    try:
+        with urllib.request.urlopen(f"{core_url}/api/postmortem/{urllib.parse.quote(session_id)}?redact=true", timeout=8) as response:
+            body = response.read().decode("utf-8")
+        (postmortem_dir / f"{session_id}.json").write_text(body, encoding="utf-8")
+        report = json.loads(body)
+        if report.get("impact", {}).get("local_total_tokens", 0) >= 0 and report.get("caveats"):
+            add("passed", f"postmortem_{session_id}", "redacted report with local totals and caveats")
+        else:
+            add("missing", f"postmortem_{session_id}", "missing local totals or caveats")
+        if prompt_marker in body:
+            add("failed", f"postmortem_redaction_{session_id}", "prompt marker leaked in redacted postmortem")
+        else:
+            add("passed", f"postmortem_redaction_{session_id}", "prompt marker redacted")
+    except Exception as exc:
+        add("missing", f"postmortem_{session_id}", str(exc))
 
 status = "pass"
 if checks["failed"]:
@@ -706,6 +981,11 @@ PY
 
 finish_and_exit() {
     local code="$1"
+    if [ "$MODE" = "real" ]; then
+        if ! check_codex_config_unchanged; then
+            code=1
+        fi
+    fi
     write_summary || true
     echo "Report: $REPORT_DIR"
     exit "$code"
@@ -721,6 +1001,9 @@ if [ "$MODE" = "fixture" ]; then
     record passed "fake_responses_regression" "see $REPORT_DIR/fake-regression"
     finish_and_exit 0
 fi
+
+snapshot_codex_config_before
+prepare_temp_codex_home || finish_and_exit 1
 
 if [ -z "$CODEX_BLACKBOX_BIN" ]; then
     require_cmd cargo
@@ -758,20 +1041,47 @@ if [ "$STACK_ALREADY_READY" = "0" ]; then
     record passed "stack_preclean" "removed stale Codex Blackbox Compose services before real smoke"
 fi
 
-SMOKE_PROMPT="$PROMPT_MARKER preflight: Read AGENTS.md and docs/reference/developing.md, then summarize the current validation rules in 3 bullets. Do not edit files."
-preflight_cmd=(
-    env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
-    "$CODEX_BLACKBOX_BIN" preflight codex-subscription --
+config_cmd=(
+    "$CODEX_BLACKBOX_BIN" config codex
+)
+printf "%s\n" "$(shell_join "${config_cmd[@]}")" >"$REPORT_DIR/config-command.txt"
+if "${config_cmd[@]}" >"$REPORT_DIR/config-codex.txt" 2>"$REPORT_DIR/config-codex.stderr" < /dev/null; then
+    record passed "config_codex_preview" "read-only config preview captured"
+else
+    record failed "config_codex_preview" "see $REPORT_DIR/config-codex.stderr"
+    finish_and_exit 1
+fi
+
+if [ "$STACK_ALREADY_READY" = "0" ]; then
+    up_cmd=(
+        env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
+        "$CODEX_BLACKBOX_BIN" up
+    )
+    printf "%s\n" "$(shell_join "${up_cmd[@]}")" >"$REPORT_DIR/up-command.txt"
+    if "${up_cmd[@]}" >"$REPORT_DIR/up.log" 2>&1 < /dev/null; then
+        record passed "codex_blackbox_up" "stack started through enabled CLI"
+    else
+        record failed "codex_blackbox_up" "see $REPORT_DIR/up.log"
+        finish_and_exit 1
+    fi
+else
+    record passed "codex_blackbox_up" "stack already reachable"
+fi
+
+SMOKE_PROMPT="$PROMPT_MARKER smoke-readiness: Read AGENTS.md and docs/reference/developing.md, then summarize the current evidence rules in 3 bullets. Do not edit files."
+smoke_cmd=(
+    env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH" CODEX_HOME="$DOGFOOD_CODEX_HOME"
+    "$CODEX_BLACKBOX_BIN" run --
     "$CODEX_BIN" exec
     --cd "$SAME_REPO"
     --sandbox read-only
     "$SMOKE_PROMPT"
 )
-printf "%s\n" "$(shell_join "${preflight_cmd[@]}")" >"$REPORT_DIR/preflight-command.txt"
-if "${preflight_cmd[@]}" >"$REPORT_DIR/preflight.log" 2>&1 < /dev/null; then
-    record passed "codex_subscription_preflight" "stack ready; no Codex turn launched"
+printf "%s\n" "$(shell_join "${smoke_cmd[@]}")" >"$REPORT_DIR/smoke-command.txt"
+if "${smoke_cmd[@]}" >"$REPORT_DIR/smoke.log" 2>&1 < /dev/null; then
+    record passed "real_codex_smoke" "observed through enabled run wrapper"
 else
-    record failed "codex_subscription_preflight" "see $REPORT_DIR/preflight.log"
+    record failed "real_codex_smoke" "see $REPORT_DIR/smoke.log"
     finish_and_exit 1
 fi
 
@@ -780,15 +1090,47 @@ wait_for_envoy_subscription_route || finish_and_exit 1
 wait_for_http "prometheus" "$PROMETHEUS_URL/-/ready" || true
 wait_for_http "grafana" "$GRAFANA_URL/api/health" || true
 
-if [ "$REPOS" = "mixed" ] && [ -z "$OTHER_REPO" ]; then
-    OTHER_REPO="$REPORT_DIR/other-repo"
-    mkdir -p "$OTHER_REPO"
-    printf "# Codex Blackbox dogfood other repo\n\nRun marker: %s\n" "$PROMPT_MARKER" >"$OTHER_REPO/README.md"
-    printf "dogfood-marker=%s\n" "$PROMPT_MARKER" >"$OTHER_REPO/project.txt"
-    if command -v git >/dev/null 2>&1; then
-        git -C "$OTHER_REPO" init -q || true
-    fi
+DISPOSABLE_REPO_ROOT="$REPORT_DIR/repos"
+READ_REPO="$DISPOSABLE_REPO_ROOT/read-repo"
+WRITE_REPO="$DISPOSABLE_REPO_ROOT/write-repo"
+DELETE_REPO="$DISPOSABLE_REPO_ROOT/delete-repo"
+TEST_REPO="$DISPOSABLE_REPO_ROOT/test-repo"
+mkdir -p "$READ_REPO" "$WRITE_REPO" "$DELETE_REPO" "$TEST_REPO"
+
+printf "# Read workflow repo\n\nmarker=%s\n" "$PROMPT_MARKER" >"$READ_REPO/README.md"
+printf "alpha\nbeta\n" >"$READ_REPO/data.txt"
+
+printf "# Write workflow repo\n\nCreate notes during validation.\n" >"$WRITE_REPO/README.md"
+
+printf "# Delete workflow repo\n\nRemove obsolete.txt during validation.\n" >"$DELETE_REPO/README.md"
+printf "obsolete marker %s\n" "$PROMPT_MARKER" >"$DELETE_REPO/obsolete.txt"
+printf "keep marker %s\n" "$PROMPT_MARKER" >"$DELETE_REPO/keep.txt"
+
+cat >"$TEST_REPO/calc.py" <<'EOF'
+def add(a, b):
+    return a + b
+EOF
+cat >"$TEST_REPO/test_calc.py" <<'EOF'
+import unittest
+from calc import add
+
+
+class CalcTest(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(add(2, 3), 5)
+
+
+if __name__ == "__main__":
+    unittest.main()
+EOF
+printf "# Test workflow repo\n\nRun python3 -m unittest test_calc.py\n" >"$TEST_REPO/README.md"
+
+if command -v git >/dev/null 2>&1; then
+    for repo_path in "$READ_REPO" "$WRITE_REPO" "$DELETE_REPO" "$TEST_REPO"; do
+        git -C "$repo_path" init -q || true
+    done
 fi
+record passed "disposable_repos_created" "$READ_REPO $WRITE_REPO $DELETE_REPO $TEST_REPO"
 
 declare -a CASES
 declare -a REPO_KINDS
@@ -803,44 +1145,32 @@ add_case() {
 }
 
 add_case \
-    "same-read-a" \
-    "same" \
-    "$SAME_REPO" \
-    "$PROMPT_MARKER same-read-a: Read AGENTS.md and docs/reference/developing.md. Answer with exactly three bullets about the validation boundary. Do not edit files."
+    "repo-read" \
+    "read" \
+    "$READ_REPO" \
+    "$PROMPT_MARKER repo-read: Read README.md and data.txt in this disposable repo. Answer with exactly two bullets and do not edit files."
 
 add_case \
-    "same-tool-b" \
-    "same" \
-    "$SAME_REPO" \
-    "$PROMPT_MARKER same-tool-b: Use local file/search or shell tools to inspect the test directory, then report the command or tool you used and three relevant filenames. Do not edit files."
+    "repo-write" \
+    "write" \
+    "$WRITE_REPO" \
+    "$PROMPT_MARKER repo-write: Create a file named notes.md containing one sentence with this marker. Then run ls and report the file you created."
 
-if [ "$REPOS" = "mixed" ]; then
-    add_case \
-        "other-read" \
-        "other" \
-        "$OTHER_REPO" \
-        "$PROMPT_MARKER other-read: Inspect this different repo/path and summarize its visible files in two bullets. Do not edit files."
-else
-    add_case \
-        "same-read-c" \
-        "same" \
-        "$SAME_REPO" \
-        "$PROMPT_MARKER same-read-c: Read README.md and summarize two things this project observes directly. Do not edit files."
+if [ "$INCLUDE_MCP" = "1" ]; then
+    record skipped "mcp_case" "read/write/delete/test coverage takes precedence in the default real validation"
 fi
 
-if [ "$INCLUDE_MCP" = "1" ] && [ "$MCP_CONFIGURED" = "1" ]; then
-    add_case \
-        "mcp-docs" \
-        "same" \
-        "$SAME_REPO" \
-        "$PROMPT_MARKER mcp-docs: If the openaiDeveloperDocs MCP server is available, use it to identify one OpenAI Responses streaming documentation page or endpoint. Say if MCP is unavailable. Do not edit files."
-else
-    add_case \
-        "same-context-d" \
-        "same" \
-        "$SAME_REPO" \
-        "$PROMPT_MARKER same-context-d: Read docs/reference/developing.md and report the difference between fake and live evidence in one paragraph. Do not edit files."
-fi
+add_case \
+    "repo-delete" \
+    "delete" \
+    "$DELETE_REPO" \
+    "$PROMPT_MARKER repo-delete: Delete obsolete.txt, leave keep.txt untouched, then run ls and report which file was deleted."
+
+add_case \
+    "repo-test" \
+    "test" \
+    "$TEST_REPO" \
+    "$PROMPT_MARKER repo-test: Run python3 -m unittest test_calc.py in this disposable repo. Do not edit files unless the test unexpectedly fails; report the command and result."
 
 : >"$WATCH_SSE"
 (curl -fsS --no-buffer -N -H "Accept: text/event-stream" "$CORE_URL/watch" >"$WATCH_SSE" 2>"$REPORT_DIR/watch.stderr" || true) &
@@ -855,15 +1185,19 @@ for index in $(seq 0 $((SESSIONS - 1))); do
     repo_kind="${REPO_KINDS[$index]}"
     repo_path="${REPOS_FOR_CASE[$index]}"
     prompt="${PROMPTS[$index]}"
+    sandbox="read-only"
+    if [ "$repo_kind" = "write" ] || [ "$repo_kind" = "delete" ]; then
+        sandbox="workspace-write"
+    fi
     stdout_path="$REPORT_DIR/session-${case_name}.stdout"
     stderr_path="$REPORT_DIR/session-${case_name}.stderr"
     exit_path="$REPORT_DIR/session-${case_name}.exit"
     session_cmd=(
-        env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH"
+        env -u COMPOSE_FILE CODEX_BLACKBOX_COMPOSE_FILE="$COMPOSE_PATH" CODEX_HOME="$DOGFOOD_CODEX_HOME"
         "$CODEX_BLACKBOX_BIN" run --
         "$CODEX_BIN" exec
         --cd "$repo_path"
-        --sandbox read-only
+        --sandbox "$sandbox"
         "$prompt"
     )
     printf "%s\n" "$(shell_join "${session_cmd[@]}")" >>"$COMMAND_LOG"
@@ -887,6 +1221,14 @@ done
 
 sleep 8
 stop_watch_capture
+
+capture_for_seconds 6 curl -fsS --no-buffer -N -H "Accept: text/event-stream" "$CORE_URL/watch?replay=1" \
+    >"$REPORT_DIR/watch-replay.sse" 2>"$REPORT_DIR/watch-replay.stderr" || true
+if [ -s "$REPORT_DIR/watch-replay.sse" ]; then
+    record passed "watch_replay_artifact" "$REPORT_DIR/watch-replay.sse"
+else
+    record missing "watch_replay_artifact" "no replay SSE captured"
+fi
 
 curl -fsS --max-time 10 "$CORE_URL/api/sessions?limit=80&days=1" >"$REPORT_DIR/sessions.json" 2>"$REPORT_DIR/sessions.stderr" \
     && record passed "api_sessions_artifact" "$REPORT_DIR/sessions.json" \

@@ -512,11 +512,11 @@ fn load_persisted_coach_events(
             serde_json::from_str::<BTreeMap<String, Value>>(&payload_raw).unwrap_or_default();
         Ok(coach::NormalizedEvent {
             timestamp: row.get::<_, String>(0)?,
-            evidence_source: coach::EvidenceSource::from_str(&row.get::<_, String>(1)?),
-            category: coach::EventCategory::from_str(&row.get::<_, String>(2)?),
+            evidence_source: coach::EvidenceSource::from_db_str(&row.get::<_, String>(1)?),
+            category: coach::EventCategory::from_db_str(&row.get::<_, String>(2)?),
             reason_code: row.get::<_, Option<String>>(3)?,
-            privacy: coach::PrivacyClassification::from_str(&row.get::<_, String>(4)?),
-            confidence: coach::ConfidenceLevel::from_str(&row.get::<_, String>(5)?),
+            privacy: coach::PrivacyClassification::from_db_str(&row.get::<_, String>(4)?),
+            confidence: coach::ConfidenceLevel::from_db_str(&row.get::<_, String>(5)?),
             session_id: row.get::<_, Option<String>>(6)?,
             turn_id: row.get::<_, Option<String>>(7)?,
             payload_summary,

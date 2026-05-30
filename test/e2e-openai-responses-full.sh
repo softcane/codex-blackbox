@@ -602,7 +602,7 @@ assert_postmortem_api() {
 }
 
 assert_prometheus_and_grafana() {
-    PROMETHEUS_URL="$PROMETHEUS_URL" GRAFANA_URL="$GRAFANA_URL" REQUEST_MANIFEST="$REQUEST_MANIFEST" python3 - <<'PY'
+    CORE_URL="$CORE_URL" PROMETHEUS_URL="$PROMETHEUS_URL" GRAFANA_URL="$GRAFANA_URL" REQUEST_MANIFEST="$REQUEST_MANIFEST" python3 - <<'PY'
 import json
 import os
 import re
@@ -612,6 +612,7 @@ import urllib.request
 
 prom_url = os.environ["PROMETHEUS_URL"]
 grafana_url = os.environ["GRAFANA_URL"]
+core_url = os.environ["CORE_URL"]
 manifest = os.environ["REQUEST_MANIFEST"]
 session_ids = [line.split("\t")[1] for line in open(manifest, encoding="utf-8") if line.strip()]
 expected_requests = len(session_ids)
@@ -703,6 +704,18 @@ for item in series.get("data", []):
             if session_id in str(value):
                 fail(f"Prometheus metric label value leaked session id: {item}")
 
+metrics_body = urllib.request.urlopen(f"{core_url}/metrics", timeout=10).read().decode("utf-8")
+for forbidden_metric in [
+    "codex_blackbox_baseline_builds_total",
+    "codex_blackbox_coach_actions_total",
+    "codex_blackbox_hook_events_total",
+    "codex_blackbox_loop_signals_total",
+    "codex_blackbox_unvalidated_edit_signals_total",
+    "codex_blackbox_validation_runs_total",
+]:
+    if forbidden_metric in metrics_body:
+        fail(f"rendered /metrics exposes disabled family {forbidden_metric}")
+
 health = get_json(grafana_url, "/api/health")
 if health.get("database") != "ok":
     fail(f"Grafana health failed: {health}")
@@ -714,16 +727,43 @@ if dashboard.get("uid") != "codex-blackbox-main":
     fail("Grafana dashboard uid mismatch")
 panel_titles = {panel.get("title") for panel in dashboard.get("panels", [])}
 required_panel_titles = {
-    "Codex Responses requests since start",
-    "Codex Responses tokens by kind",
-    "Codex context fill p95 (5m)",
-    "Codex failed responses since start",
-    "Codex incomplete responses since start",
-    "Codex diagnosis cause labels",
+    "Terminology Guide",
+    "Requests",
+    "Completed",
+    "Failed",
+    "Incomplete",
+    "Unknown",
+    "Cached Input",
+    "Requests Per Minute",
+    "Turn Latency P95",
+    "Context Fill P95",
+    "Tokens By Model",
+    "Token Components",
+    "Tool-Call Intent",
+    "Model Fallback",
+    "Guard Blocks",
+    "Diagnostic Causes",
 }
 for title in required_panel_titles:
     if title not in panel_titles:
         fail(f"Grafana dashboard missing panel {title!r}")
+if "Diagnostic Cause Guide" in panel_titles:
+    fail("Grafana dashboard must not include the removed Diagnostic Cause Guide panel")
+panels_by_title = {panel.get("title"): panel for panel in dashboard.get("panels", [])}
+for title, x, y in [
+    ("Requests", 0, 4),
+    ("Completed", 8, 4),
+    ("Failed", 16, 4),
+    ("Incomplete", 0, 8),
+    ("Unknown", 8, 8),
+    ("Cached Input", 16, 8),
+]:
+    grid = panels_by_title[title].get("gridPos", {})
+    if grid.get("x") != x or grid.get("y") != y or grid.get("w") != 8:
+        fail(f"Grafana top card {title!r} has unexpected grid position {grid}")
+for title in ["Requests Per Minute", "Turn Latency P95", "Context Fill P95"]:
+    if panels_by_title[title].get("type") != "timeseries":
+        fail(f"Grafana panel {title!r} should use a time-series visualization")
 
 metric_names = {
     item["metric"]["__name__"]
@@ -739,10 +779,38 @@ for panel in dashboard.get("panels", []):
             if metric_name not in metric_names:
                 fail(f"Grafana panel {panel.get('title')!r} references missing metric {metric_name}")
 
+dashboard_text = json.dumps(dashboard)
+for forbidden in [
+    "codex_blackbox_baseline_builds_total",
+    "codex_blackbox_coach_actions_total",
+    "codex_blackbox_hook_events_total",
+    "codex_blackbox_loop_signals_total",
+    "codex_blackbox_unvalidated_edit_signals_total",
+    "codex_blackbox_validation_runs_total",
+    "tool success",
+    "succeeded",
+    "preflight",
+    "reconcile",
+    "tmux",
+]:
+    if forbidden in dashboard_text:
+        fail(f"Grafana dashboard exposes disabled surface {forbidden!r}")
+
+panel_exprs = [
+    target.get("expr", "")
+    for panel in dashboard.get("panels", [])
+    for target in panel.get("targets", []) or []
+    if target.get("expr")
+]
+if not any("codex_blackbox_turn_duration_seconds_bucket" in expr for expr in panel_exprs):
+    fail("Grafana dashboard missing turn latency histogram query")
+if not any("codex_blackbox_tool_calls_total" in expr for expr in panel_exprs):
+    fail("Grafana dashboard missing tool-call intent query")
+if any("estimated_cost" in expr or "cost_dollars" in expr for expr in panel_exprs):
+    fail("Grafana dashboard must not query local cost estimates")
+
 for panel in dashboard.get("panels", []):
     title = panel.get("title") or ""
-    if "Codex" not in title:
-        continue
     panel_text = json.dumps(panel).lower()
     for copied_model_term in (
         "cl" + "aude",

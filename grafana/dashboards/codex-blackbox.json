@@ -23,20 +23,24 @@
   "liveNow": false,
   "panels": [
     {
+      "datasource": {
+        "type": "grafana",
+        "uid": "-- Grafana --"
+      },
+      "description": "Short, factual notes for interpreting the current-process metrics.",
       "gridPos": {
-        "h": 7,
+        "h": 4,
         "w": 24,
         "x": 0,
         "y": 0
       },
-      "id": 21,
+      "id": 1,
       "options": {
-        "content": "### How to read this dashboard\n\n**Codex request** means a model turn Codex Blackbox observed through Envoy Responses traffic, not every ChatGPT backend call.\n\n**Requested model** comes from the Responses request body. **Served model** comes from response headers or the Responses payload.\n\n**Cached input %** uses Responses usage fields. Cached input is a subset of input, not extra input.\n\n**Context fill** uses Codex input tokens divided by the configured or inferred context window.\n\n**Failed or incomplete responses** come from terminal Responses SSE events observed by Envoy.\n\n**Diagnostic causes** are limited to Envoy-derived Codex status, model mismatch, token/accounting, and context signals.",
+        "content": "### Read this first\n\n- **Since core start** means counters from the current `codex-blackbox-core` process lifetime, not all rows saved in SQLite.\n- **Request** means one Codex Responses model turn observed by Envoy/core. If the cards are zero after a restart, no new Codex turn has passed through this core yet.\n- **Tool-call intent** means the model asked for a tool. It does not prove the tool finished.\n- **Tokens** use Codex accounting: cached input is part of input, and total tokens are input plus output.",
         "mode": "markdown"
       },
       "pluginVersion": "11.1.0",
       "title": "Terminology Guide",
-      "description": "Short definitions for the dashboard's main terms and KPIs.",
       "type": "text"
     },
     {
@@ -44,43 +48,38 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Codex Responses model turns observed by Envoy/core since this core process started. Zero means no new Codex turn has passed through this process yet.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "noValue": "0 observed",
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 40
-              },
-              {
                 "color": "green",
-                "value": 70
+                "value": null
               }
             ]
           },
-          "unit": "percent"
+          "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
+        "w": 8,
         "x": 0,
-        "y": 7
+        "y": 4
       },
-      "id": 3,
+      "id": 2,
       "options": {
-        "colorMode": "background",
+        "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
+        "noValue": "0 observed",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": [
@@ -94,59 +93,54 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "100 * sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"cached_input\"}) / clamp_min(sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"input\"}), 1) unless sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"input\"}) == 0",
+          "expr": "sum(codex_blackbox_requests_total{provider=\"codex_responses\"})",
           "instant": true,
           "legendFormat": "",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Codex cached input % since start",
-      "description": "Share of Codex input tokens that came from provider cache reuse. Higher is usually better.",
+      "title": "Requests",
       "type": "stat"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 11
-      },
-      "id": 5,
-      "panels": [],
-      "title": "Codex model and token signals",
-      "description": "Model usage, token volume, and requested-vs-served model changes.",
-      "type": "row"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Completed Codex Responses streams since this core process started. Zero means no completed stream has been observed yet.",
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "palette-classic"
+            "mode": "thresholds"
+          },
+          "noValue": "0 completed",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
           },
           "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 12
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 4
       },
-      "id": 6,
+      "id": 3,
       "options": {
-        "displayMode": "basic",
-        "maxVizHeight": 300,
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "namePlacement": "auto",
-        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "noValue": "0 completed",
+        "orientation": "auto",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -154,114 +148,33 @@
           "fields": "",
           "values": false
         },
-        "showUnfilled": true,
-        "sizing": "auto"
+        "textMode": "auto"
       },
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (model) (codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0",
+          "expr": "sum(codex_blackbox_codex_response_status_total{status=\"completed\"})",
           "instant": true,
-          "legendFormat": "{{model}}",
+          "legendFormat": "",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Codex tokens by model since start",
-      "description": "Total Codex tokens by served model since codex-blackbox-core started.",
-      "type": "bargauge"
+      "title": "Completed",
+      "type": "stat"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "requests",
-            "axisPlacement": "auto",
-            "drawStyle": "line",
-            "fillOpacity": 15,
-            "gradientMode": "opacity",
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 4,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            }
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 12
-      },
-      "id": 11,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum by (model) (codex_blackbox_requests_total{provider=\"codex_responses\"})",
-          "legendFormat": "{{model}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Codex requests by model since start",
-      "description": "Codex request counts by model since codex-blackbox-core started.",
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 20
-      },
-      "id": 13,
-      "panels": [],
-      "title": "Response status",
-      "description": "Envoy-observed Codex response status and diagnosis signals.",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "description": "Failed Codex Responses streams since this core process started. Zero means no failed stream has been observed.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "noValue": "0 failed",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -285,15 +198,16 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 21
+        "w": 8,
+        "x": 16,
+        "y": 4
       },
-      "id": 15,
+      "id": 4,
       "options": {
-        "colorMode": "background",
+        "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
+        "noValue": "0 failed",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": [
@@ -314,8 +228,7 @@
           "refId": "A"
         }
       ],
-      "title": "Codex failed responses since start",
-      "description": "Envoy-observed Codex Responses streams that ended with failed status since codex-blackbox-core started.",
+      "title": "Failed",
       "type": "stat"
     },
     {
@@ -323,11 +236,13 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Incomplete Codex Responses streams since this core process started. Zero means no stream stopped early.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "noValue": "0 incomplete",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -351,15 +266,16 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 21
+        "w": 8,
+        "x": 0,
+        "y": 8
       },
-      "id": 16,
+      "id": 5,
       "options": {
-        "colorMode": "background",
+        "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
+        "noValue": "0 incomplete",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": [
@@ -380,8 +296,7 @@
           "refId": "A"
         }
       ],
-      "title": "Codex incomplete responses since start",
-      "description": "Envoy-observed Codex Responses streams that ended with incomplete status since codex-blackbox-core started.",
+      "title": "Incomplete",
       "type": "stat"
     },
     {
@@ -389,176 +304,13 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 25
-      },
-      "id": 18,
-      "options": {
-        "displayMode": "basic",
-        "maxVizHeight": 300,
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "namePlacement": "auto",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true,
-        "sizing": "auto"
-      },
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "codex_blackbox_sessions_degraded_total{cause_type=~\"codex_response_failed|codex_response_incomplete|codex_model_mismatch|codex_high_context_fill|codex_high_reasoning_share|codex_accounting_anomaly|codex_low_cached_input_reuse\"} > 0",
-          "legendFormat": "{{cause_type}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Codex diagnostic causes since start",
-      "description": "Codex diagnosis causes since codex-blackbox-core started. Only non-zero causes are shown.",
-      "type": "bargauge"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 33
-      },
-      "id": 28,
-      "panels": [],
-      "title": "Codex live observability",
-      "description": "Raw Codex Responses counters for request, token, context, and diagnosis checks.",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 0,
-        "y": 34
-      },
-      "id": 29,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum(codex_blackbox_requests_total{provider=\"codex_responses\"})",
-          "legendFormat": "",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "title": "Codex Responses requests since start",
-      "description": "Codex Responses model turns observed since codex-blackbox-core started.",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 6,
-        "y": 34
-      },
-      "id": 30,
-      "options": {
-        "displayMode": "basic",
-        "maxVizHeight": 300,
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "namePlacement": "auto",
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true,
-        "sizing": "auto"
-      },
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "sum by (kind) (codex_blackbox_tokens_total{provider=\"codex_responses\",kind=~\"input|cached_input|uncached_input|output|reasoning_output|total\"})",
-          "legendFormat": "{{kind}}",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "title": "Codex Responses tokens by kind",
-      "description": "Codex token counters by kind. Cached input is part of input, not extra tokens.",
-      "type": "bargauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
+      "description": "Streams without a known terminal status since this core process started. Zero means observed streams had known terminal statuses.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "noValue": "0 unknown",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -568,29 +320,30 @@
               },
               {
                 "color": "yellow",
-                "value": 70
+                "value": 1
               },
               {
                 "color": "red",
-                "value": 90
+                "value": 3
               }
             ]
           },
-          "unit": "percent"
+          "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 6,
-        "x": 12,
-        "y": 34
+        "w": 8,
+        "x": 8,
+        "y": 8
       },
-      "id": 31,
+      "id": 6,
       "options": {
-        "colorMode": "background",
+        "colorMode": "value",
         "graphMode": "none",
         "justifyMode": "auto",
+        "noValue": "0 unknown",
         "orientation": "auto",
         "reduceOptions": {
           "calcs": [
@@ -604,13 +357,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(codex_blackbox_context_fill_percent_bucket{provider=\"codex_responses\"}[5m])))",
+          "expr": "sum(codex_blackbox_codex_response_status_total{status=\"unknown\"})",
+          "instant": true,
           "legendFormat": "",
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Codex context fill p95 (5m)",
-      "description": "Five-minute p95 context fill. Higher means less context room is left.",
+      "title": "Unknown",
       "type": "stat"
     },
     {
@@ -618,18 +372,291 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Share of observed input tokens reported as cached input. Empty means no input tokens have been observed since this core process started.",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "inspect": false
+          "noValue": "no token data",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 20
+              },
+              {
+                "color": "green",
+                "value": 50
+              }
+            ]
           },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 8
+      },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "noValue": "no token data",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "(100 * sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"cached_input\"}) / clamp_min(sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"input\"}), 1)) unless on() (sum(codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"input\"}) == 0)",
+          "instant": true,
+          "legendFormat": "",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Cached Input",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Recent Codex Responses request rate by served model. No data means no request samples exist in the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "requests/min",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "noValue": "no request samples",
+          "unit": "reqpm"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (model) (rate(codex_blackbox_requests_total{provider=\"codex_responses\"}[$__rate_interval])) * 60",
+          "legendFormat": "{{model}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Requests Per Minute",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Recent p95 model-turn duration from Envoy response timing. No data means no turn-duration samples exist in the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "s",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "noValue": "no recent turn samples",
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(codex_blackbox_turn_duration_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{model}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Turn Latency P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Recent p95 context-window fill from observed Codex input tokens. No data means no context samples exist in the selected time range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "percent",
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "noValue": "no recent turn samples",
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (rate(codex_blackbox_context_fill_percent_bucket{provider=\"codex_responses\"}[$__rate_interval])))",
+          "legendFormat": "{{model}} p95",
+          "refId": "A"
+        }
+      ],
+      "title": "Context Fill P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Total observed tokens by served model since this core process started. Empty means no non-zero token totals have been observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no token totals",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -644,38 +671,381 @@
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 6,
-        "x": 18,
-        "y": 34
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 26
       },
-      "id": 32,
+      "id": 11,
       "options": {
-        "cellHeight": "sm",
-        "footer": {
-          "countRows": false,
-          "fields": "",
-          "reducer": [
-            "sum"
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no token totals",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
           ],
-          "show": false
+          "fields": "",
+          "values": false
         },
-        "showHeader": true
+        "showUnfilled": true,
+        "sizing": "auto"
       },
       "targets": [
         {
           "editorMode": "code",
-          "expr": "codex_blackbox_sessions_degraded_total{cause_type=~\"codex_response_failed|codex_response_incomplete|codex_model_mismatch|codex_high_context_fill|codex_high_reasoning_share|codex_accounting_anomaly|codex_low_cached_input_reuse\"} > 0",
-          "format": "table",
+          "expr": "sum by (model) (codex_blackbox_tokens_total{provider=\"codex_responses\",kind=\"total\"}) > 0",
+          "instant": true,
+          "legendFormat": "{{model}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Tokens By Model",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Observed token components since this core process started. Read rows separately: cached input is part of input, and reasoning output is part of output. Empty means no non-zero token components have been observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no token components",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "id": 12,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no token components",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (kind) (codex_blackbox_tokens_total{provider=\"codex_responses\",kind=~\"input|uncached_input|cached_input|output|reasoning_output\"}) > 0",
+          "instant": true,
+          "legendFormat": "{{kind}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Token Components",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Model-side tool-call intent by bounded tool label. This is not proof of local tool execution. Empty means no tool-call intent has been observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no tool intent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 0,
+        "y": 33
+      },
+      "id": 14,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no tool intent",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (tool) (codex_blackbox_tool_calls_total) > 0",
+          "instant": true,
+          "legendFormat": "{{tool}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Tool-Call Intent",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Requested-versus-served model mismatches observed by Envoy/core. Empty means no mismatch has been observed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no mismatches",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 6,
+        "y": 33
+      },
+      "id": 13,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no mismatches",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (requested, actual) (codex_blackbox_model_fallback_total) > 0",
+          "instant": true,
+          "legendFormat": "{{requested}} -> {{actual}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Model Fallback",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Advisory guard blocks by bounded reason code. Empty means no guard block has been emitted by this core process.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no guard blocks",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 12,
+        "y": 33
+      },
+      "id": 15,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no guard blocks",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (reason_code) (codex_blackbox_guard_blocks_total) > 0",
+          "instant": true,
+          "legendFormat": "{{reason_code}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Guard Blocks",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Postmortem-aligned diagnostic causes, including heuristic causes such as high reasoning share. Empty means no diagnostic cause counter is non-zero.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "noValue": "no diagnostic causes",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 6,
+        "x": 18,
+        "y": 33
+      },
+      "id": 16,
+      "options": {
+        "displayMode": "basic",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "noValue": "no diagnostic causes",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (cause_type) (codex_blackbox_sessions_degraded_total{cause_type=~\"codex_response_failed|codex_response_incomplete|codex_model_mismatch|codex_high_context_fill|codex_high_reasoning_share|codex_accounting_anomaly|codex_low_cached_input_reuse\"}) > 0",
           "instant": true,
           "legendFormat": "{{cause_type}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Codex diagnosis cause labels",
-      "description": "Codex diagnosis causes by label. Only non-zero causes are shown.",
-      "type": "table"
+      "title": "Diagnostic Causes",
+      "type": "bargauge"
     }
   ],
   "refresh": "30s",
@@ -688,13 +1058,13 @@
     "list": []
   },
   "time": {
-    "from": "now-7d",
+    "from": "now-6h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Codex Blackbox - Codex Envoy observability",
+  "title": "Codex Blackbox - Codex Responses Observability",
   "uid": "codex-blackbox-main",
-  "version": 5,
+  "version": 10,
   "weekStart": "monday"
 }

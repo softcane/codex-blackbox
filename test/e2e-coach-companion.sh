@@ -281,9 +281,8 @@ cat >"$REPORT_DIR/final-classification.json" <<JSON
   "artifact_dir": "$REPORT_DIR",
   "classification": {
     "fake_proxy_hook_e2e": "fake",
-    "companion_ui_api": "fake",
-    "live_cli_smoke": "skipped",
-    "live_ui_desktop_smoke": "skipped"
+    "coach_json_api": "fake",
+    "live_cli_smoke": "skipped"
   },
   "unsupported_or_untrusted": [
     "fixture evidence is not live Codex support proof",

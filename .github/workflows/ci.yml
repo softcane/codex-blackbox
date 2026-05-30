@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.86.0
@@ -48,7 +48,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@1.86.0
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload failure logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: docker-compose-logs
           path: /tmp/codex-blackbox-ci
@@ -96,7 +96,56 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Check install.sh syntax
         run: sh -n install.sh
+
+  package-smoke:
+    name: Release package smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.86.0
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release CLI
+        run: cargo build --release -p codex-blackbox-cli
+
+      - name: Package and verify CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="x86_64-unknown-linux-gnu"
+          archive="codex-blackbox-${target}.tar.gz"
+          staging="dist/${target}"
+          verify_dir="dist/verify"
+          mkdir -p "$staging" "$verify_dir"
+          cp target/release/codex-blackbox "$staging/codex-blackbox"
+          cp README.md LICENSE "$staging/"
+          tar -czf "dist/${archive}" -C "$staging" codex-blackbox README.md LICENSE
+          (cd dist && sha256sum "$archive" > "${archive}.sha256")
+          expected="$(awk '{print $1}' "dist/${archive}.sha256")"
+          actual="$(sha256sum "dist/${archive}" | awk '{print $1}')"
+          test "$expected" = "$actual"
+          tar -xzf "dist/${archive}" -C "$verify_dir"
+          "$verify_dir/codex-blackbox" --version
+          "$verify_dir/codex-blackbox" run --dry-run -- codex exec --sandbox read-only "release package smoke" > dist/package-smoke.txt
+          grep -q "Config files: not modified" dist/package-smoke.txt
+          grep -q "features.enable_request_compression=false" dist/package-smoke.txt
+
+      - name: Upload smoke package
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-blackbox-package-smoke
+          path: |
+            dist/codex-blackbox-x86_64-unknown-linux-gnu.tar.gz
+            dist/codex-blackbox-x86_64-unknown-linux-gnu.tar.gz.sha256
+            dist/package-smoke.txt

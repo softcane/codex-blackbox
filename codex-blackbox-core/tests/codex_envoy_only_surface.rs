@@ -179,6 +179,26 @@ fn codex_target_path_does_not_depend_on_local_json_stdout() {
 }
 
 #[test]
+fn custom_companion_browser_ui_is_not_served() {
+    let core = read_repo_file("codex-blackbox-core/src/main.rs");
+    for forbidden in [
+        "COMPANION_HTML",
+        "handle_companion_ui",
+        ".route(\"/companion\"",
+    ] {
+        assert!(
+            !core.contains(forbidden),
+            "calibrated v1 must not serve the removed Companion browser UI via {forbidden}"
+        );
+    }
+
+    assert!(
+        core.contains("\"/api/companion/sessions\""),
+        "redacted companion JSON APIs should remain for internal tests and future integrations"
+    );
+}
+
+#[test]
 fn codex_http_and_watch_surface_does_not_expose_removed_cache_or_quota_products() {
     let core = read_repo_file("codex-blackbox-core/src/main.rs");
     for forbidden in [
@@ -511,7 +531,11 @@ fn historical_monitor_does_not_compute_removed_cache_cost_or_tool_surfaces() {
 
 #[test]
 fn core_metrics_register_only_envoy_derived_codex_families() {
-    let metrics = read_repo_file("codex-blackbox-core/src/metrics.rs");
+    let metrics_source = read_repo_file("codex-blackbox-core/src/metrics.rs");
+    let metrics = metrics_source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("metrics source before tests");
     let allowed_metric_families = [
         "codex_blackbox_requests_total",
         "codex_blackbox_tokens_total",
@@ -607,14 +631,33 @@ fn codex_dashboard_contains_only_envoy_derived_codex_metrics() {
         "codex_blackbox_history_estimated_spend",
         "codex_blackbox_history_sessions",
         "codex_blackbox_history_degraded",
+        "codex_blackbox_hook_events_total",
+        "codex_blackbox_validation_runs_total",
+        "codex_blackbox_loop_signals_total",
+        "codex_blackbox_coach_actions_total",
+        "codex_blackbox_baseline_builds_total",
+        "codex_blackbox_unvalidated_edit_signals_total",
     ];
     let forbidden_query_terms = ["cache_read", "cache_create"];
     let forbidden_panel_terms = [
         "Tool failures",
         "Skill lifecycle",
         "MCP lifecycle",
-        "Estimated Codex cost",
+        "tool success",
+        "Tool success",
+        "succeeded",
         "Active sessions",
+        "Coach",
+        "coach",
+        "hook",
+        "Hook",
+        "validation",
+        "Validation",
+        "baseline",
+        "Baseline",
+        "tmux",
+        "preflight",
+        "reconcile",
     ];
 
     for panel in panels {
@@ -652,5 +695,209 @@ fn codex_dashboard_contains_only_envoy_derived_codex_metrics() {
     assert!(
         dashboard.contains("codex_blackbox_codex_response_status_total"),
         "dashboard must use true Envoy-derived Codex response status counters"
+    );
+    for term in [
+        "Coach",
+        "coach",
+        "hook",
+        "Hook",
+        "validation",
+        "Validation",
+        "baseline",
+        "Baseline",
+        "tmux",
+        "preflight",
+        "reconcile",
+        "tool success",
+        "succeeded",
+    ] {
+        assert!(
+            !dashboard.contains(term),
+            "dashboard must not expose disabled feature term {term:?}"
+        );
+    }
+}
+
+#[test]
+fn codex_dashboard_panels_have_clear_enabled_query_contracts() {
+    let dashboard = read_repo_file("grafana/dashboards/codex-blackbox.json");
+    let parsed: Value = serde_json::from_str(&dashboard).expect("dashboard JSON");
+    let panels = parsed
+        .get("panels")
+        .and_then(Value::as_array)
+        .expect("dashboard panels");
+
+    let mut titles = Vec::new();
+    let mut expressions = Vec::new();
+    for panel in panels {
+        let title = panel.get("title").and_then(Value::as_str).unwrap_or("");
+        let description = panel
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(!title.trim().is_empty(), "dashboard panel missing title");
+        assert!(
+            !description.trim().is_empty(),
+            "dashboard panel {title:?} missing plain-English description"
+        );
+        titles.push(title.to_string());
+
+        if let Some(targets) = panel.get("targets").and_then(Value::as_array) {
+            assert!(
+                description.contains("Zero means")
+                    || description.contains("No data means")
+                    || description.contains("Empty means"),
+                "dashboard panel {title:?} must explain its empty or zero state"
+            );
+            for target in targets {
+                let expr = target.get("expr").and_then(Value::as_str).unwrap_or("");
+                assert!(
+                    !expr.trim().is_empty(),
+                    "dashboard panel {title:?} target missing PromQL"
+                );
+                if panel.get("type").and_then(Value::as_str) == Some("timeseries") {
+                    assert!(
+                        expr.contains("rate(") || expr.contains("increase("),
+                        "time-series panel {title:?} must use range/rate semantics: {expr}"
+                    );
+                }
+                expressions.push(expr.to_string());
+            }
+        }
+    }
+
+    for required_title in [
+        "Terminology Guide",
+        "Requests",
+        "Completed",
+        "Failed",
+        "Incomplete",
+        "Unknown",
+        "Cached Input",
+        "Requests Per Minute",
+        "Turn Latency P95",
+        "Context Fill P95",
+        "Tokens By Model",
+        "Token Components",
+        "Model Fallback",
+        "Tool-Call Intent",
+        "Guard Blocks",
+        "Diagnostic Causes",
+    ] {
+        assert!(
+            titles.iter().any(|title| title == required_title),
+            "dashboard missing expected panel {required_title:?}"
+        );
+    }
+    assert!(
+        !titles.iter().any(|title| title == "Diagnostic Cause Guide"),
+        "dashboard must not include the removed diagnostic guide text panel"
+    );
+    let panel_by_title = |want: &str| {
+        panels
+            .iter()
+            .find(|panel| panel.get("title").and_then(Value::as_str) == Some(want))
+            .unwrap_or_else(|| panic!("dashboard missing panel {want:?}"))
+    };
+    for (title, x, y) in [
+        ("Requests", 0, 4),
+        ("Completed", 8, 4),
+        ("Failed", 16, 4),
+        ("Incomplete", 0, 8),
+        ("Unknown", 8, 8),
+        ("Cached Input", 16, 8),
+    ] {
+        let panel = panel_by_title(title);
+        let grid = panel
+            .get("gridPos")
+            .and_then(Value::as_object)
+            .expect("top-card grid");
+        assert_eq!(grid.get("x").and_then(Value::as_i64), Some(x), "{title} x");
+        assert_eq!(grid.get("y").and_then(Value::as_i64), Some(y), "{title} y");
+        assert_eq!(
+            grid.get("w").and_then(Value::as_i64),
+            Some(8),
+            "{title} width"
+        );
+    }
+    for title in [
+        "Requests Per Minute",
+        "Turn Latency P95",
+        "Context Fill P95",
+    ] {
+        assert_eq!(
+            panel_by_title(title).get("type").and_then(Value::as_str),
+            Some("timeseries"),
+            "{title} should use a time-series visualization"
+        );
+    }
+
+    assert!(
+        dashboard.contains("Since core start")
+            && dashboard.contains("current `codex-blackbox-core` process lifetime"),
+        "dashboard must define current-process lifetime semantics for since-start panels"
+    );
+    assert!(
+        expressions
+            .iter()
+            .any(|expr| expr.contains("codex_blackbox_turn_duration_seconds_bucket")),
+        "dashboard must include a latency panel backed by turn duration metrics"
+    );
+    assert!(
+        expressions
+            .iter()
+            .any(|expr| expr.contains("codex_blackbox_context_fill_percent_bucket")),
+        "dashboard must include a context fill panel backed by context histogram metrics"
+    );
+    assert!(
+        expressions
+            .iter()
+            .any(|expr| expr.contains("codex_blackbox_tool_calls_total")),
+        "dashboard must expose proxy-observed tool-call intent"
+    );
+    assert!(
+        dashboard.contains("Tool-call intent")
+            && !dashboard.contains("tool success")
+            && !dashboard.contains("succeeded"),
+        "tool panels must say intent without implying local tool success"
+    );
+    assert!(
+        !expressions
+            .iter()
+            .any(|expr| expr.contains("estimated_cost") || expr.contains("cost_dollars")),
+        "dashboard must not graph local/untrusted cost estimates"
+    );
+    let token_component_query = expressions
+        .iter()
+        .find(|expr| {
+            expr.contains("kind=~\"input|uncached_input|cached_input|output|reasoning_output\"")
+        })
+        .expect("token component query");
+    assert!(
+        !token_component_query.contains("|total"),
+        "token component panel must not invite adding local total to its parts"
+    );
+    let diagnostic_query = expressions
+        .iter()
+        .find(|expr| expr.contains("codex_blackbox_sessions_degraded_total"))
+        .expect("diagnostic query");
+    for cause in [
+        "codex_response_failed",
+        "codex_response_incomplete",
+        "codex_model_mismatch",
+        "codex_high_context_fill",
+        "codex_high_reasoning_share",
+        "codex_accounting_anomaly",
+        "codex_low_cached_input_reuse",
+    ] {
+        assert!(
+            diagnostic_query.contains(cause) && dashboard.contains(cause),
+            "dashboard diagnostic surface missing postmortem cause {cause}"
+        );
+    }
+    assert!(
+        dashboard.contains("no new Codex turn has passed through this core yet")
+            || dashboard.contains("no new Codex turn has passed through this process yet"),
+        "terminology guide must explain why all current-process counters can be zero after restart"
     );
 }

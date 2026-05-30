@@ -15,6 +15,10 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
+mod features {
+    pub(crate) const ENABLE_COACH: bool = false;
+}
+
 // ---------------------------------------------------------------------------
 // Proto modules
 // ---------------------------------------------------------------------------
@@ -1052,34 +1056,35 @@ fn insert_coach_event(conn: &Connection, event: &coach::NormalizedEvent) -> rusq
     Ok(())
 }
 
-fn record_proxy_coach_events(
-    conn: &Connection,
-    timestamp: &str,
-    session_id: &str,
-    status: &str,
+struct ProxyCoachEventInput<'a> {
+    timestamp: &'a str,
+    session_id: &'a str,
+    status: &'a str,
     input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
     reasoning_output_tokens: u64,
     total_tokens: u64,
     context_utilization: f64,
-    tool_calls_json: &str,
+    tool_calls_json: &'a str,
     trusted_for_budget_enforcement: bool,
     turn_number: u32,
-) {
-    let context_fill_percent = Some((context_utilization * 100.0).clamp(0.0, 100.0));
-    let turn_id = format!("turn_{turn_number}");
+}
+
+fn record_proxy_coach_events(conn: &Connection, input: ProxyCoachEventInput<'_>) {
+    let context_fill_percent = Some((input.context_utilization * 100.0).clamp(0.0, 100.0));
+    let turn_id = format!("turn_{}", input.turn_number);
     let turn_event = coach::proxy_turn_event(
-        timestamp.to_string(),
-        session_id.to_string(),
+        input.timestamp.to_string(),
+        input.session_id.to_string(),
         turn_id.clone(),
-        status,
+        input.status,
         coach::TokenTotals {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            reasoning_output_tokens,
-            local_total_tokens: total_tokens,
+            input_tokens: input.input_tokens,
+            cached_input_tokens: input.cached_input_tokens,
+            output_tokens: input.output_tokens,
+            reasoning_output_tokens: input.reasoning_output_tokens,
+            local_total_tokens: input.total_tokens,
         },
         context_fill_percent,
     );
@@ -1087,11 +1092,11 @@ fn record_proxy_coach_events(
 
     if let Some(fill) = context_fill_percent.filter(|fill| *fill >= 70.0) {
         let event = coach::NormalizedEvent::new(
-            timestamp.to_string(),
+            input.timestamp.to_string(),
             coach::EvidenceSource::Proxy,
             coach::EventCategory::ContextPressureObserved,
         )
-        .with_session(session_id.to_string())
+        .with_session(input.session_id.to_string())
         .with_turn(turn_id.clone())
         .with_reason(if fill >= 85.0 {
             "high_context_stop"
@@ -1102,13 +1107,13 @@ fn record_proxy_coach_events(
         let _ = insert_coach_event(conn, &event);
     }
 
-    for tool_name in parse_codex_tool_calls_json(tool_calls_json) {
+    for tool_name in parse_codex_tool_calls_json(input.tool_calls_json) {
         let event = coach::NormalizedEvent::new(
-            timestamp.to_string(),
+            input.timestamp.to_string(),
             coach::EvidenceSource::Proxy,
             coach::EventCategory::ToolIntentObserved,
         )
-        .with_session(session_id.to_string())
+        .with_session(input.session_id.to_string())
         .with_turn(turn_id.clone())
         .with_reason("proxy_tool_intent")
         .with_payload_value(
@@ -1118,13 +1123,13 @@ fn record_proxy_coach_events(
         let _ = insert_coach_event(conn, &event);
     }
 
-    if !trusted_for_budget_enforcement {
+    if !input.trusted_for_budget_enforcement {
         let event = coach::NormalizedEvent::new(
-            timestamp.to_string(),
+            input.timestamp.to_string(),
             coach::EvidenceSource::Proxy,
             coach::EventCategory::PricingTrustObserved,
         )
-        .with_session(session_id.to_string())
+        .with_session(input.session_id.to_string())
         .with_turn(turn_id)
         .with_reason("untrusted_pricing")
         .with_payload_value("trusted_for_budget_enforcement", serde_json::json!(false))
@@ -1328,18 +1333,20 @@ fn db_writer_loop(path: &str, rx: std_mpsc::Receiver<DbCommand>) {
 
                 record_proxy_coach_events(
                     &conn,
-                    &timestamp,
-                    &session_id,
-                    &status,
-                    input_tokens,
-                    cached_input_tokens,
-                    output_tokens,
-                    reasoning_output_tokens,
-                    total_tokens,
-                    context_utilization,
-                    &tool_calls_json,
-                    trusted_for_budget_enforcement,
-                    turn_number,
+                    ProxyCoachEventInput {
+                        timestamp: &timestamp,
+                        session_id: &session_id,
+                        status: &status,
+                        input_tokens,
+                        cached_input_tokens,
+                        output_tokens,
+                        reasoning_output_tokens,
+                        total_tokens,
+                        context_utilization,
+                        tool_calls_json: &tool_calls_json,
+                        trusted_for_budget_enforcement,
+                        turn_number,
+                    },
                 );
 
                 let _ = conn.execute(
@@ -4873,14 +4880,6 @@ async fn handle_companion_session(
     }
 }
 
-async fn handle_companion_ui() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [("content-type", "text/html; charset=utf-8")],
-        COMPANION_HTML,
-    )
-}
-
 fn hook_str<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -5214,128 +5213,6 @@ async fn handle_coach_hook(Json(input): Json<Value>) -> impl IntoResponse {
         serde_json::to_string(&output).unwrap_or_else(|_| "{\"continue\":true}".to_string()),
     )
 }
-
-const COMPANION_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Codex Blackbox Companion</title>
-  <style>
-    :root { color-scheme: light; --ink:#172026; --muted:#61717d; --line:#d8dee3; --bg:#f7f8f8; --panel:#ffffff; --good:#187044; --watch:#136b8f; --care:#9a6200; --stop:#b42318; --block:#7a1020; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:var(--bg); color:var(--ink); letter-spacing:0; }
-    header { height:56px; display:flex; align-items:center; gap:12px; padding:0 18px; border-bottom:1px solid var(--line); background:#fff; }
-    .mark { width:28px; height:28px; border:2px solid var(--ink); display:grid; place-items:center; font-size:14px; font-weight:700; }
-    .title { font-weight:700; }
-    .layout { display:grid; grid-template-columns:minmax(220px, 300px) 1fr; min-height:calc(100vh - 56px); }
-    aside { border-right:1px solid var(--line); background:#fff; padding:12px; overflow:auto; }
-    main { padding:16px; overflow:auto; }
-    button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); min-height:32px; border-radius:6px; padding:6px 10px; cursor:pointer; }
-    button:hover { border-color:#94a3ad; }
-    .session { width:100%; text-align:left; margin-bottom:8px; display:grid; gap:4px; }
-    .session strong { font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .session span { font-size:12px; color:var(--muted); }
-    .band { background:var(--panel); border-bottom:1px solid var(--line); padding:14px 16px; margin:-16px -16px 16px; display:grid; gap:8px; }
-    .state { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-    .pill { display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border-radius:999px; border:1px solid var(--line); font-size:12px; font-weight:650; }
-    .healthy { color:var(--good); border-color:#a7d7bd; }
-    .watching { color:var(--watch); border-color:#9ed1e0; }
-    .careful { color:var(--care); border-color:#e3c383; }
-    .stop { color:var(--stop); border-color:#efb0a8; }
-    .blocked { color:var(--block); border-color:#dda1ad; }
-    .cooldown { color:var(--care); border-color:#e3c383; }
-    .ended { color:var(--muted); }
-    .grid { display:grid; grid-template-columns:repeat(12, 1fr); gap:12px; }
-    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
-    h2 { font-size:14px; margin:0 0 10px; }
-    .span4 { grid-column:span 4; } .span6 { grid-column:span 6; } .span8 { grid-column:span 8; } .span12 { grid-column:span 12; }
-    .metric { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid #edf0f2; }
-    .metric:last-child { border-bottom:0; }
-    .muted { color:var(--muted); }
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th, td { text-align:left; border-bottom:1px solid #edf0f2; padding:7px 6px; vertical-align:top; }
-    th { color:var(--muted); font-weight:650; }
-    .empty { color:var(--muted); font-size:13px; padding:10px 0; }
-    .bar { height:10px; background:#e8edf0; border-radius:999px; overflow:hidden; }
-    .bar > div { height:100%; background:#2f6f73; width:0%; }
-    a { color:#0f5f9a; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-    @media (max-width: 820px) { .layout { grid-template-columns:1fr; } aside { border-right:0; border-bottom:1px solid var(--line); max-height:220px; } .span4,.span6,.span8 { grid-column:span 12; } }
-  </style>
-</head>
-<body>
-  <header><div class="mark">CB</div><div class="title">Codex Blackbox Companion</div><div class="muted" id="updated"></div></header>
-  <div class="layout">
-    <aside><div id="sessions"></div></aside>
-    <main>
-      <div class="band">
-        <div class="state"><span id="state" class="pill watching">Watching</span><strong id="reason">Loading</strong></div>
-        <div id="next" class="muted"></div>
-        <div id="evidence"></div>
-      </div>
-      <div class="grid">
-        <section class="span4"><h2>Tokens And Context</h2><div id="tokens"></div></section>
-        <section class="span4"><h2>Validation</h2><div id="validation"></div></section>
-        <section class="span4"><h2>Coach Actions</h2><div id="actions"></div></section>
-        <section class="span6"><h2>Signals</h2><div id="signals"></div></section>
-        <section class="span6"><h2>Postmortem</h2><div id="postmortem"></div></section>
-        <section class="span12"><h2>Timeline</h2><div id="timeline"></div></section>
-      </div>
-    </main>
-  </div>
-  <script>
-    let selected = null;
-    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const stateClass = (s) => String(s || "watching").toLowerCase();
-    async function json(url) { const r = await fetch(url); if (!r.ok) throw new Error(String(r.status)); return r.json(); }
-    function renderSessions(items) {
-      const box = document.getElementById("sessions");
-      if (!items.length) { box.innerHTML = '<div class="empty">No sessions</div>'; return; }
-      if (!selected) selected = items[0].session_id;
-      box.innerHTML = items.map(s => `<button class="session" data-id="${esc(s.session_id)}"><strong>${esc(s.session_id)}</strong><span>${esc(s.state)} · ${esc(s.primary_reason)}</span></button>`).join("");
-      box.querySelectorAll("button").forEach(b => b.onclick = () => { selected = b.dataset.id; loadSession(); });
-    }
-    function rows(items, cols) {
-      if (!items.length) return '<div class="empty">None</div>';
-      return `<table><thead><tr>${cols.map(c=>`<th>${esc(c[0])}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${cols.map(c=>`<td>${esc(c[1](item))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
-    }
-    function renderSnapshot(s) {
-      const decision = s.decision || {};
-      const state = stateClass(decision.state);
-      const stateEl = document.getElementById("state");
-      stateEl.className = `pill ${state}`;
-      stateEl.textContent = decision.state || "watching";
-      document.getElementById("reason").textContent = decision.primary_reason || "";
-      document.getElementById("next").textContent = decision.next_action || "";
-      document.getElementById("evidence").innerHTML = (decision.evidence_sources || []).map(e => `<span class="pill">${esc(e.evidence_source)} ${esc(e.count)}</span>`).join(" ");
-      const fill = Math.max(0, Math.min(100, s.state.max_context_fill_percent || 0));
-      document.getElementById("tokens").innerHTML = [
-        ['Turns', s.state.turn_count],
-        ['Total tokens', s.state.token_totals.local_total_tokens],
-        ['Cached input', s.state.token_totals.cached_input_tokens],
-        ['Output', s.state.token_totals.output_tokens],
-        ['Reasoning output', s.state.token_totals.reasoning_output_tokens],
-      ].map(([k,v]) => `<div class="metric"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("") + `<div class="metric"><span>Context</span><strong>${fill.toFixed(0)}%</strong></div><div class="bar"><div style="width:${fill}%"></div></div>`;
-      document.getElementById("validation").innerHTML = rows(s.state.recent_validation_results || [], [['Category', x=>x.category], ['Result', x=>x.result], ['Evidence', x=>x.evidence_source]]);
-      document.getElementById("actions").innerHTML = rows(s.state.hook_actions || [], [['Action', x=>x.action], ['Reason', x=>x.reason_code], ['Evidence', x=>x.evidence_source]]);
-      document.getElementById("signals").innerHTML = rows(s.signals || [], [['Severity', x=>x.severity], ['Signal', x=>x.signal_name], ['Reason', x=>x.reason], ['Evidence', x=>x.evidence_source]]);
-      document.getElementById("postmortem").innerHTML = s.state.postmortem_link ? `<a href="${esc(s.state.postmortem_link)}">Open redacted postmortem</a>` : '<div class="empty">Not ready</div>';
-      document.getElementById("timeline").innerHTML = rows((s.timeline || []).slice(-80), [['Time', x=>x.timestamp], ['Evidence', x=>x.evidence_source], ['Category', x=>x.category], ['Reason', x=>x.reason_code || '']] );
-    }
-    async function loadSession() { if (!selected) return; try { renderSnapshot(await json(`/api/companion/session/${encodeURIComponent(selected)}`)); } catch (_) {} }
-    async function tick() {
-      try {
-        const data = await json('/api/companion/sessions?limit=20&days=7');
-        renderSessions(data.sessions || []);
-        await loadSession();
-        document.getElementById("updated").textContent = new Date().toLocaleTimeString();
-      } catch (e) { document.getElementById("reason").textContent = "Core unavailable"; }
-    }
-    tick(); setInterval(tick, 2000);
-  </script>
-</body>
-</html>"#;
 
 #[derive(Debug, Deserialize)]
 struct CodexObservationRequest {
@@ -6537,18 +6414,16 @@ async fn handle_postmortem_target(
 }
 
 async fn http_server() {
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/api/summary", get(handle_summary))
         .route("/api/guard-state", get(handle_guard_state))
-        .route("/companion", get(handle_companion_ui))
         .route("/api/companion/sessions", get(handle_companion_sessions))
         .route(
             "/api/companion/session/:session_id",
             get(handle_companion_session),
         )
-        .route("/api/coach/hook", post(handle_coach_hook))
         .route("/api/observations/codex", post(handle_codex_observations))
         .route("/api/recall", get(handle_recall))
         .route(
@@ -6564,6 +6439,9 @@ async fn http_server() {
         )
         .route("/api/sessions", get(handle_sessions))
         .route("/watch", get(handle_watch));
+    if features::ENABLE_COACH {
+        app = app.route("/api/coach/hook", post(handle_coach_hook));
+    }
 
     let addr =
         std::env::var("CODEX_BLACKBOX_HTTP_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
@@ -10105,8 +9983,8 @@ mod tests {
         seed_live_metric_labels_from_db(&conn).expect("seed tool labels");
 
         let (_, body) = metrics::render().expect("render metrics");
-        assert!(body.contains("codex_blackbox_tool_calls_total{tool=\"bash\"} 0"));
-        assert!(body.contains("codex_blackbox_tool_calls_total{tool=\"named_tool\"} 0"));
+        assert!(body.contains("codex_blackbox_tool_calls_total{tool=\"bash\"}"));
+        assert!(body.contains("codex_blackbox_tool_calls_total{tool=\"named_tool\"}"));
         assert!(!body.contains("mcp__github__get_issue"));
         for dropped_metric in [
             "codex_blackbox_tool_failures_total",

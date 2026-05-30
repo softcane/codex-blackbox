@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Check crate versions match tag
         shell: bash
@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -96,13 +96,36 @@ jobs:
           cp README.md LICENSE "$staging/"
           tar -czf "dist/${archive}" -C "$staging" codex-blackbox README.md LICENSE
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+            (cd dist && sha256sum "${archive}" > "${archive}.sha256")
           else
-            shasum -a 256 "dist/${archive}" > "dist/${archive}.sha256"
+            (cd dist && shasum -a 256 "${archive}" > "${archive}.sha256")
+          fi
+
+      - name: Verify packaged archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          archive="codex-blackbox-${target}.tar.gz"
+          expected="$(awk '{print $1}' "dist/${archive}.sha256")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "dist/${archive}" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "dist/${archive}" | awk '{print $1}')"
+          fi
+          test "$expected" = "$actual"
+          mkdir -p "dist/verify-${target}"
+          tar -xzf "dist/${archive}" -C "dist/verify-${target}"
+          test -x "dist/verify-${target}/codex-blackbox"
+          if [[ "${{ matrix.cross }}" != "true" ]]; then
+            "dist/verify-${target}/codex-blackbox" --version
+            "dist/verify-${target}/codex-blackbox" run --dry-run -- codex exec --sandbox read-only "release archive smoke" > "dist/verify-${target}.txt"
+            grep -q "Config files: not modified" "dist/verify-${target}.txt"
+            grep -q "features.enable_request_compression=false" "dist/verify-${target}.txt"
           fi
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: codex-blackbox-${{ matrix.target }}
           path: |
@@ -128,7 +151,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Set image tags
         id: tags
@@ -223,14 +246,37 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Download CLI artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: codex-blackbox-*
           merge-multiple: true
+
+      - name: Verify downloaded release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/codex-blackbox-*.tar.gz)
+          checksums=(dist/codex-blackbox-*.tar.gz.sha256)
+          if [[ "${#archives[@]}" -lt 4 || "${#checksums[@]}" -lt 4 ]]; then
+            echo "expected four CLI archives and checksums" >&2
+            ls -la dist >&2
+            exit 1
+          fi
+          for checksum in "${checksums[@]}"; do
+            archive="${checksum%.sha256}"
+            if [[ ! -f "$archive" ]]; then
+              echo "missing archive for checksum: $checksum" >&2
+              exit 1
+            fi
+            expected="$(awk '{print $1}' "$checksum")"
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+            test "$expected" = "$actual"
+          done
 
       - name: Create release
         shell: bash
@@ -241,7 +287,14 @@ jobs:
             dist/codex-blackbox-*.tar.gz.sha256
             install.sh
           )
-          notes="Install with: curl https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh"
+          notes="$(printf '%s\n' \
+            'Install with:' \
+            '' \
+            '```bash' \
+            'curl -fsSL https://raw.githubusercontent.com/softcane/codex-blackbox/main/install.sh | sh' \
+            '```' \
+            '' \
+            'CLI archives are uploaded with `.sha256` files. The installer verifies the checksum before installing.')"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
             gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$notes"

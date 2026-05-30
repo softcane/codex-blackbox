@@ -1,11 +1,18 @@
+#[allow(dead_code)]
 mod baseline_commands;
+#[allow(dead_code)]
 mod coach_commands;
 mod tmux;
-mod ui_commands;
-mod ui_config;
-mod ui_launch;
-mod ui_process;
-mod ui_status;
+
+mod features {
+    pub(crate) const ENABLE_COACH: bool = false;
+    pub(crate) const ENABLE_BASELINE: bool = false;
+    pub(crate) const ENABLE_SESSIONS: bool = false;
+    pub(crate) const ENABLE_RECALL: bool = false;
+    pub(crate) const ENABLE_PREFLIGHT: bool = false;
+    pub(crate) const ENABLE_RECONCILE: bool = false;
+    pub(crate) const ENABLE_TMUX_WATCH: bool = false;
+}
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -107,8 +114,8 @@ enum Commands {
         #[arg(long, default_value = "http://localhost:9091")]
         url: String,
 
-        /// Hide frustration signal events
-        #[arg(long)]
+        /// Legacy watch filter retained only for old scripts; no enabled watch surface emits it.
+        #[arg(long, hide = true)]
         no_signals: bool,
 
         /// Render the deterministic local postmortem when a session becomes ready
@@ -128,27 +135,19 @@ enum Commands {
         session: Option<String>,
 
         /// Split each session into its own tmux pane
-        #[arg(long, conflicts_with = "session")]
+        #[arg(long, conflicts_with = "session", hide = !features::ENABLE_TMUX_WATCH)]
         tmux: bool,
 
         /// Max tmux panes before refusing new sessions
-        #[arg(long, default_value = "8")]
+        #[arg(long, default_value = "8", hide = !features::ENABLE_TMUX_WATCH)]
         tmux_max_panes: usize,
     },
 
     /// Show recent sessions
+    #[command(hide = !features::ENABLE_SESSIONS, disable_help_flag = true)]
     Sessions {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-
-        /// Number of sessions to show
-        #[arg(long, default_value = "20")]
-        limit: u32,
-
-        /// Days to look back
-        #[arg(long, default_value = "7")]
-        days: u32,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 
     /// Render the current Codex decision footer or JSON
@@ -202,34 +201,24 @@ enum Commands {
     },
 
     /// Install, inspect, or run the Codex Blackbox hook coach
+    #[command(hide = !features::ENABLE_COACH, disable_help_flag = true)]
     Coach {
-        #[command(subcommand)]
-        command: CoachCommands,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 
     /// Manage optional derived-only local baseline learning
+    #[command(hide = !features::ENABLE_BASELINE, disable_help_flag = true)]
     Baseline {
-        #[command(subcommand)]
-        command: BaselineCommands,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 
     /// Search across past session prompts and final summaries
+    #[command(hide = !features::ENABLE_RECALL, disable_help_flag = true)]
     Recall {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-
-        /// Number of matches to show
-        #[arg(long, default_value = "5")]
-        limit: u32,
-
-        /// Days to look back
-        #[arg(long, default_value = "30")]
-        days: u32,
-
-        /// Search query
-        #[arg(required = true, num_args = 1..)]
-        query: Vec<String>,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 
     /// Render a deterministic Codex session report
@@ -255,26 +244,10 @@ enum Commands {
     },
 
     /// Import a billed-cost reconciliation for a session
+    #[command(hide = !features::ENABLE_RECONCILE, disable_help_flag = true)]
     Reconcile {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-
-        /// Session ID to reconcile
-        #[arg(long)]
-        session: String,
-
-        /// Billed cost in USD
-        #[arg(long)]
-        billed_cost: f64,
-
-        /// Billing source label, e.g. invoice_2026q2
-        #[arg(long)]
-        source: String,
-
-        /// Optional import timestamp in UTC ISO 8601
-        #[arg(long)]
-        imported_at: Option<String>,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 
     /// Print read-only configuration previews
@@ -283,24 +256,11 @@ enum Commands {
         command: ConfigCommands,
     },
 
-    /// Experimental local Codex Desktop/IDE UI integration
-    Ui {
-        /// Codex user config path; defaults to CODEX_HOME/config.toml or ~/.codex/config.toml
-        #[arg(long)]
-        config: Option<PathBuf>,
-
-        /// Codex Blackbox UI state directory; tests can override this to avoid user state
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-
-        #[command(subcommand)]
-        command: UiCommands,
-    },
-
     /// Manual preflight checks for live smoke tests; never launches Codex turns
+    #[command(hide = !features::ENABLE_PREFLIGHT, disable_help_flag = true)]
     Preflight {
-        #[command(subcommand)]
-        command: PreflightCommands,
+        #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _args: Vec<String>,
     },
 }
 
@@ -308,173 +268,6 @@ enum Commands {
 enum ConfigCommands {
     /// Print the Codex proxy configuration used by the run wrapper without applying it
     Codex,
-}
-
-#[derive(Debug, Subcommand)]
-enum UiCommands {
-    /// Check experimental Codex UI mode configuration and local stack readiness
-    Doctor {
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-    },
-
-    /// Enable experimental Codex UI mode in the user Codex config
-    Enable {
-        /// Print intended changes without modifying files
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Overwrite an existing user-owned codex-blackbox-chatgpt provider
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Disable experimental Codex UI mode using Blackbox-owned state
-    Disable,
-
-    /// Show experimental Codex UI observation status
-    Status {
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-
-        /// Age threshold for recent observed traffic
-        #[arg(long, default_value = "900")]
-        recent_seconds: u64,
-    },
-
-    /// Start or focus Codex Desktop where supported
-    Launch {
-        /// Print the platform launch action without running it
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Guided live UI smoke checklist; never starts live model traffic by default
-    Smoke,
-}
-
-#[derive(Debug, Subcommand)]
-enum CoachCommands {
-    /// Preview the project-local hooks.json that would be installed
-    Preview {
-        /// hooks.json path; defaults to .codex/hooks.json in the current repo
-        #[arg(long)]
-        hooks_file: Option<PathBuf>,
-
-        /// Base URL of codex-blackbox-core used by the hook command
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-    },
-
-    /// Install project-local hook coach entries
-    Install {
-        /// hooks.json path; defaults to .codex/hooks.json in the current repo
-        #[arg(long)]
-        hooks_file: Option<PathBuf>,
-
-        /// Print intended changes without modifying files
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Replace an invalid existing hooks.json with the Blackbox hook set
-        #[arg(long)]
-        force: bool,
-
-        /// Base URL of codex-blackbox-core used by the hook command
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-    },
-
-    /// Remove Blackbox-owned hook coach entries
-    Uninstall {
-        /// hooks.json path; defaults to .codex/hooks.json in the current repo
-        #[arg(long)]
-        hooks_file: Option<PathBuf>,
-    },
-
-    /// Show whether Blackbox hook coach entries are installed
-    Status {
-        /// hooks.json path; defaults to .codex/hooks.json in the current repo
-        #[arg(long)]
-        hooks_file: Option<PathBuf>,
-
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Run as a Codex command hook: read hook JSON from stdin and emit hook JSON on stdout
-    Handle {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum BaselineCommands {
-    /// Preview derived-only baseline facts from companion API snapshots
-    Preview {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-    },
-
-    /// Store derived-only baseline facts locally
-    Learn {
-        /// Base URL of codex-blackbox-core
-        #[arg(long, default_value = "http://localhost:9091")]
-        url: String,
-
-        /// Baseline file path
-        #[arg(long)]
-        state: Option<PathBuf>,
-    },
-
-    /// Show the stored baseline
-    Show {
-        /// Baseline file path
-        #[arg(long)]
-        state: Option<PathBuf>,
-
-        /// Emit machine-readable JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Remove the stored baseline
-    Reset {
-        /// Baseline file path
-        #[arg(long)]
-        state: Option<PathBuf>,
-    },
-
-    /// Disable baseline learning while keeping a derived-only marker
-    Disable {
-        /// Baseline file path
-        #[arg(long)]
-        state: Option<PathBuf>,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum PreflightCommands {
-    /// Verify local ChatGPT login, start subscription proxy stack, and print the live command
-    CodexSubscription {
-        /// Codex command to show, e.g. -- codex exec "prompt"
-        #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1258,10 +1051,12 @@ async fn run_doctor() -> i32 {
         }
     }
 
-    if command_exists("tmux") {
-        print_check("✓", "tmux found");
-    } else {
-        print_check("⚠", "tmux not found; --tmux watch mode will not work");
+    if features::ENABLE_TMUX_WATCH {
+        if command_exists("tmux") {
+            print_check("✓", "tmux found");
+        } else {
+            print_check("⚠", "tmux not found; --tmux watch mode will not work");
+        }
     }
 
     for port in [10000, 9091, 3000] {
@@ -1472,7 +1267,7 @@ fn tmux_session_name() -> String {
 fn start_watcher() -> Result<WatchHandle, String> {
     let cli_path = current_cli_path();
     let core_url = codex_blackbox_core_url();
-    if command_exists("tmux") {
+    if features::ENABLE_TMUX_WATCH && command_exists("tmux") {
         let session = tmux_session_name();
         let command = shell_join(&[
             cli_path,
@@ -2270,6 +2065,7 @@ fn require_chatgpt_codex_login() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn run_codex_subscription_preflight(command: Vec<String>) -> i32 {
     if command.is_empty() {
         eprintln!(
@@ -2401,6 +2197,7 @@ fn local_time_from_iso(iso: &str) -> String {
         .unwrap_or_else(|| "??:??:??".to_string())
 }
 
+#[allow(dead_code)]
 fn compact_datetime_from_iso(iso: &str) -> String {
     parse_local_datetime(iso)
         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
@@ -3256,7 +3053,7 @@ fn render_event(
                 "  \u{1f504} POSSIBLE LOOP \u{00b7} {} rapid turns \u{00b7} ~{} tokens wasted?  ",
                 consecutive, tokens_display
             );
-            let inner2 = "  UNPORTED baseline: if model seems stuck, Ctrl+C and restart";
+            let inner2 = "  If the model seems stuck, Ctrl+C and restart";
             let width = inner1.len().max(inner2.len()).max(57);
             print_tagged(
                 &tag,
@@ -3385,6 +3182,14 @@ fn render_diagnosis(report: &DiagnosisReport, tag: &str) {
     println!();
 }
 
+fn exit_disabled_feature(feature: &str) -> ! {
+    eprintln!(
+        "{}",
+        format!("Error: {feature} is disabled in this build.").red()
+    );
+    std::process::exit(1);
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -3414,6 +3219,9 @@ async fn main() {
             tmux_max_panes,
         } => {
             if tmux {
+                if !features::ENABLE_TMUX_WATCH {
+                    exit_disabled_feature("tmux watch mode");
+                }
                 // Tmux orchestrator mode. Self-bootstrap into a tmux session
                 // if we're not already inside one, so the user just runs
                 // `codex-blackbox watch --tmux` once.
@@ -3490,20 +3298,8 @@ async fn main() {
                 }
             }
         }
-        Commands::Sessions { url, limit, days } => {
-            let sessions_url = format!(
-                "{}/api/sessions?limit={}&days={}",
-                url.trim_end_matches('/'),
-                limit,
-                days
-            );
-            match fetch_sessions(&sessions_url).await {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("{}", format!("Error: {}", e).red());
-                    std::process::exit(1);
-                }
-            }
+        Commands::Sessions { .. } => {
+            exit_disabled_feature("sessions list command");
         }
         Commands::Status {
             url,
@@ -3532,60 +3328,14 @@ async fn main() {
                 std::process::exit(1);
             }
         },
-        Commands::Coach { command } => match command {
-            CoachCommands::Preview { hooks_file, url } => {
-                std::process::exit(coach_commands::run_preview(hooks_file, url));
-            }
-            CoachCommands::Install {
-                hooks_file,
-                dry_run,
-                force,
-                url,
-            } => {
-                std::process::exit(coach_commands::run_install(hooks_file, dry_run, force, url));
-            }
-            CoachCommands::Uninstall { hooks_file } => {
-                std::process::exit(coach_commands::run_uninstall(hooks_file));
-            }
-            CoachCommands::Status { hooks_file, json } => {
-                std::process::exit(coach_commands::run_status(hooks_file, json));
-            }
-            CoachCommands::Handle { url } => {
-                std::process::exit(coach_commands::run_handle(url).await);
-            }
-        },
-        Commands::Baseline { command } => match command {
-            BaselineCommands::Preview { url } => {
-                std::process::exit(baseline_commands::run_preview(url).await);
-            }
-            BaselineCommands::Learn { url, state } => {
-                std::process::exit(baseline_commands::run_learn(url, state).await);
-            }
-            BaselineCommands::Show { state, json } => {
-                std::process::exit(baseline_commands::run_show(state, json));
-            }
-            BaselineCommands::Reset { state } => {
-                std::process::exit(baseline_commands::run_reset(state));
-            }
-            BaselineCommands::Disable { state } => {
-                std::process::exit(baseline_commands::run_disable(state));
-            }
-        },
-        Commands::Recall {
-            url,
-            limit,
-            days,
-            query,
-        } => {
-            let query = query.join(" ");
-            let recall_url = format!("{}/api/recall", url.trim_end_matches('/'));
-            match fetch_recall(&recall_url, &query, limit, days).await {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("{}", format!("Error: {}", e).red());
-                    std::process::exit(1);
-                }
-            }
+        Commands::Coach { .. } => {
+            exit_disabled_feature("coach hooks");
+        }
+        Commands::Baseline { .. } => {
+            exit_disabled_feature("baseline learning");
+        }
+        Commands::Recall { .. } => {
+            exit_disabled_feature("recall command");
         }
         Commands::Postmortem {
             url,
@@ -3603,81 +3353,21 @@ async fn main() {
                 }
             }
         }
-        Commands::Reconcile {
-            url,
-            session,
-            billed_cost,
-            source,
-            imported_at,
-        } => {
-            let reconcile_url =
-                format!("{}/api/billing-reconciliations", url.trim_end_matches('/'));
-            match post_reconciliation(
-                &reconcile_url,
-                &session,
-                billed_cost,
-                &source,
-                imported_at.as_deref(),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("{}", format!("Error: {}", e).red());
-                    std::process::exit(1);
-                }
-            }
+        Commands::Reconcile { .. } => {
+            exit_disabled_feature("reconcile command");
         }
         Commands::Config { command } => match command {
             ConfigCommands::Codex => {
                 print_codex_config_preview();
             }
         },
-        Commands::Ui {
-            config,
-            state_dir,
-            command,
-        } => match command {
-            UiCommands::Doctor { json, url } => {
-                std::process::exit(ui_commands::run_doctor(config, state_dir, url, json).await);
-            }
-            UiCommands::Enable { dry_run, force } => {
-                std::process::exit(ui_commands::run_enable(config, state_dir, dry_run, force));
-            }
-            UiCommands::Disable => {
-                std::process::exit(ui_commands::run_disable(config, state_dir));
-            }
-            UiCommands::Status {
-                json,
-                url,
-                recent_seconds,
-            } => {
-                std::process::exit(
-                    ui_commands::run_status(config, state_dir, url, json, recent_seconds).await,
-                );
-            }
-            UiCommands::Launch { dry_run } => {
-                std::process::exit(ui_commands::run_launch(dry_run));
-            }
-            UiCommands::Smoke => {
-                println!("Codex Blackbox UI smoke is guided only.");
-                println!("No live model traffic was started by this command.");
-                println!(
-                    "Before a real smoke: run `codex-blackbox up` and `codex-blackbox ui enable`."
-                );
-                println!("Then restart local Codex Desktop or the local IDE extension app-server.");
-                println!("After explicit user approval, send one small UI prompt and run `codex-blackbox ui status --json`.");
-                println!("Live UI support proof requires observed provider=\"codex_responses\" traffic from that real Desktop/IDE smoke.");
-            }
-        },
-        Commands::Preflight { command } => match command {
-            PreflightCommands::CodexSubscription { command } => {
-                std::process::exit(run_codex_subscription_preflight(command).await);
-            }
-        },
+        Commands::Preflight { .. } => {
+            exit_disabled_feature("preflight command");
+        }
     }
 }
 
+#[allow(dead_code)]
 async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let resp = reqwest::Client::new().get(url).send().await?;
     if !resp.status().is_success() {
@@ -3788,6 +3478,7 @@ async fn fetch_sessions(url: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn session_model_label(session: &serde_json::Value) -> String {
     let requested = session
         .get("requested_model")
@@ -5712,6 +5403,7 @@ fn number_field(value: &serde_json::Value, key: &str) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
+#[allow(dead_code)]
 async fn post_reconciliation(
     url: &str,
     session: &str,
@@ -5747,6 +5439,7 @@ async fn post_reconciliation(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn fetch_recall(
     url: &str,
     query: &str,
@@ -7402,28 +7095,21 @@ mod tests {
         assert_eq!(width, None);
         assert_eq!(target, "last");
 
-        let cli = Cli::try_parse_from(["codex-blackbox", "sessions"]).expect("sessions parses");
-        let Commands::Sessions { url, limit, days } = cli.command else {
-            panic!("expected sessions command");
-        };
-        assert_eq!(url, "http://localhost:9091");
-        assert_eq!(limit, 20);
-        assert_eq!(days, 7);
+        let cli =
+            Cli::try_parse_from(["codex-blackbox", "sessions"]).expect("sessions parses disabled");
+        assert!(matches!(cli.command, Commands::Sessions { .. }));
 
-        let cli = Cli::try_parse_from(["codex-blackbox", "recall", "auth"]).expect("recall parses");
-        let Commands::Recall {
-            url,
-            limit,
-            days,
-            query,
-        } = cli.command
-        else {
-            panic!("expected recall command");
-        };
-        assert_eq!(url, "http://localhost:9091");
-        assert_eq!(limit, 5);
-        assert_eq!(days, 30);
-        assert_eq!(query, vec!["auth"]);
+        let cli = Cli::try_parse_from(["codex-blackbox", "recall", "auth"])
+            .expect("recall parses disabled");
+        assert!(matches!(cli.command, Commands::Recall { .. }));
+
+        let cli = Cli::try_parse_from(["codex-blackbox", "preflight", "codex-subscription"])
+            .expect("preflight parses disabled");
+        assert!(matches!(cli.command, Commands::Preflight { .. }));
+
+        let cli = Cli::try_parse_from(["codex-blackbox", "reconcile", "--session", "session_a"])
+            .expect("reconcile parses disabled");
+        assert!(matches!(cli.command, Commands::Reconcile { .. }));
 
         let cli =
             Cli::try_parse_from(["codex-blackbox", "config", "codex"]).expect("config parses");

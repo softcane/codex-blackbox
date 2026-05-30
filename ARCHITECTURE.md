@@ -8,51 +8,34 @@ short and links here when deeper context is needed.
 ## Product Boundary
 
 Codex Blackbox observes Codex CLI traffic through a local Envoy proxy and
-records authoritative model-turn evidence. Experimental UI mode can explicitly
-route local Codex Desktop and local IDE extension app-server traffic through the
-same Envoy/core pipeline by writing reversible user-level Codex config. The
-optional hook coach records supported Codex lifecycle hook evidence for
-coaching only; hook evidence is incomplete, labeled separately, and never
-replaces proxy evidence. Codex Blackbox does not use local JSON stdout,
-app-server hook endpoints, or inferred tool outcomes as authoritative telemetry.
+records authoritative model-turn evidence. The calibrated v1 product surface is
+the proxy/core observer plus CLI doctor, up, run, watch, status, guard,
+postmortem, and config workflows. Codex Blackbox does not use local JSON
+stdout, Codex lifecycle hooks, app-server hook endpoints, Codex Desktop/UI
+traffic, WebSocket frames, or inferred tool outcomes as authoritative
+telemetry.
 
-UI mode is explicit only. `codex-blackbox run -- codex ...` keeps using
-command-line config overrides and must not mutate `~/.codex/config.toml`.
-`codex-blackbox ui enable` is the mutating entry point, and disable uses
-Blackbox-owned rollback state instead of blindly restoring a whole backup file.
-Persistent UI mode must preserve Codex Desktop's provider identity: it sets
-`openai_base_url` and disables request compression, but it must not set
-`chatgpt_base_url` or replace `model_provider` with a Blackbox-specific id.
-Changing the provider id hides existing Desktop sessions because app-server
-thread listing defaults to the active provider. Current safe UI mode preserves
-that provider identity, but Codex Desktop may still attempt Responses over
-WebSocket. If the app does not fall back to HTTP Responses after Envoy returns
-426, `ui status` reports `websocket_only_unobservable`; seamless UI observation
-then requires a future WebSocket relay instead of another restart.
-If Envoy sees HTTP Responses POST traffic but core does not persist
-`provider="codex_responses"` evidence, `ui status` reports
-`http_responses_unparsed`; that is a parser/body-shape problem, not a config
-reload problem.
-Core decodes `content-encoding: zstd` request bodies before parsing Responses
-JSON so app-server compression does not block observation.
+`codex-blackbox run -- codex ...` uses command-line config overrides and must
+not mutate `~/.codex/config.toml`. Product support claims are limited to real
+Codex Responses evidence persisted by core as `provider="codex_responses"`.
+Local HTTP request decoding, including `content-encoding: zstd`, exists to keep
+the proxy path parseable; it is not a Desktop/UI support claim.
 
 The remote compaction path `/backend-api/codex/responses/compact` bypasses
 ext_proc body inspection. Compaction requests are large control-plane payloads,
 not model-turn telemetry, and buffering them can trigger Envoy's local 413
 request-size protection before the upstream sees the request.
 
-UI mode is scoped to local Codex Desktop and local IDE extension app-server
-traffic. Hosted web/cloud Codex, API-key Codex routing, generic system proxying,
-TLS MITM, WebSocket frame observation, JSON stdout, app-server callbacks, and
-tool-result telemetry are out of scope for UI mode.
+Hosted web/cloud Codex, Codex Desktop/UI observation, API-key Codex routing,
+generic system proxying, TLS MITM, WebSocket frame observation, JSON stdout,
+app-server callbacks, and tool-result telemetry are out of scope.
 
-## Coach And Companion Flow
+## Decision Flow
 
-The coach stack uses one event pipeline:
+The internal decision stack uses one event pipeline:
 
 ```text
 proxy collector      -> normalized events
-hook collector       -> normalized events
 offline transcript   -> normalized events, offline only
 future app-server    -> normalized events, future client mode
 user policy          -> normalized events
@@ -60,8 +43,7 @@ user policy          -> normalized events
 normalized events -> session state -> signal engine -> decision engine
 
 decision engine -> CLI status/guard/watch
-decision engine -> hook coach response
-decision engine -> companion UI/API
+decision engine -> redacted local JSON API
 decision engine -> postmortem
 decision engine -> bounded Prometheus metrics
 ```
@@ -71,26 +53,23 @@ bounded reason code, confidence, session/turn references when available, and a
 privacy classification. Payload summaries are derived and redacted by default.
 
 The v1 signal engine covers failed, incomplete, and unknown model responses,
-high context, repeated validation failure, unvalidated edits, repeated
-supported-tool failure, blind retry, risky supported tool calls, untrusted
-pricing when a dollar budget is configured, rate-limit pressure when available,
-and missing durable evidence.
+high context, accounting anomalies, model fallback, untrusted pricing when a
+dollar budget is configured, rate-limit pressure when available, and missing
+durable evidence.
 
 The decision states are `Healthy`, `Watching`, `Careful`, `Stop`, `Blocked`,
 `Cooldown`, and `Ended`. The same serialized decision object is reused by CLI
-status, guard, watch, hook coach responses, the companion API, and postmortems.
+status, guard, watch, local JSON APIs, postmortems, and Grafana-facing metrics.
 
 Evidence classes must stay separate:
 
 - Fake fixtures validate local contracts.
-- Preflight checks validate configuration without launching a model turn.
+- Static checks validate configuration without launching a model turn.
 - Dogfood and live smoke evidence require real Codex traffic observed by
   `codex-blackbox-core` with `provider="codex_responses"`.
 
-Fake UI fixtures and local dry runs prove local contracts only. Live UI support
-claims require a real Desktop/IDE smoke with persisted
-`provider="codex_responses"` traffic; `ui status` must not count known local
-fake fixture sessions as live UI evidence.
+No Desktop/UI support claim is part of the calibrated product scope. Fake
+fixtures and local dry runs prove local contracts only.
 
 ## Runtime Flow
 
@@ -130,30 +109,19 @@ Core runtime modules:
   from Envoy-observed turn snapshots.
 - `codex-blackbox-core/src/postmortem.rs`: deterministic postmortem report
   construction and redaction.
-- `codex-blackbox-core/src/coach.rs`: normalized event model, derived session
-  state, signal engine, and companion decision conversion.
+- `codex-blackbox-core/src/coach.rs`: internal normalized event model, derived
+  session state, signal engine, and decision conversion.
 
 CLI modules:
 
 - `codex-blackbox-cli/src/main.rs`: command parsing, stack management,
-  wrapper run plan, watch client, sessions/recall/postmortem/reconcile
-  commands, and terminal rendering.
-- `codex-blackbox-cli/src/ui_config.rs`: experimental UI config
-  planning/apply/disable, TOML-aware mutation, backup/state handling, and
-  config inspection.
-- `codex-blackbox-cli/src/ui_status.rs`: experimental UI status
-  classification from config state, process hints, recent Envoy WebSocket 426
-  access logs, and existing core observation evidence.
-- `codex-blackbox-cli/src/ui_process.rs`: local Codex Desktop/app-server
-  process detection for restart warnings only.
-- `codex-blackbox-cli/src/ui_launch.rs`: safe platform launch planning for
-  starting or focusing Codex Desktop without killing or restarting processes.
-- `codex-blackbox-cli/src/coach_commands.rs`: explicit project-local hook
-  preview, install, status, uninstall, and fail-open hook handler command.
-- `codex-blackbox-cli/src/baseline_commands.rs`: optional derived-only baseline
-  preview, learn, show, reset, and disable commands.
-- `codex-blackbox-cli/src/tmux.rs`: tmux watch orchestration and per-session
-  pane state.
+  wrapper run plan, watch client, status/guard/postmortem/config commands, and
+  terminal rendering.
+- `codex-blackbox-cli/src/coach_commands.rs`,
+  `codex-blackbox-cli/src/baseline_commands.rs`, and
+  `codex-blackbox-cli/src/tmux.rs`: dormant implementation code behind
+  internal feature gates that default to disabled and are not part of the
+  default product surface.
 
 Config and harness modules:
 
@@ -171,17 +139,16 @@ Config and harness modules:
 - Treat cached input as a subset of input tokens, never as extra tokens.
 - Preserve completed, failed, incomplete, and unknown terminal statuses.
 - Treat tool calls as model-side intent only.
-- Keep hook evidence advisory and visibly labeled as `hook`; supported
-  `PostToolUse` output may prove hook-observed result evidence but cannot prove
-  proxy tool intent succeeded.
-- Keep UI mode reversible and explicit; do not use UI config writes for the
-  `run codex` wrapper path.
+- Keep disabled hook evidence out of the default product surface. If dormant
+  code is re-enabled internally, hook evidence must remain advisory and visibly
+  labeled separately from proxy evidence.
+- Do not mutate user-level Codex config for the `run codex` wrapper path or
+  for support claims.
 - Keep Prometheus labels bounded; never label metrics with session ids, cwd,
   prompts, request ids, response ids, or raw tool inputs.
-- Keep unsupported surfaces absent from watch, tmux, metrics, persistence, and
-  public docs.
-- Keep baseline learning derived-only; never store raw prompts, outputs,
-  commands, paths, tool inputs, secrets, or full transcripts.
+- Keep unsupported surfaces absent from watch, metrics, persistence, and public
+  docs.
+- Keep dormant baseline code unreachable from the default product surface.
 
 ## Known Structural Debt
 
